@@ -136,9 +136,11 @@ class OpenMMLabRuntime:
     ) -> list[dict[str, Any]]:
         import numpy as np
         from mmdet.apis import inference_detector
+        from mmengine.registry import DefaultScope
         from mmpose.apis import inference_topdown
 
-        detection_result = inference_detector(models.detector, frame)
+        with DefaultScope.overwrite_default_scope("mmdet"):
+            detection_result = inference_detector(models.detector, frame)
         predicted = getattr(detection_result, "pred_instances", None)
         if predicted is None:
             raise WorkerError("detector result has no pred_instances")
@@ -159,7 +161,8 @@ class OpenMMLabRuntime:
         if not selected:
             return []
         selected_boxes = np.asarray([bboxes[index] for index in selected], dtype=np.float32)
-        pose_results = inference_topdown(models.pose, frame, bboxes=selected_boxes)
+        with DefaultScope.overwrite_default_scope("mmpose"):
+            pose_results = inference_topdown(models.pose, frame, bboxes=selected_boxes)
         if len(pose_results) != len(selected):
             raise WorkerError("pose result count differs from detector box count")
         instances: list[dict[str, Any]] = []

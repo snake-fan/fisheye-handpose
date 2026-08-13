@@ -183,8 +183,11 @@ def test_h20_executor_builds_runtime_request_and_imports_verified_worker_bundle(
     session.mkdir()
     calibration = session / "capture_calibration_camera.yaml"
     calibration.write_text("placeholder", encoding="utf-8")
-    worker_python = tmp_path / "worker-python"
-    worker_python.write_text("", encoding="utf-8")
+    base_python = tmp_path / "uv-managed-python"
+    base_python.write_text("", encoding="utf-8")
+    worker_python = tmp_path / "deploy" / ".venv" / "bin" / "python"
+    worker_python.parent.mkdir(parents=True)
+    worker_python.symlink_to(base_python)
     worker_root = tmp_path / "worker-root"
     package = worker_root / "fisheye_h20_worker"
     package.mkdir(parents=True)
@@ -301,6 +304,9 @@ def test_h20_executor_builds_runtime_request_and_imports_verified_worker_bundle(
     assert request["calibration"]["left_camera_id"] == "cam_0"
     assert request["calibration"]["output_size"] == [1600, 1300]
     assert captured["env"] == {"PYTHONPATH": str(worker_root.resolve())}
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[0] == str(worker_python.absolute())
 
     reader = RunArtifactReader(run_dir)
     assert reader.validate().ok

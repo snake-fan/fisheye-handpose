@@ -773,6 +773,82 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(captures[0].path, "capture.mp4")
         self.assertTrue(captures[0].released)
 
+    def test_real_runtime_infers_each_model_in_its_openmmlab_scope_and_restores_prior_scope(
+        self,
+    ) -> None:
+        from contextlib import contextmanager
+        from types import ModuleType, SimpleNamespace
+
+        import numpy as np
+
+        active_scope = ["mmpose"]
+        calls: list[tuple[str, str]] = []
+
+        class FakeDefaultScope:
+            @classmethod
+            @contextmanager
+            def overwrite_default_scope(cls, scope_name: str):
+                previous_scope = active_scope[0]
+                active_scope[0] = scope_name
+                try:
+                    yield
+                finally:
+                    active_scope[0] = previous_scope
+
+        def inference_detector(model: object, frame: object) -> object:
+            calls.append(("detector", active_scope[0]))
+            return SimpleNamespace(
+                pred_instances=SimpleNamespace(
+                    bboxes=np.asarray([[10.0, 20.0, 30.0, 40.0]], dtype=np.float32),
+                    scores=np.asarray([0.9], dtype=np.float32),
+                    labels=np.asarray([0], dtype=np.int64),
+                )
+            )
+
+        def inference_topdown(model: object, frame: object, *, bboxes: object) -> list[object]:
+            calls.append(("pose", active_scope[0]))
+            return [
+                SimpleNamespace(
+                    pred_instances=SimpleNamespace(
+                        keypoints=np.zeros((1, 21, 2), dtype=np.float32),
+                        keypoint_scores=np.full((1, 21), 0.8, dtype=np.float32),
+                    )
+                )
+            ]
+
+        mmengine = ModuleType("mmengine")
+        mmengine_registry = ModuleType("mmengine.registry")
+        mmengine_registry.DefaultScope = FakeDefaultScope
+        mmdet = ModuleType("mmdet")
+        mmdet_apis = ModuleType("mmdet.apis")
+        mmdet_apis.inference_detector = inference_detector
+        mmpose = ModuleType("mmpose")
+        mmpose_apis = ModuleType("mmpose.apis")
+        mmpose_apis.inference_topdown = inference_topdown
+
+        models = SimpleNamespace(detector=object(), pose=object())
+        with patch.dict(
+            sys.modules,
+            {
+                "mmengine": mmengine,
+                "mmengine.registry": mmengine_registry,
+                "mmdet": mmdet,
+                "mmdet.apis": mmdet_apis,
+                "mmpose": mmpose,
+                "mmpose.apis": mmpose_apis,
+            },
+        ):
+            instances = OpenMMLabRuntime().infer(
+                models,
+                object(),
+                bbox_threshold=0.3,
+                category_id=0,
+            )
+
+        self.assertEqual(calls, [("detector", "mmdet"), ("pose", "mmpose")])
+        self.assertEqual(active_scope, ["mmpose"])
+        self.assertEqual(len(instances), 1)
+
     def test_models_load_once_and_real_detection_pose_events_are_persisted(self) -> None:
         runtime = FakeRuntime()
         with TemporaryDirectory() as temporary_directory:

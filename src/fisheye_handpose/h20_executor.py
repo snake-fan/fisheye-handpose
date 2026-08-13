@@ -46,6 +46,14 @@ def _path(value: Any, label: str) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def _worker_python_path(value: Any) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise H20ExecutorConfigurationError("worker_python must be a non-empty path")
+    # A venv's Python is commonly a symlink to its base interpreter. Keep the venv
+    # entry point so Python discovers pyvenv.cfg and activates that environment.
+    return Path(value).expanduser().absolute()
+
+
 @dataclass(frozen=True, slots=True)
 class H20ExecutorConfig:
     worker_python: Path
@@ -62,7 +70,7 @@ class H20ExecutorConfig:
         missing = sorted(required - request.keys())
         if missing:
             raise H20ExecutorConfigurationError(f"request template is missing sections: {missing}")
-        worker_python = _path(root.get("worker_python"), "worker_python")
+        worker_python = _worker_python_path(root.get("worker_python"))
         worker_module_root = _path(root.get("worker_module_root"), "worker_module_root")
         if not worker_python.is_file():
             raise H20ExecutorConfigurationError(f"worker_python is not a file: {worker_python}")
