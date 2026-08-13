@@ -75,9 +75,11 @@ def test_cli_starts_keepalive_tunnel_waits_for_health_then_starts_vite_and_clean
     frontend.mkdir()
     (frontend / "package.json").write_text("{}", encoding="utf-8")
     frontend_checks = iter((False, True))
+    api_checks = iter((False, True))
     tunnel = FakeProcess()
     runtime = FakeRuntime(
         tunnels=[tunnel],
+        api_health=lambda _url: next(api_checks),
         frontend_health=lambda _url, _api: next(frontend_checks),
         interrupt_after_sleeps=2,
     )
@@ -130,8 +132,10 @@ def test_cli_restarts_an_exited_tunnel_with_backoff_and_reuses_existing_vite(
     (frontend / "package.json").write_text("{}", encoding="utf-8")
     first = FakeProcess([255])
     second = FakeProcess()
+    api_checks = iter((False, False, True))
     runtime = FakeRuntime(
         tunnels=[first, second],
+        api_health=lambda _url: next(api_checks),
         frontend_health=lambda _url, _api: True,
         interrupt_after_sleeps=2,
     )
@@ -145,6 +149,28 @@ def test_cli_restarts_an_exited_tunnel_with_backoff_and_reuses_existing_vite(
     assert runtime.stopped == [second]
     assert any("exited with code 255" in message for message in runtime.messages)
     assert any("Reusing Vite" in message for message in runtime.messages)
+
+
+def test_cli_reuses_an_existing_healthy_tunnel_without_starting_another_ssh(
+    tmp_path: Path,
+) -> None:
+    frontend = tmp_path / "frontend"
+    frontend.mkdir()
+    (frontend / "package.json").write_text("{}", encoding="utf-8")
+    runtime = FakeRuntime(
+        tunnels=[],
+        api_health=lambda _url: True,
+        frontend_health=lambda _url, _api: True,
+        interrupt_after_sleeps=1,
+    )
+
+    code = remote_trace_viewer.main(["--frontend-dir", str(frontend)], runtime=runtime)
+
+    assert code == 0
+    assert runtime.process_calls == []
+    assert runtime.stopped == []
+    assert any("Reusing existing SSH tunnel" in message for message in runtime.messages)
+    assert any("Viewer ready" in message for message in runtime.messages)
 
 
 class FakeHttpResponse:
@@ -235,6 +261,7 @@ def test_cli_reports_a_missing_ssh_executable_and_still_finishes_cleanup(
     def missing_executable(_command: list[str], **_kwargs: Any) -> FakeProcess:
         raise FileNotFoundError("ssh not found")
 
+    runtime.api_health = lambda _url: False
     runtime.popen = missing_executable  # type: ignore[method-assign]
 
     assert remote_trace_viewer.main(["--frontend-dir", str(frontend)], runtime=runtime) == 2
@@ -249,8 +276,10 @@ def test_cli_refuses_to_reuse_a_frontend_with_a_different_api_identity(
     frontend.mkdir()
     (frontend / "package.json").write_text("{}", encoding="utf-8")
     tunnel = FakeProcess()
+    api_checks = iter((False, True))
     runtime = FakeRuntime(
         tunnels=[tunnel],
+        api_health=lambda _url: next(api_checks),
         frontend_health=lambda _url, _api: False,
         frontend_responds=lambda _url: True,
         interrupt_after_sleeps=10,

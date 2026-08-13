@@ -275,6 +275,33 @@ def run(args: argparse.Namespace, runtime: Runtime) -> int:
     reconnect_delay = 1.0
     try:
         while True:
+            if runtime.api_health(api_health_url):
+                runtime.output(f"Reusing existing SSH tunnel at 127.0.0.1:{args.local_api_port}")
+                reconnect_delay = 1.0
+                if frontend is None or frontend.poll() is not None:
+                    frontend = _start_frontend(
+                        args,
+                        runtime,
+                        frontend_url,
+                        api_base_url,
+                    )
+                runtime.output(f"Viewer ready: {frontend_url} (Ctrl-C to stop)")
+                while runtime.api_health(api_health_url):
+                    if frontend is not None and frontend.poll() is not None:
+                        runtime.output(f"Vite exited with code {frontend.returncode}; restarting")
+                        frontend = _start_frontend(
+                            args,
+                            runtime,
+                            frontend_url,
+                            api_base_url,
+                        )
+                    runtime.sleep(0.5)
+                runtime.output("Existing SSH tunnel is no longer healthy")
+                runtime.output(f"Reconnecting in {reconnect_delay:.1f}s")
+                runtime.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2.0, args.reconnect_max_seconds)
+                continue
+
             runtime.output(
                 f"Starting SSH tunnel {args.ssh_host}:{args.remote_api_port} "
                 f"-> 127.0.0.1:{args.local_api_port}"
@@ -294,6 +321,17 @@ def run(args: argparse.Namespace, runtime: Runtime) -> int:
                     runtime.stop_process(tunnel)
                 else:
                     runtime.output(f"SSH tunnel exited with code {code}")
+                tunnel = None
+                runtime.output(f"Reconnecting in {reconnect_delay:.1f}s")
+                runtime.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2.0, args.reconnect_max_seconds)
+                continue
+
+            # A different process may have answered the shared local health URL
+            # just as our SSH child failed to bind.  Only a live child proves that
+            # this process owns the newly established tunnel.
+            if tunnel.poll() is not None:
+                runtime.output(f"SSH tunnel exited with code {tunnel.returncode}")
                 tunnel = None
                 runtime.output(f"Reconnecting in {reconnect_delay:.1f}s")
                 runtime.sleep(reconnect_delay)
