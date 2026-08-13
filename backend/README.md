@@ -26,9 +26,20 @@ uv run --locked --no-editable fisheye-trace-api \
   --port 8000
 ```
 
-On the Mac, run `ssh -N -L 8000:127.0.0.1:8000 h20` and then start the React development
-server described in [`../frontend/README.md`](../frontend/README.md). This diagnostic API
-has no authentication layer; do not expose it directly on a public interface.
+On the Mac, prefer the persistent viewer helper from the repository root:
+
+```bash
+uv run --locked --no-editable python scripts/remote_trace_viewer.py
+```
+
+It forwards local `18081` to remote `18080`, validates this API's exact read-only health
+response, starts or reuses Vite on `15174`, and automatically recreates a dropped SSH
+tunnel with bounded exponential backoff. See [`../frontend/README.md`](../frontend/README.md)
+for its manual equivalent and overrides. The default CORS list contains only loopback
+origins used by the documented Vite dev (`5173`), preview (`4173`), and remote helper
+(`15174`) workflows. A custom frontend port requires a matching repeated `--cors-origin`.
+This diagnostic API has no authentication layer; keep it on H20 loopback and do not expose
+it directly on a public interface.
 
 ## API boundary
 

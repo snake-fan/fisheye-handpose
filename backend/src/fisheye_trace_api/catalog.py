@@ -6,6 +6,8 @@ import hashlib
 import json
 import mimetypes
 import re
+import threading
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -34,6 +36,32 @@ class ResolvedArtifact:
     sha256: str
 
 
+_FileFingerprint = tuple[int, int, int, int, int]
+_RunFingerprint = tuple[tuple[str, _FileFingerprint] | None, ...]
+_BlobFingerprint = tuple[tuple[str, _FileFingerprint | None], ...]
+_ValidationFingerprint = _RunFingerprint | tuple[_RunFingerprint, _BlobFingerprint]
+
+
+@dataclass(frozen=True, slots=True)
+class _RunIndex:
+    fingerprint: _RunFingerprint
+    manifest: dict[str, Any]
+    summary: dict[str, Any] | None
+    records: tuple[dict[str, Any], ...]
+    finalized: bool
+    frames: tuple[dict[str, Any], ...]
+    frames_by_key: dict[str, dict[str, Any]]
+    records_by_frame: dict[str, tuple[dict[str, Any], ...]]
+    records_by_id: dict[str, dict[str, Any]]
+    artifacts_by_path: dict[str, dict[str, Any]]
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedArtifact:
+    fingerprint: _FileFingerprint
+    size: int
+
+
 class TraceCatalog:
     """Query trace folders under one configured catalog root."""
 
@@ -41,6 +69,17 @@ class TraceCatalog:
         self.root = Path(root).expanduser().resolve(strict=True)
         if not self.root.is_dir():
             raise NotADirectoryError(self.root)
+        self._cache_lock = threading.RLock()
+        self._run_indexes: dict[Path, _RunIndex] = {}
+        self._run_index_locks: dict[Path, threading.Lock] = {}
+        self._validation_cache: dict[tuple[Path, _ValidationFingerprint, bool], dict[str, Any]] = {}
+        self._validation_locks: dict[tuple[Path, _ValidationFingerprint, bool], threading.Lock] = {}
+        self._artifact_cache: dict[tuple[Path, str, int | None], _VerifiedArtifact] = {}
+        self._artifact_locks: dict[tuple[Path, str, int | None], threading.Lock] = {}
+        self._known_runs: dict[str, Path] = {}
+        self._discovered_runs: tuple[Path, ...] | None = None
+        self._discovery_marker: tuple[tuple[str, int, int], ...] | None = None
+        self._discovery_deadline = 0.0
 
     def list_runs(
         self,
@@ -76,9 +115,10 @@ class TraceCatalog:
         run = self._find_run(run_key)
         run_summary = self._summarize_safe(run)
         try:
-            manifest = self._manifest(run)
-            summary = self._summary(run)
-            records = self._records(run)
+            index = self._index(run)
+            manifest = index.manifest
+            summary = index.summary
+            records = index.records
         except Exception as error:
             manifest = _load_json_safe(_first_existing(run, _MANIFEST_NAMES)) or {}
             summary = _load_json_safe(_first_existing(run, _SUMMARY_NAMES))
@@ -103,7 +143,7 @@ class TraceCatalog:
             "run": run_summary,
             "manifest": manifest,
             "summary": summary,
-            "validation": _validate_run(run, manifest),
+            "validation": self._validate_run(run, index, verify_blobs=True),
             "provenance": _run_provenance(manifest, records),
             "stages": sorted({str(record["stage"]) for record in records if record.get("stage")}),
             "track_ids": sorted(
@@ -130,7 +170,16 @@ class TraceCatalog:
         track_id: str | None = None,
         status: str | None = None,
     ) -> dict[str, Any]:
-        records = self._records(self._find_run(run_key))
+        index = self._index(self._find_run(run_key))
+        records = index.records
+        if stage is None and track_id is None and status is None:
+            items = list(index.frames)
+            return {
+                "items": items[offset : offset + limit],
+                "offset": offset,
+                "limit": limit,
+                "total": len(items),
+            }
         frames: dict[str, dict[str, Any]] = {}
         for record in records:
             payload = _metadata(record)
@@ -183,25 +232,16 @@ class TraceCatalog:
         }
 
     def get_frame(self, run_key: str, frame_key: str) -> dict[str, Any]:
-        page = self.list_frames(run_key, offset=0, limit=2**31 - 1)
-        frame = next(
-            (item for item in page["items"] if item["frame_key"] == frame_key),
-            None,
-        )
+        run = self._find_run(run_key)
+        index = self._index(run)
+        frame = index.frames_by_key.get(frame_key)
         if frame is None:
             raise KeyError((run_key, frame_key))
-        run = self._find_run(run_key)
-        records = self._records(run)
-        matches = []
-        for record in records:
-            payload = _metadata(record)
-            if payload.get("frame_id") == frame["frame_id"]:
-                matches.append(record)
         return {
             "run_key": run_key,
-            "run_id": str(self._manifest(run).get("run_id") or run.name),
+            "run_id": str(index.manifest.get("run_id") or run.name),
             "frame": frame,
-            "records": matches,
+            "records": list(index.records_by_frame.get(frame["frame_id"], ())),
         }
 
     def get_records(self, run_key: str, stage: str, frame_key: str) -> dict[str, Any]:
@@ -211,9 +251,10 @@ class TraceCatalog:
             if record.get("stage") == stage
         ]
         run = self._find_run(run_key)
+        index = self._index(run)
         return {
             "run_key": run_key,
-            "run_id": str(self._manifest(run).get("run_id") or run.name),
+            "run_id": str(index.manifest.get("run_id") or run.name),
             "stage": stage,
             "frame_key": frame_key,
             "items": items,
@@ -221,14 +262,8 @@ class TraceCatalog:
         }
 
     def get_record(self, run_key: str, record_id: str) -> dict[str, Any]:
-        record = next(
-            (
-                record
-                for record in self._records(self._find_run(run_key))
-                if record.get("record_id", record.get("id")) == record_id
-            ),
-            None,
-        )
+        index = self._index(self._find_run(run_key))
+        record = index.records_by_id.get(record_id)
         if record is None:
             raise KeyError((run_key, record_id))
         return record
@@ -244,17 +279,7 @@ class TraceCatalog:
             or "\0" in relative_path
         ):
             raise ArtifactNotFoundError(relative_path)
-        references = []
-        for record in self._records(run):
-            references.extend(_artifact_references(record))
-        reference = next(
-            (
-                value
-                for value in references
-                if value.get("relative_path", value.get("path")) == relative_path
-            ),
-            None,
-        )
+        reference = self._index(run).artifacts_by_path.get(relative_path)
         if reference is None:
             raise ArtifactNotFoundError(relative_path)
         try:
@@ -267,24 +292,56 @@ class TraceCatalog:
         expected_size = reference.get("bytes", reference.get("size"))
         if not isinstance(expected_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha):
             raise ArtifactIntegrityError("artifact reference has no valid SHA-256")
-        digest = hashlib.sha256()
-        size = 0
-        with candidate.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-                size += len(chunk)
-        if digest.hexdigest() != expected_sha.lower() or (
-            isinstance(expected_size, int)
-            and not isinstance(expected_size, bool)
-            and size != expected_size
-        ):
-            raise ArtifactIntegrityError(f"artifact integrity mismatch: {relative_path}")
+        cache_key = (
+            candidate,
+            expected_sha.lower(),
+            expected_size
+            if isinstance(expected_size, int) and not isinstance(expected_size, bool)
+            else None,
+        )
+        artifact_lock = self._artifact_lock(cache_key)
+        with artifact_lock:
+            try:
+                fingerprint = _file_fingerprint(candidate)
+            except OSError:
+                raise ArtifactNotFoundError(relative_path) from None
+            with self._cache_lock:
+                cached_artifact = self._artifact_cache.get(cache_key)
+            if cached_artifact is not None and cached_artifact.fingerprint == fingerprint:
+                size = cached_artifact.size
+            else:
+                digest = hashlib.sha256()
+                size = 0
+                with candidate.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        size += len(chunk)
+                try:
+                    stable_fingerprint = _file_fingerprint(candidate)
+                except OSError:
+                    raise ArtifactNotFoundError(relative_path) from None
+                if fingerprint != stable_fingerprint:
+                    raise ArtifactIntegrityError(f"artifact changed while reading: {relative_path}")
+                if digest.hexdigest() != expected_sha.lower() or (
+                    isinstance(expected_size, int)
+                    and not isinstance(expected_size, bool)
+                    and size != expected_size
+                ):
+                    with self._cache_lock:
+                        self._artifact_cache.pop(cache_key, None)
+                    raise ArtifactIntegrityError(f"artifact integrity mismatch: {relative_path}")
+                with self._cache_lock:
+                    self._artifact_cache[cache_key] = _VerifiedArtifact(stable_fingerprint, size)
         media_type = reference.get("media_type", reference.get("mime_type"))
         if not isinstance(media_type, str) or not media_type:
             media_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
         return ResolvedArtifact(candidate, media_type, size, expected_sha.lower())
 
     def _find_run(self, run_key: str) -> Path:
+        with self._cache_lock:
+            known = self._known_runs.get(run_key)
+        if known is not None and known.is_dir():
+            return known
         for path in self._run_directories():
             if self._run_key(path) == run_key:
                 return path
@@ -295,6 +352,15 @@ class TraceCatalog:
         return hashlib.sha256(relative_path.encode("utf-8")).hexdigest()[:16]
 
     def _run_directories(self) -> tuple[Path, ...]:
+        marker = _directory_marker(self.root)
+        now = time.monotonic()
+        with self._cache_lock:
+            if (
+                self._discovered_runs is not None
+                and marker == self._discovery_marker
+                and now < self._discovery_deadline
+            ):
+                return self._discovered_runs
         manifests: set[Path] = set()
         for name in _MANIFEST_NAMES:
             manifests.update(self.root.rglob(name))
@@ -305,14 +371,23 @@ class TraceCatalog:
             directory = manifest.parent.resolve()
             if directory.is_relative_to(self.root) and _first_existing(directory, _TRACE_NAMES):
                 directories.append(directory)
-        return tuple(sorted(set(directories)))
+        result = tuple(sorted(set(directories)))
+        with self._cache_lock:
+            self._discovered_runs = result
+            self._discovery_marker = marker
+            self._discovery_deadline = now + 1.0
+            self._known_runs = {self._run_key(path): path for path in result}
+        return result
 
     def _summarize(self, run: Path) -> dict[str, Any]:
-        manifest = self._manifest(run)
-        summary = self._summary(run)
-        records = self._records(run)
+        index = self._index(run)
+        manifest = index.manifest
+        summary = index.summary
+        records = index.records
         if manifest.get("schema_version") == "fisheye-handpose/run-manifest/v1":
-            RunArtifactReader(run).validate(verify_blobs=False)
+            report = self._validate_run(run, index, verify_blobs=False)
+            if not report["ok"]:
+                raise TraceValidationError("; ".join(report["errors"]))
         stages = Counter(str(record.get("stage")) for record in records if record.get("stage"))
         frame_ids = {
             payload["frame_id"]
@@ -428,6 +503,74 @@ class TraceCatalog:
     def _records(run: Path) -> list[dict[str, Any]]:
         return _load_jsonl(_required_existing(run, _TRACE_NAMES))
 
+    def _index(self, run: Path) -> _RunIndex:
+        fingerprint = _run_fingerprint(run)
+        with self._cache_lock:
+            cached = self._run_indexes.get(run)
+            if cached is not None and cached.finalized and cached.fingerprint == fingerprint:
+                return cached
+            run_lock = self._run_index_locks.setdefault(run, threading.Lock())
+        with run_lock:
+            fingerprint = _run_fingerprint(run)
+            with self._cache_lock:
+                cached = self._run_indexes.get(run)
+                if cached is not None and cached.finalized and cached.fingerprint == fingerprint:
+                    return cached
+            manifest = self._manifest(run)
+            summary = self._summary(run)
+            records = tuple(self._records(run))
+            index = _build_index(fingerprint, manifest, summary, records)
+            with self._cache_lock:
+                if index.finalized:
+                    self._run_indexes[run] = index
+                    stale = [
+                        key
+                        for key in self._validation_cache
+                        if key[0] == run and key[1] != fingerprint
+                    ]
+                    for key in stale:
+                        self._validation_cache.pop(key, None)
+                else:
+                    self._run_indexes.pop(run, None)
+            return index
+
+    def _validate_run(
+        self,
+        run: Path,
+        index: _RunIndex,
+        *,
+        verify_blobs: bool,
+    ) -> dict[str, Any]:
+        if index.manifest.get("schema_version") != "fisheye-handpose/run-manifest/v1":
+            return _legacy_validation()
+        if not index.finalized:
+            return _validate_canonical(run, verify_blobs=verify_blobs)
+        validation_fingerprint: _ValidationFingerprint = index.fingerprint
+        if verify_blobs:
+            validation_fingerprint = (
+                index.fingerprint,
+                _blob_fingerprint(run, index.artifacts_by_path),
+            )
+        key = (run, validation_fingerprint, verify_blobs)
+        with self._cache_lock:
+            cached = self._validation_cache.get(key)
+            if cached is not None:
+                return cached
+            validation_lock = self._validation_locks.setdefault(key, threading.Lock())
+        with validation_lock:
+            with self._cache_lock:
+                cached = self._validation_cache.get(key)
+                if cached is not None:
+                    return cached
+            result = _validate_canonical(run, verify_blobs=verify_blobs)
+            with self._cache_lock:
+                self._validation_cache[key] = result
+            return result
+
+    def _artifact_lock(self, key: tuple[Path, str, int | None]) -> threading.Lock:
+        with self._cache_lock:
+            return self._artifact_locks.setdefault(key, threading.Lock())
+
 
 def _load_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -453,6 +596,128 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
             raise ValueError(f"expected JSON object at {path}:{number}")
         records.append(value)
     return records
+
+
+def _file_fingerprint(path: Path) -> _FileFingerprint:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _run_fingerprint(run: Path) -> _RunFingerprint:
+    paths = (
+        _first_existing(run, _MANIFEST_NAMES),
+        _first_existing(run, _TRACE_NAMES),
+        _first_existing(run, _SUMMARY_NAMES),
+    )
+    return tuple(
+        (path.name, _file_fingerprint(path)) if path is not None else None for path in paths
+    )
+
+
+def _blob_fingerprint(
+    run: Path,
+    references: dict[str, dict[str, Any]],
+) -> _BlobFingerprint:
+    values: list[tuple[str, _FileFingerprint | None]] = []
+    for relative_path in sorted(references):
+        try:
+            parts = PurePosixPath(relative_path)
+            candidate = run.joinpath(*parts.parts).resolve(strict=True)
+            fingerprint = (
+                _file_fingerprint(candidate)
+                if candidate.is_relative_to(run) and candidate.is_file()
+                else None
+            )
+        except (OSError, RuntimeError):
+            fingerprint = None
+        values.append((relative_path, fingerprint))
+    return tuple(values)
+
+
+def _directory_marker(root: Path) -> tuple[tuple[str, int, int], ...]:
+    markers: list[tuple[str, int, int]] = []
+    try:
+        children = tuple(root.iterdir())
+    except OSError:
+        return ()
+    for child in children:
+        try:
+            stat = child.stat()
+        except OSError:
+            continue
+        markers.append((child.name, stat.st_mtime_ns, stat.st_ctime_ns))
+    return tuple(sorted(markers))
+
+
+def _build_index(
+    fingerprint: _RunFingerprint,
+    manifest: dict[str, Any],
+    summary: dict[str, Any] | None,
+    records: tuple[dict[str, Any], ...],
+) -> _RunIndex:
+    frames: dict[str, dict[str, Any]] = {}
+    records_by_frame: dict[str, list[dict[str, Any]]] = {}
+    records_by_id: dict[str, dict[str, Any]] = {}
+    artifacts_by_path: dict[str, dict[str, Any]] = {}
+    for record in records:
+        record_id = record.get("record_id", record.get("id"))
+        if isinstance(record_id, str) and record_id:
+            records_by_id[record_id] = record
+        for reference in _artifact_references(record):
+            path = reference.get("relative_path", reference.get("path"))
+            if isinstance(path, str):
+                artifacts_by_path.setdefault(path, reference)
+        payload = _metadata(record)
+        frame_id = payload.get("frame_id")
+        if not isinstance(frame_id, str) or not frame_id:
+            continue
+        records_by_frame.setdefault(frame_id, []).append(record)
+        item = frames.setdefault(
+            frame_id,
+            {
+                "frame_key": _frame_key(frame_id),
+                "frame_id": frame_id,
+                "frame_index": _frame_index(payload, frame_id),
+                "timestamp_ns": _frame_timestamp_ns(payload),
+                "record_ids": [],
+                "stages": [],
+                "statuses": [],
+                "track_ids": [],
+                "view_ids": [],
+            },
+        )
+        if item["frame_index"] is None:
+            item["frame_index"] = _frame_index(payload, frame_id)
+        if item["timestamp_ns"] is None:
+            item["timestamp_ns"] = _frame_timestamp_ns(payload)
+        _append_text(item["record_ids"], record_id)
+        _append_text(item["stages"], record.get("stage"))
+        _append_text(item["statuses"], record.get("status"))
+        _append_text(item["track_ids"], payload.get("track_id"))
+        _append_text(item["view_ids"], payload.get("view_id"))
+    ordered_frames = tuple(
+        sorted(
+            frames.values(),
+            key=lambda item: (
+                item["frame_index"] is None,
+                item["frame_index"] if item["frame_index"] is not None else 0,
+                item["timestamp_ns"] if isinstance(item["timestamp_ns"], int) else 0,
+                item["frame_id"],
+            ),
+        )
+    )
+    return _RunIndex(
+        fingerprint=fingerprint,
+        manifest=manifest,
+        summary=summary,
+        records=records,
+        finalized=summary is not None and summary.get("status") in {"COMPLETED", "FAILED"},
+        frames=ordered_frames,
+        frames_by_key={item["frame_key"]: item for item in ordered_frames},
+        records_by_frame={key: tuple(value) for key, value in records_by_frame.items()},
+        records_by_id=records_by_id,
+        artifacts_by_path=artifacts_by_path,
+    )
 
 
 def _frame_index(payload: dict[str, Any], frame_id: str) -> int | None:
@@ -563,14 +828,22 @@ def _validate_run(
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
     if manifest.get("schema_version") != "fisheye-handpose/run-manifest/v1":
-        return {
-            "ok": False,
-            "mode": "LEGACY_UNVERIFIED",
-            "errors": ["legacy trace has no canonical v1 integrity proof"],
-            "warnings": [],
-        }
+        return _legacy_validation()
+    return _validate_canonical(run, verify_blobs=True)
+
+
+def _legacy_validation() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "mode": "LEGACY_UNVERIFIED",
+        "errors": ["legacy trace has no canonical v1 integrity proof"],
+        "warnings": [],
+    }
+
+
+def _validate_canonical(run: Path, *, verify_blobs: bool) -> dict[str, Any]:
     try:
-        report = RunArtifactReader(run).validate()
+        report = RunArtifactReader(run).validate(verify_blobs=verify_blobs)
     except (TraceValidationError, OSError, UnicodeError, ValueError) as error:
         return {
             "ok": False,

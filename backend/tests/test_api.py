@@ -70,6 +70,22 @@ def test_api_exposes_catalog_health_runs_frames_and_stage_records(tmp_path: Path
     assert client.get(f"/api/v1/runs/{run_key}/records/decode-4").json()["record_id"] == "decode-4"
 
 
+def test_default_cors_allows_supported_dev_preview_and_remote_viewer_origins(
+    tmp_path: Path,
+) -> None:
+    _catalog_fixture(tmp_path)
+    client = TestClient(create_app(tmp_path))
+
+    for origin in (
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:4173",
+        "http://127.0.0.1:15174",
+    ):
+        response = client.get("/api/v1/health", headers={"Origin": origin})
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == origin
+
+
 def test_record_query_endpoint_resolves_h20_ids_that_contain_slashes(tmp_path: Path) -> None:
     run, _, _ = _catalog_fixture(tmp_path)
     record = json.loads((run / "trace.jsonl").read_text(encoding="utf-8"))

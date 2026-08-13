@@ -18,15 +18,20 @@ from .catalog import (
 )
 
 API_PREFIX = "/api/v1"
+DEFAULT_CORS_ORIGINS = (
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "http://127.0.0.1:4173",
+    "http://localhost:4173",
+    "http://127.0.0.1:15174",
+    "http://localhost:15174",
+)
 
 
 def create_app(
     catalog_root: str | Path,
     *,
-    cors_origins: tuple[str, ...] = (
-        "http://127.0.0.1:5173",
-        "http://localhost:5173",
-    ),
+    cors_origins: tuple[str, ...] = DEFAULT_CORS_ORIGINS,
 ) -> FastAPI:
     """Create a read-only application over one trace catalog root."""
 

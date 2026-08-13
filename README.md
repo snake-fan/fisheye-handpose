@@ -156,6 +156,19 @@ npm run dev
 Open `http://127.0.0.1:5173`. Remote H20 inspection uses an SSH tunnel; see
 [backend/README.md](backend/README.md) and [frontend/README.md](frontend/README.md).
 
+For the configured remote workflow, the Mac helper keeps both the SSH tunnel and local
+React development server alive, verifies the API health contract before declaring success,
+and reconnects automatically after a network drop:
+
+```bash
+uv run --locked --no-editable python scripts/remote_trace_viewer.py
+```
+
+It defaults to SSH alias `h20`, remote API port `18080`, local API port `18081`, and
+frontend port `15174`. Press Ctrl-C once to terminate only the tunnel and Vite process that
+the helper created. Run `python scripts/remote_trace_viewer.py --help` to override ports,
+the SSH alias, or frontend directory; no remote path, password, or private key is embedded.
+
 To persist the stages already executed by `audit-session`, add a trace directory:
 
 ```bash

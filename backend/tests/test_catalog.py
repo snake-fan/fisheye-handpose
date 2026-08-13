@@ -5,9 +5,20 @@ import json
 from pathlib import Path
 
 import pytest
-from fisheye_handpose.trace import RunArtifactWriter, RunStatus, TraceStage, TraceStatus
+from fisheye_handpose.trace import (
+    RunArtifactReader,
+    RunArtifactWriter,
+    RunStatus,
+    TraceStage,
+    TraceStatus,
+)
 
-from fisheye_trace_api.catalog import ArtifactNotFoundError, TraceCatalog
+import fisheye_trace_api.catalog as catalog_module
+from fisheye_trace_api.catalog import (
+    ArtifactIntegrityError,
+    ArtifactNotFoundError,
+    TraceCatalog,
+)
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -764,3 +775,203 @@ def test_run_detail_extracts_only_evidence_backed_provenance_facets(tmp_path: Pa
     no_worker_catalog = TraceCatalog(tmp_path)
     no_worker_detail = no_worker_catalog.get_run(_key(no_worker_catalog, "no-worker-provenance"))
     assert set(no_worker_detail["provenance"]) == {"manifest"}
+
+
+def test_completed_run_reuses_one_parsed_index_across_catalog_queries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_run(tmp_path, run_id="stable-completed")
+    parse_count = 0
+    original_load_jsonl = catalog_module._load_jsonl
+
+    def counted_load_jsonl(path: Path) -> list[dict[str, object]]:
+        nonlocal parse_count
+        parse_count += 1
+        return original_load_jsonl(path)
+
+    monkeypatch.setattr(catalog_module, "_load_jsonl", counted_load_jsonl)
+    catalog = TraceCatalog(tmp_path)
+
+    run = catalog.list_runs()["items"][0]
+    run_key = run["run_key"]
+    frame = catalog.list_frames(run_key)["items"][0]
+    catalog.get_run(run_key)
+    catalog.get_frame(run_key, frame["frame_key"])
+    catalog.get_record(run_key, "pose:left:7")
+    catalog.list_runs()
+
+    assert parse_count == 1
+
+
+def test_completed_run_index_is_rebuilt_when_trace_fingerprint_changes(tmp_path: Path) -> None:
+    run = _write_run(tmp_path, run_id="changed-completed")
+    catalog = TraceCatalog(tmp_path)
+    run_key = catalog.list_runs()["items"][0]["run_key"]
+
+    assert catalog.list_frames(run_key)["total"] == 1
+    with (run / "trace.jsonl").open("a", encoding="utf-8") as trace:
+        trace.write(
+            json.dumps(
+                {
+                    "record_id": "decode:right:8",
+                    "ordinal": 2,
+                    "stage": "DECODE",
+                    "status": "SUCCEEDED",
+                    "event": "decoded",
+                    "payload": {"frame_id": "frame/000008", "frame_index": 8},
+                    "blobs": [],
+                }
+            )
+            + "\n"
+        )
+
+    assert catalog.list_frames(run_key)["total"] == 2
+
+
+def test_active_run_is_never_frozen_in_the_completed_index(tmp_path: Path) -> None:
+    run = _write_run(tmp_path, run_id="still-writing")
+    (run / "run_summary.json").unlink()
+    catalog = TraceCatalog(tmp_path)
+    run_key = catalog.list_runs()["items"][0]["run_key"]
+
+    assert catalog.list_frames(run_key)["total"] == 1
+    with (run / "trace.jsonl").open("a", encoding="utf-8") as trace:
+        trace.write(
+            json.dumps(
+                {
+                    "record_id": "decode:right:8",
+                    "ordinal": 2,
+                    "stage": "DECODE",
+                    "status": "SUCCEEDED",
+                    "event": "decoded",
+                    "payload": {"frame_id": "frame/000008", "frame_index": 8},
+                    "blobs": [],
+                }
+            )
+            + "\n"
+        )
+
+    assert catalog.list_frames(run_key)["total"] == 2
+
+
+def test_completed_canonical_run_performs_full_validation_once_per_fingerprint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "validated-once"
+    writer = RunArtifactWriter.create(
+        run,
+        run_id="validated-once",
+        pipeline_version="test",
+    )
+    writer.append(
+        record_id="decode:0",
+        stage=TraceStage.DECODE,
+        status=TraceStatus.SUCCEEDED,
+        event="decoded",
+        payload={"frame_id": "frame/000000", "frame_index": 0},
+    )
+    writer.finalize(status=RunStatus.COMPLETED)
+    validation_modes: list[bool] = []
+    original_validate = catalog_module.RunArtifactReader.validate
+
+    def counted_validate(
+        reader: RunArtifactReader,
+        *,
+        verify_blobs: bool = True,
+    ) -> object:
+        validation_modes.append(verify_blobs)
+        return original_validate(reader, verify_blobs=verify_blobs)
+
+    monkeypatch.setattr(catalog_module.RunArtifactReader, "validate", counted_validate)
+    catalog = TraceCatalog(tmp_path)
+    run_key = catalog.list_runs()["items"][0]["run_key"]
+
+    assert catalog.get_run(run_key)["validation"]["ok"] is True
+    assert catalog.get_run(run_key)["validation"]["ok"] is True
+
+    assert validation_modes == [False, True]
+
+
+def test_artifact_hash_result_is_reused_until_the_file_stat_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _write_run(tmp_path, run_id="artifact-cache")
+    body = b"0123456789"
+    digest = hashlib.sha256(body).hexdigest()
+    relative_path = f"blobs/sha256/{digest[:2]}/{digest}.bin"
+    artifact_path = run / relative_path
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_bytes(body)
+    records = [json.loads(line) for line in (run / "trace.jsonl").read_text().splitlines()]
+    records[0]["blobs"] = [
+        {
+            "sha256": digest,
+            "bytes": len(body),
+            "role": "source_left",
+            "media_type": "application/octet-stream",
+            "relative_path": relative_path,
+        }
+    ]
+    (run / "trace.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    artifact_reads = 0
+    original_open = Path.open
+
+    def counted_open(path: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal artifact_reads
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path == artifact_path and mode == "rb":
+            artifact_reads += 1
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    catalog = TraceCatalog(tmp_path)
+    run_key = catalog.list_runs()["items"][0]["run_key"]
+
+    assert catalog.resolve_artifact(run_key, relative_path).size == len(body)
+    assert catalog.resolve_artifact(run_key, relative_path).size == len(body)
+    assert artifact_reads == 1
+
+    artifact_path.write_bytes(b"abcdefghij")
+    with pytest.raises(ArtifactIntegrityError):
+        catalog.resolve_artifact(run_key, relative_path)
+
+
+def test_full_validation_cache_is_invalidated_when_a_referenced_blob_changes(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "validated-blob"
+    writer = RunArtifactWriter.create(
+        run,
+        run_id="validated-blob",
+        pipeline_version="test",
+    )
+    blob = writer.put_blob(
+        b"trusted artifact",
+        role="source_left",
+        media_type="application/octet-stream",
+        suffix=".bin",
+    )
+    writer.append(
+        record_id="decode:0",
+        stage=TraceStage.DECODE,
+        status=TraceStatus.SUCCEEDED,
+        event="decoded",
+        payload={"frame_id": "frame/000000", "frame_index": 0},
+        blobs=(blob,),
+    )
+    writer.finalize(status=RunStatus.COMPLETED)
+    catalog = TraceCatalog(tmp_path)
+    run_key = catalog.list_runs()["items"][0]["run_key"]
+
+    assert catalog.get_run(run_key)["validation"]["ok"] is True
+
+    (run / blob.relative_path).write_bytes(b"tampered artifact")
+
+    validation = catalog.get_run(run_key)["validation"]
+    assert validation["ok"] is False
+    assert validation["mode"] == "CANONICAL_V1"

@@ -1,5 +1,5 @@
 import { AlertTriangle, Check, ChevronLeft, ChevronRight, LoaderCircle, Search, X } from "lucide-react";
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 
 import type { RunSummary } from "../api/types";
 
@@ -12,6 +12,7 @@ interface RunCatalogProps {
   query: string;
   loading: boolean;
   error: string;
+  connectionStatus: "checking" | "connected" | "disconnected";
   onSelect: (runKey: string) => void;
   onSearch: (query: string) => void;
   onPage: (offset: number) => void;
@@ -36,12 +37,23 @@ export function RunCatalog({
   query,
   loading,
   error,
+  connectionStatus,
   onSelect,
   onSearch,
   onPage,
 }: RunCatalogProps) {
   const [draftQuery, setDraftQuery] = useState(query);
+  const onSearchRef = useRef(onSearch);
+  useEffect(() => {
+    onSearchRef.current = onSearch;
+  }, [onSearch]);
   useEffect(() => setDraftQuery(query), [query]);
+  useEffect(() => {
+    const normalized = draftQuery.trim();
+    if (normalized === query) return;
+    const timeout = window.setTimeout(() => onSearchRef.current(normalized), 250);
+    return () => window.clearTimeout(timeout);
+  }, [draftQuery, query]);
   const submitSearch = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     onSearch(draftQuery.trim());
@@ -98,7 +110,11 @@ export function RunCatalog({
             <LoaderCircle className="spin" aria-hidden="true" /> 正在读取运行目录
           </div>
         )}
-        {error && <div className="catalog-message error" role="alert">{error}</div>}
+        {error && (
+          <div className="catalog-message error" role="alert">
+            <span>{error}</span>
+          </div>
+        )}
         {!loading && !error && runs.length === 0 && (
           <div className="catalog-message">还没有可检查的运行</div>
         )}
@@ -151,9 +167,15 @@ export function RunCatalog({
         </button>
       </nav>
 
-      <footer className="catalog-footer">
-        <span className="connection-dot" /> API v1 · READ ONLY
-      </footer>
+      <div
+        className={`catalog-footer connection-${connectionStatus}`}
+        role="status"
+        aria-label={connectionStatus === "connected" ? "API 已连接" : connectionStatus === "disconnected" ? "API 已断开" : "正在连接 API"}
+      >
+        <span className="connection-dot" />
+        {connectionStatus === "connected" ? "API CONNECTED" : connectionStatus === "disconnected" ? "API DISCONNECTED" : "API CONNECTING"}
+        <span>· READ ONLY</span>
+      </div>
     </aside>
   );
 }

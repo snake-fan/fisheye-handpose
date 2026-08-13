@@ -70,6 +70,11 @@ button { color: inherit; }
 .warning-count { display: flex; align-items: center; gap: 3px; color: var(--amber); }
 .warning-count svg { width: 10px; }
 .catalog-message { padding: 22px 12px; color: var(--muted); font-size: 0.7rem; text-align: center; }
+.catalog-message > span { display: block; }
+.retry-button { margin-top: 12px; border: 1px solid color-mix(in srgb, var(--red) 55%, transparent); border-radius: 999px; padding: 7px 13px; background: color-mix(in srgb, var(--red) 10%, transparent); color: var(--red); font: 0.62rem var(--mono); cursor: pointer; }
+.retry-button:hover { background: color-mix(in srgb, var(--red) 18%, transparent); }
+.connection-alert { position: fixed; z-index: 20; top: 18px; right: 18px; display: flex; align-items: center; gap: 14px; border: 1px solid color-mix(in srgb, var(--red) 40%, var(--line)); border-radius: 10px; padding: 10px 12px 10px 16px; background: color-mix(in srgb, var(--panel) 92%, transparent); box-shadow: 0 12px 36px rgba(0, 0, 0, 0.28); color: var(--red); font: 0.65rem var(--mono); backdrop-filter: blur(16px); }
+.connection-alert .retry-button { margin-top: 0; }
 .catalog-message svg { width: 13px; vertical-align: middle; }
 .catalog-message.error { color: var(--red); }
 .catalog-pagination { display: grid; grid-template-columns: 27px 1fr 27px; align-items: center; gap: 7px; padding: 9px 14px; border-top: 1px solid var(--line); }
@@ -80,6 +85,9 @@ button { color: inherit; }
 .catalog-pagination svg { width: 12px; height: 12px; }
 .catalog-footer { display: flex; align-items: center; gap: 7px; padding: 14px 17px; border-top: 1px solid var(--line); color: var(--dim); font: 0.56rem var(--mono); letter-spacing: 0.08em; }
 .connection-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 8px var(--mint); }
+.connection-disconnected { color: var(--red); }
+.connection-disconnected .connection-dot { background: var(--red); box-shadow: 0 0 8px var(--red); }
+.connection-checking .connection-dot { background: var(--amber); box-shadow: 0 0 8px var(--amber); animation: pulse 1s ease-in-out infinite alternate; }
 .studio-main { min-width: 0; overflow: hidden; }
 .empty-studio { max-width: 460px; padding: 48px; text-align: center; }
 .studio-main > .empty-studio { margin: 0 auto; padding-top: 28vh; }
@@ -289,6 +297,7 @@ button { color: inherit; }
 .raw-json { max-height: 440px; margin: 0; padding: 17px; overflow: auto; color: #b7c9c7; background: #080d10; white-space: pre-wrap; font: 0.57rem/1.55 var(--mono); }
 .tab-empty { display: grid; min-height: 160px; place-items: center; color: var(--dim); font-size: 0.62rem; }
 .spin { animation: spin 1s linear infinite; }
+@keyframes pulse { from { opacity: 0.45; } to { opacity: 1; } }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 button:focus-visible,

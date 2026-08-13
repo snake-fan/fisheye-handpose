@@ -8,7 +8,7 @@ from pathlib import Path
 
 import uvicorn
 
-from .app import create_app
+from .app import DEFAULT_CORS_ORIGINS, create_app
 
 
 def _directory(value: str) -> Path:
@@ -34,14 +34,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    origins = (
-        tuple(args.cors_origins)
-        if args.cors_origins
-        else (
-            "http://127.0.0.1:5173",
-            "http://localhost:5173",
-        )
-    )
+    origins = tuple(args.cors_origins) if args.cors_origins else DEFAULT_CORS_ORIGINS
     uvicorn.run(
         create_app(args.catalog_root, cors_origins=origins),
         host=args.host,

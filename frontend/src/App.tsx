@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-import { traceApi } from "./api/client";
+import { TraceApiError, traceApi } from "./api/client";
 import type { FrameDetail, FrameSummary, RunDetail, RunSummary } from "./api/types";
 import { FrameInspector } from "./components/FrameInspector";
 import { FrameTimeline } from "./components/FrameTimeline";
@@ -9,8 +9,10 @@ import { RunHeader } from "./components/RunHeader";
 import { TraceFilters } from "./components/TraceFilters";
 import { useUrlState } from "./hooks/useUrlState";
 
-const FRAME_PAGE_SIZE = 120;
+const FRAME_PAGE_SIZE = 40;
 const RUN_PAGE_SIZE = 50;
+
+type ConnectionStatus = "checking" | "connected" | "disconnected";
 
 function pageOffset(value: string): number {
   const parsed = Number(value);
@@ -37,10 +39,39 @@ export function App() {
   const [frameDetail, setFrameDetail] = useState<FrameDetail | null>(null);
   const [frameLoading, setFrameLoading] = useState(false);
   const [frameError, setFrameError] = useState("");
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
+  const [retryNonce, setRetryNonce] = useState(0);
+  const connectionStatusRef = useRef<ConnectionStatus>("checking");
+
+  const recordRequestSuccess = () => {
+    connectionStatusRef.current = "connected";
+    setConnectionStatus("connected");
+  };
+
+  const recordRequestFailure = (reason: unknown) => {
+    if (reason instanceof TraceApiError && reason.code === "CONNECTION_FAILED") {
+      connectionStatusRef.current = "disconnected";
+      setConnectionStatus("disconnected");
+    }
+  };
+
+  const retryConnection = () => {
+    connectionStatusRef.current = "checking";
+    setConnectionStatus("checking");
+    setRetryNonce((value) => value + 1);
+  };
+
+  useEffect(() => {
+    if (connectionStatus !== "disconnected") return;
+    const timeout = window.setTimeout(retryConnection, 2_000);
+    return () => window.clearTimeout(timeout);
+  }, [connectionStatus]);
 
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
+    setRuns([]);
+    setError("");
     traceApi
       .listRuns({
         offset: pageOffset(urlState.run_offset),
@@ -48,36 +79,46 @@ export function App() {
         q: urlState.q,
       }, controller.signal)
       .then((page) => {
+        if (controller.signal.aborted) return;
         setRuns(page.items);
         setRunTotal(page.total);
         setLoadedRunOffset(page.offset);
         setRunLimit(page.limit);
         setError("");
+        recordRequestSuccess();
       })
       .catch((reason: unknown) => {
         if (controller.signal.aborted) return;
+        recordRequestFailure(reason);
         setError(reason instanceof Error ? reason.message : "无法读取运行目录");
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
       });
     return () => controller.abort();
-  }, [urlState.q, urlState.run_offset]);
+  }, [retryNonce, urlState.q, urlState.run_offset]);
 
   useEffect(() => {
     if (!urlState.run) {
       setDetail(null);
       setDetailError("");
+      setDetailLoading(false);
       return;
     }
     const controller = new AbortController();
+    setDetail(null);
     setDetailLoading(true);
     setDetailError("");
     traceApi
       .getRun(urlState.run, controller.signal)
-      .then(setDetail)
+      .then((value) => {
+        if (controller.signal.aborted) return;
+        setDetail(value);
+        recordRequestSuccess();
+      })
       .catch((reason: unknown) => {
         if (controller.signal.aborted) return;
+        recordRequestFailure(reason);
         setDetail(null);
         setDetailError(reason instanceof Error ? reason.message : "无法读取运行详情");
       })
@@ -85,16 +126,21 @@ export function App() {
         if (!controller.signal.aborted) setDetailLoading(false);
       });
     return () => controller.abort();
-  }, [urlState.run]);
+  }, [retryNonce, urlState.run]);
 
   useEffect(() => {
     if (!urlState.run) {
       setFrames([]);
       setFrameTotal(0);
       setLoadedFrameOffset(0);
+      setFramesError("");
+      setFramesLoading(false);
       return;
     }
     const controller = new AbortController();
+    setFrames([]);
+    setFrameTotal(0);
+    setLoadedFrameOffset(0);
     setFramesLoading(true);
     setFramesError("");
     traceApi
@@ -110,13 +156,16 @@ export function App() {
         controller.signal,
       )
       .then((page) => {
+        if (controller.signal.aborted) return;
         setFrames(page.items);
         setFrameTotal(page.total);
         setLoadedFrameOffset(page.offset);
         setFrameLimit(page.limit);
+        recordRequestSuccess();
       })
       .catch((reason: unknown) => {
         if (controller.signal.aborted) return;
+        recordRequestFailure(reason);
         setFrames([]);
         setFrameTotal(0);
         setFramesError(reason instanceof Error ? reason.message : "无法读取帧索引");
@@ -125,22 +174,29 @@ export function App() {
         if (!controller.signal.aborted) setFramesLoading(false);
       });
     return () => controller.abort();
-  }, [urlState.offset, urlState.run, urlState.stage, urlState.status, urlState.track]);
+  }, [retryNonce, urlState.offset, urlState.run, urlState.stage, urlState.status, urlState.track]);
 
   useEffect(() => {
     if (!urlState.run || !urlState.frame) {
       setFrameDetail(null);
       setFrameError("");
+      setFrameLoading(false);
       return;
     }
     const controller = new AbortController();
+    setFrameDetail(null);
     setFrameLoading(true);
     setFrameError("");
     traceApi
       .getFrame(urlState.run, urlState.frame, controller.signal)
-      .then(setFrameDetail)
+      .then((value) => {
+        if (controller.signal.aborted) return;
+        setFrameDetail(value);
+        recordRequestSuccess();
+      })
       .catch((reason: unknown) => {
         if (controller.signal.aborted) return;
+        recordRequestFailure(reason);
         setFrameDetail(null);
         setFrameError(reason instanceof Error ? reason.message : "无法读取帧证据");
       })
@@ -148,7 +204,7 @@ export function App() {
         if (!controller.signal.aborted) setFrameLoading(false);
       });
     return () => controller.abort();
-  }, [urlState.frame, urlState.run]);
+  }, [retryNonce, urlState.frame, urlState.run]);
 
   return (
     <div className="app-shell">
@@ -161,6 +217,7 @@ export function App() {
         query={urlState.q}
         loading={loading}
         error={error}
+        connectionStatus={connectionStatus}
         onSelect={(run) => setUrlState({
           run,
           frame: "",
@@ -230,6 +287,12 @@ export function App() {
           </div>
         )}
       </main>
+      {connectionStatus === "disconnected" && (
+        <div className="connection-alert" role="alert">
+          <span>追踪 API 连接已断开</span>
+          <button type="button" className="retry-button" onClick={retryConnection}>重试连接</button>
+        </div>
+      )}
     </div>
   );
 }

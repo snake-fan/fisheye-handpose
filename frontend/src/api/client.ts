@@ -11,6 +11,20 @@ import type {
 const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim() ?? "";
 const apiBaseUrl = configuredBaseUrl.replace(/\/$/, "");
 
+export type TraceApiErrorCode = "CONNECTION_FAILED" | "HTTP_ERROR";
+
+export class TraceApiError extends Error {
+  readonly code: TraceApiErrorCode;
+  readonly retryable: boolean;
+
+  constructor(message: string, code: TraceApiErrorCode, retryable: boolean) {
+    super(message);
+    this.name = "TraceApiError";
+    this.code = code;
+    this.retryable = retryable;
+  }
+}
+
 function withQuery<T extends object>(path: string, query: T): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
@@ -21,11 +35,22 @@ function withQuery<T extends object>(path: string, query: T): string {
 }
 
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(url, {
-    cache: "no-store",
-    headers: { Accept: "application/json" },
-    signal,
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      cache: "no-store",
+      headers: { Accept: "application/json" },
+      signal,
+    });
+  } catch (reason) {
+    if (reason instanceof DOMException && reason.name === "AbortError") throw reason;
+    if (signal?.aborted) throw reason;
+    throw new TraceApiError(
+      "无法连接到追踪 API，请确认后端服务或 SSH 隧道是否正在运行。",
+      "CONNECTION_FAILED",
+      true,
+    );
+  }
   if (!response.ok) {
     let message = `请求失败（HTTP ${response.status}）`;
     try {
@@ -34,7 +59,7 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
     } catch {
       // Keep the status-based fallback for a non-JSON error response.
     }
-    throw new Error(message);
+    throw new TraceApiError(message, "HTTP_ERROR", response.status >= 500);
   }
   return response.json() as Promise<T>;
 }
