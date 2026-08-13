@@ -1,0 +1,391 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Fisheye Handpose Trace API",
+    "version": "1.0.0",
+    "description": "Read-only API for browsing multiple immutable pipeline trace folders."
+  },
+  "servers": [{"url": "http://127.0.0.1:8000"}],
+  "paths": {
+    "/api/v1/health": {
+      "get": {
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Service is ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["status", "read_only"],
+                  "properties": {
+                    "status": {"const": "ok"},
+                    "read_only": {"const": true}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs": {
+      "get": {
+        "operationId": "listRuns",
+        "parameters": [
+          {"$ref": "#/components/parameters/Offset"},
+          {"$ref": "#/components/parameters/RunLimit"},
+          {"name": "status", "in": "query", "schema": {"type": "string"}},
+          {"name": "q", "in": "query", "schema": {"type": "string"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "Page of pipeline runs",
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/RunPage"}}
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/runs/{run_key}": {
+      "get": {
+        "operationId": "getRun",
+        "parameters": [{"$ref": "#/components/parameters/RunKey"}],
+        "responses": {
+          "200": {
+            "description": "Run manifest, terminal summary and filter vocabulary",
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/RunDetail"}}
+            }
+          },
+          "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      }
+    },
+    "/api/v1/runs/{run_key}/frames": {
+      "get": {
+        "operationId": "listFrames",
+        "parameters": [
+          {"$ref": "#/components/parameters/RunKey"},
+          {"$ref": "#/components/parameters/Offset"},
+          {"$ref": "#/components/parameters/FrameLimit"},
+          {"name": "stage", "in": "query", "schema": {"type": "string"}},
+          {"name": "track_id", "in": "query", "schema": {"type": "string"}},
+          {"name": "status", "in": "query", "schema": {"type": "string"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "Filtered page of frames",
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/FramePage"}}
+            }
+          },
+          "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      }
+    },
+    "/api/v1/runs/{run_key}/frames/{frame_key}": {
+      "get": {
+        "operationId": "getFrame",
+        "parameters": [
+          {"$ref": "#/components/parameters/RunKey"},
+          {"$ref": "#/components/parameters/FrameKey"}
+        ],
+        "responses": {
+          "200": {
+            "description": "Frame summary and original trace records",
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/FrameDetail"}}
+            }
+          },
+          "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      }
+    },
+    "/api/v1/runs/{run_key}/record": {
+      "get": {
+        "summary": "Get one record by arbitrary stable ID",
+        "parameters": [
+          {"$ref": "#/components/parameters/RunKey"},
+          {"name": "record_id", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1}}
+        ],
+        "responses": {
+          "200": {"description": "One original trace record", "content": {"application/json": {"schema": {"type": "object", "additionalProperties": true}}}},
+          "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      }
+    },
+    "/api/v1/runs/{run_key}/records/{record_id}": {
+      "get": {
+        "operationId": "getRecord",
+        "parameters": [
+          {"$ref": "#/components/parameters/RunKey"},
+          {"name": "record_id", "in": "path", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "One original trace record",
+            "content": {
+              "application/json": {
+                "schema": {"type": "object", "additionalProperties": true}
+              }
+            }
+          },
+          "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      }
+    },
+    "/api/v1/runs/{run_key}/records/{stage}/{frame_key}": {
+      "get": {
+        "operationId": "getStageRecords",
+        "parameters": [
+          {"$ref": "#/components/parameters/RunKey"},
+          {"name": "stage", "in": "path", "required": true, "schema": {"type": "string"}},
+          {"$ref": "#/components/parameters/FrameKey"}
+        ],
+        "responses": {
+          "200": {
+            "description": "Original trace records for one frame and stage",
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/RecordPage"}}
+            }
+          },
+          "404": {"$ref": "#/components/responses/NotFound"}
+        }
+      }
+    },
+    "/api/v1/runs/{run_key}/artifacts/{artifact_path}": {
+      "get": {
+        "operationId": "getArtifact",
+        "parameters": [
+          {"$ref": "#/components/parameters/RunKey"},
+          {
+            "name": "artifact_path",
+            "in": "path",
+            "required": true,
+            "description": "Referenced POSIX-relative path inside the run directory",
+            "schema": {"type": "string"}
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "required": false,
+            "schema": {"type": "string", "examples": ["bytes=0-1048575"]}
+          }
+        ],
+        "responses": {
+          "200": {"description": "Complete integrity-checked artifact"},
+          "206": {
+            "description": "Single byte range",
+            "headers": {
+              "Content-Range": {"schema": {"type": "string"}},
+              "Accept-Ranges": {"schema": {"const": "bytes"}}
+            }
+          },
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "409": {
+            "description": "Artifact no longer matches its trace reference",
+            "content": {
+              "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+            }
+          },
+          "416": {"description": "Range is not satisfiable"}
+        }
+      },
+      "head": {
+        "operationId": "headArtifact",
+        "parameters": [
+          {"$ref": "#/components/parameters/RunKey"},
+          {"name": "artifact_path", "in": "path", "required": true, "schema": {"type": "string"}}
+        ],
+        "responses": {"200": {"description": "Artifact headers without a body"}}
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "RunKey": {
+        "name": "run_key",
+        "in": "path",
+        "required": true,
+        "description": "Opaque catalog identity derived from the run's relative directory path",
+        "schema": {"type": "string", "pattern": "^[0-9a-f]{16}$"}
+      },
+      "FrameKey": {
+        "name": "frame_key",
+        "in": "path",
+        "required": true,
+        "description": "Opaque SHA-256 identity of the exact frame_id within a run",
+        "schema": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "Offset": {
+        "name": "offset",
+        "in": "query",
+        "schema": {"type": "integer", "minimum": 0, "default": 0}
+      },
+      "RunLimit": {
+        "name": "limit",
+        "in": "query",
+        "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 50}
+      },
+      "FrameLimit": {
+        "name": "limit",
+        "in": "query",
+        "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}
+      }
+    },
+    "responses": {
+      "NotFound": {
+        "description": "Run, frame, record or artifact not found",
+        "content": {
+          "application/json": {"schema": {"$ref": "#/components/schemas/Error"}}
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": {"type": "string"},
+              "message": {"type": "string"}
+            }
+          }
+        }
+      },
+      "Run": {
+        "type": "object",
+        "required": ["run_key", "item_id", "run_id", "status", "record_count", "frame_count", "stage_counts", "warning_count", "failure_count"],
+        "properties": {
+          "run_key": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+          "item_id": {"type": "string"},
+          "run_id": {"type": "string"},
+          "data_item_id": {"type": ["string", "null"]},
+          "status": {"type": "string"},
+          "created_at_utc": {"type": ["string", "null"]},
+          "finalized_at_utc": {"type": ["string", "null"]},
+          "pipeline_version": {"type": ["string", "null"]},
+          "record_count": {"type": "integer", "minimum": 0},
+          "frame_count": {"type": "integer", "minimum": 0},
+          "stage_counts": {"type": "object", "additionalProperties": {"type": "integer"}},
+          "warning_count": {"type": "integer", "minimum": 0},
+          "failure_count": {"type": "integer", "minimum": 0}
+        }
+      },
+      "RunPage": {
+        "allOf": [
+          {"$ref": "#/components/schemas/PageMetadata"},
+          {
+            "type": "object",
+            "required": ["items"],
+            "properties": {"items": {"type": "array", "items": {"$ref": "#/components/schemas/Run"}}}
+          }
+        ]
+      },
+      "RunDetail": {
+        "type": "object",
+        "required": ["run", "manifest", "summary", "validation", "provenance", "stages", "track_ids", "view_ids", "global_records"],
+        "properties": {
+          "run": {"$ref": "#/components/schemas/Run"},
+          "manifest": {"type": "object", "additionalProperties": true},
+          "summary": {"type": ["object", "null"], "additionalProperties": true},
+          "validation": {"type": "object", "additionalProperties": true},
+          "provenance": {"$ref": "#/components/schemas/RunProvenance"},
+          "stages": {"type": "array", "items": {"type": "string"}},
+          "track_ids": {"type": "array", "items": {"type": "string"}},
+          "view_ids": {"type": "array", "items": {"type": "string"}},
+          "global_records": {"type": "array", "items": {"type": "object", "additionalProperties": true}}
+        }
+      },
+      "RunProvenance": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "manifest": {"$ref": "#/components/schemas/ManifestProvenanceFacet"},
+          "worker_inputs": {"$ref": "#/components/schemas/RecordProvenanceFacet"},
+          "calibration": {"$ref": "#/components/schemas/RecordProvenanceFacet"}
+        }
+      },
+      "ManifestProvenanceFacet": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["config", "metadata"],
+        "properties": {
+          "config": {},
+          "metadata": {}
+        }
+      },
+      "RecordProvenanceFacet": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["record_id", "payload"],
+        "properties": {
+          "record_id": {"type": "string"},
+          "payload": {"type": "object", "additionalProperties": true},
+          "worker_provenance": {"type": "object", "additionalProperties": true}
+        }
+      },
+      "Frame": {
+        "type": "object",
+        "required": ["frame_key", "frame_id", "frame_index", "record_ids", "stages", "statuses", "track_ids", "view_ids"],
+        "properties": {
+          "frame_key": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "frame_id": {"type": "string"},
+          "frame_index": {"type": ["integer", "null"], "minimum": 0},
+          "timestamp_ns": {"type": ["integer", "null"]},
+          "record_ids": {"type": "array", "items": {"type": "string"}},
+          "stages": {"type": "array", "items": {"type": "string"}},
+          "statuses": {"type": "array", "items": {"type": "string"}},
+          "track_ids": {"type": "array", "items": {"type": "string"}},
+          "view_ids": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "FramePage": {
+        "allOf": [
+          {"$ref": "#/components/schemas/PageMetadata"},
+          {
+            "type": "object",
+            "required": ["items"],
+            "properties": {"items": {"type": "array", "items": {"$ref": "#/components/schemas/Frame"}}}
+          }
+        ]
+      },
+      "FrameDetail": {
+        "type": "object",
+        "required": ["run_key", "run_id", "frame", "records"],
+        "properties": {
+          "run_key": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+          "run_id": {"type": "string"},
+          "frame": {"$ref": "#/components/schemas/Frame"},
+          "records": {"type": "array", "items": {"type": "object", "additionalProperties": true}}
+        }
+      },
+      "RecordPage": {
+        "type": "object",
+        "required": ["run_key", "run_id", "stage", "frame_key", "items", "total"],
+        "properties": {
+          "run_key": {"type": "string", "pattern": "^[0-9a-f]{16}$"},
+          "run_id": {"type": "string"},
+          "stage": {"type": "string"},
+          "frame_key": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "items": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+          "total": {"type": "integer", "minimum": 0}
+        }
+      },
+      "PageMetadata": {
+        "type": "object",
+        "required": ["offset", "limit", "total"],
+        "properties": {
+          "offset": {"type": "integer", "minimum": 0},
+          "limit": {"type": "integer", "minimum": 1},
+          "total": {"type": "integer", "minimum": 0}
+        }
+      }
+    }
+  }
+}

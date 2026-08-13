@@ -56,47 +56,23 @@ def _report_bytes(report: dict[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
-def _write_audit_trace(
+def append_audit_trace(
     report: dict[str, Any],
-    destination: Path,
-    *,
-    audit_report_path: str | Path | None = None,
-    pipeline_version: str = __version__,
-) -> Path:
-    """Build one complete audit trace at a previously absent staging path.
+    writer: RunArtifactWriter,
+) -> tuple[str, ...]:
+    """Append audit evidence to an existing pipeline run without finalizing it.
 
     The audit already performs full video decoding. Preview extraction is deliberately
     omitted here so enabling tracing cannot trigger a second decode or change audit
     results. Later perception stages can attach their own source/crop overlays as blobs.
+
+    The caller owns ``writer`` and remains responsible for all later stages and the one
+    terminal ``finalize`` call. This makes an audit a composable prefix of a full run
+    instead of a nested trace with a second writer and summary.
     """
 
     source = str(report.get("input_session") or "unknown-session")
-    source_name = Path(source).name or "session"
     report_bytes = _report_bytes(report)
-    writer = RunArtifactWriter.create(
-        destination,
-        run_id=f"audit-{source_name}",
-        pipeline_version=pipeline_version,
-        config=report.get("config"),
-        inputs=[
-            {
-                "kind": "stereo_session",
-                "path": source,
-                "audit_report_path": (
-                    str(Path(audit_report_path).expanduser().resolve())
-                    if audit_report_path is not None
-                    else None
-                ),
-            }
-        ],
-        metadata={
-            "producer": "audit-session",
-            "preview_images": {
-                "status": "OMITTED",
-                "reason": "avoid a second video decode during audit trace persistence",
-            },
-        },
-    )
     record_ids: list[str] = []
 
     def append(**kwargs: Any) -> str:
@@ -272,6 +248,51 @@ def _write_audit_trace(
             parent_ids=tuple(record_ids[-8:]),
             blobs=(report_blob,),
         )
+        return tuple(record_ids)
+    except BaseException:
+        raise
+
+
+def _write_audit_trace(
+    report: dict[str, Any],
+    destination: Path,
+    *,
+    audit_report_path: str | Path | None = None,
+    pipeline_version: str = __version__,
+) -> Path:
+    """Build and finalize one standalone audit trace at a new staging path."""
+
+    source = str(report.get("input_session") or "unknown-session")
+    source_name = Path(source).name or "session"
+    writer = RunArtifactWriter.create(
+        destination,
+        run_id=f"audit-{source_name}",
+        pipeline_version=pipeline_version,
+        config=report.get("config"),
+        inputs=[
+            {
+                "kind": "stereo_session",
+                "path": source,
+                "audit_report_path": (
+                    str(Path(audit_report_path).expanduser().resolve())
+                    if audit_report_path is not None
+                    else None
+                ),
+            }
+        ],
+        metadata={
+            "producer": "audit-session",
+            "preview_images": {
+                "status": "OMITTED",
+                "reason": "avoid a second video decode during audit trace persistence",
+            },
+        },
+    )
+    try:
+        record_ids = append_audit_trace(
+            report,
+            writer,
+        )
         run_status = RunStatus.FAILED if report.get("status") == "FAIL" else RunStatus.COMPLETED
         writer.finalize(
             status=run_status,
@@ -331,4 +352,4 @@ def persist_audit_trace(
     return destination
 
 
-__all__ = ["persist_audit_trace"]
+__all__ = ["append_audit_trace", "persist_audit_trace"]

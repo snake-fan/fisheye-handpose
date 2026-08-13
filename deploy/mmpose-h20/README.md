@@ -26,7 +26,7 @@ the Python 3.11+ geometry package at the repository root.
 Model weights are intentionally managed by the adjacent asset manifest and fetch script;
 they are not duplicated in the environment contract.
 
-## Create the environment on H20
+## Create a new environment on a new H20 host
 
 Run commands from this directory:
 
@@ -60,8 +60,9 @@ python3 doctor.py --mode manifest
 ```
 
 This standard-library-only mode intentionally bypasses uv project resolution, because
-the subproject itself is constrained to Linux x86_64. It validates the committed
-`pyproject.toml`, `uv.lock`, and `environment.json` without importing the CUDA stack.
+the subproject itself is constrained to Linux x86_64. It validates `environment.json`,
+the built-in pin contract, and `.python-version` without importing CUDA. The separate
+`uv sync --locked` command is the gate that checks `pyproject.toml` against `uv.lock`.
 
 After synchronization on the H20 server, run the fail-closed runtime check:
 
@@ -84,6 +85,31 @@ uv run --locked python doctor.py --mode runtime \
 
 This optional directory check verifies presence only. Use the model asset tooling for
 artifact identity and checksum validation.
+
+## Existing configured H20: pull without replacing SM90 MMCV
+
+The repository at `/mnt/workspace/zyf/fisheye/fisheye-handpose` already has a validated
+Python 3.10 GPU environment with a locally compiled SM90 MMCV wheel. Its system uv is older
+than this subproject's required uv, and synchronizing this subproject would replace that
+working wheel with the upstream binary that lacks the required H20 kernel. After a pull,
+update only the root Python 3.11 environment and invoke the GPU interpreter directly:
+
+```bash
+REPO=/mnt/workspace/zyf/fisheye/fisheye-handpose
+git -C "$REPO" pull --ff-only
+cd "$REPO"
+uv sync --locked --no-editable \
+  --refresh-package fisheye-handpose \
+  --reinstall-package fisheye-handpose
+
+GPU_PY="$REPO/deploy/mmpose-h20/.venv/bin/python"
+"$GPU_PY" deploy/mmpose-h20/doctor.py --mode runtime \
+  --model-dir "$REPO/models/openmmlab"
+```
+
+Do **not** run `uv sync`, `uv run --locked`, or an editable install inside
+`deploy/mmpose-h20` on this configured host. The core launches `$GPU_PY` directly and
+supplies the worker via `PYTHONPATH`, preserving the compiled wheel.
 
 ## Model assets and smoke tests
 
@@ -144,6 +170,237 @@ uv run --locked python scripts/mano_smoke.py \
 
 This validates left/right forward passes plus finite Adam gradients and an LBFGS closure.
 
+## Stereo perception worker
+
+`worker/fisheye_h20_worker` is a Python 3.10 process boundary for the real stereo hand
+pipeline:
+
+```text
+timestamp CSV + presentation-order stereo video
+  -> RTMDet hand candidates (0, 1, or 2 per view)
+  -> RTMPose Hand5 21-point evidence and confidence
+  -> KB4 point rectification
+  -> epipolar cross-view association with explicit unmatched candidates
+  -> metric raw triangulation in the rectified-left camera frame
+  -> sequence-local one-to-one 3D tracking
+  -> optional framewise MANO fitting with per-track handedness and frozen beta
+  -> timestamp-aware causal temporal baseline
+  -> fhp21.jsonl export
+```
+
+The worker never imports the Python 3.11 core package. Its session names, timestamp units,
+coordinate frame, stage names, and `fhp21/v1` labels mirror the core JSON protocol; the
+copied minimal parsing semantics are documented in the worker modules. A validated bridge
+imports the immutable worker package through the core's single `RunArtifactWriter`.
+
+Video frames are decoded in presentation order with the locked OpenCV already installed
+by the OpenMMLab stack. PyYAML is likewise already present in `uv.lock`; the worker adds no
+new runtime dependency. Do **not** run `uv sync` on the configured H20 host because that
+would replace the locally compiled SM90 MMCV wheel. Keep using its Python directly:
+
+```bash
+cd /mnt/workspace/zyf/fisheye/fisheye-handpose/deploy/mmpose-h20
+PYTHONPATH=worker .venv/bin/python -m fisheye_h20_worker \
+  /ABS/PATH/request.json /ABS/PATH/worker-result
+```
+
+The worker is invoked through `PYTHONPATH` so the already-built environment does not need
+an editable reinstall. `pyproject.toml` and `uv.lock` remain unchanged and consistent; no
+dependency resolution or environment mutation is required for this worker.
+
+The request uses the strict `fisheye-handpose/h20-worker-request/v1` schema:
+
+```json
+{
+  "schema_version": "fisheye-handpose/h20-worker-request/v1",
+  "session": {
+    "path": "/mnt/workspace/zyf/fisheye/data/SESSION",
+    "timestamp_column": "timestamp_us",
+    "timestamp_unit": "us",
+    "max_skew_us": 1000,
+    "max_pairs": 100
+  },
+  "calibration": {
+    "path": "/mnt/workspace/zyf/fisheye/data/SESSION/capture_calibration_camera.yaml",
+    "left_camera_id": "cam_0",
+    "right_camera_id": "cam_1",
+    "translation_unit": "mm",
+    "extrinsics_convention": "reference_to_camera",
+    "output_size": [1600, 1300],
+    "balance": 0.8,
+    "fov_scale": 1.0
+  },
+  "thresholds": {
+    "bbox_score": 0.3,
+    "keypoint_score": 0.2,
+    "association_epipolar_px": 5.0,
+    "max_reprojection_error_px": 3.0,
+    "min_ray_angle_deg": 0.5
+  },
+  "models": {
+    "manifest": "/ABS/PATH/model-assets.json",
+    "model_dir": "/ABS/PATH/models/openmmlab",
+    "mmpose_source": "/ABS/PATH/vendor/mmpose",
+    "device": "cuda:0",
+    "detector_category_id": 0,
+    "license_risk_acknowledged": true
+  },
+  "artifacts": {
+    "source_frames": "SAMPLED",
+    "sample_every": 1,
+    "image_format": "jpg"
+  },
+  "tracking": {
+    "max_root_distance_m": 0.15,
+    "max_gap_ms": 250
+  },
+  "mano": {
+    "model_root": "/ABS/PATH/models",
+    "manifest": "/ABS/PRIVATE/PATH/mano-assets.json",
+    "min_valid_landmarks": 15,
+    "max_fit_rmse_m": 0.02,
+    "iterations": 40,
+    "learning_rate": 0.03
+  },
+  "temporal": {
+    "method": "causal_time_ema_v1",
+    "time_constant_ms": 80,
+    "gap_reset_ms": 250
+  }
+}
+```
+
+`tracking` and `temporal` may be omitted to use the shown defaults. `mano` is optional;
+set it to `null` or omit it to run a raw-geometry temporal baseline. That path always emits
+`KINEMATIC_REFINEMENT / SKIPPED / output_status=NOT_PRODUCED` instead of claiming a MANO
+result. When configured, both MANO files are checked against the private manifest before
+SMPL-X can deserialize either pickle. The manifest must contain the same explicit license,
+provenance, filenames, byte counts, and full SHA-256 identities required by
+`scripts/mano_smoke.py`.
+
+Tracking uses a wrist (or valid-landmark centroid) anchor and deterministic
+max-cardinality/min-distance one-to-one assignment. Every assignment states `MATCHED` or
+`NEW`, its distance, and its actual time delta. The first high-quality MANO frame for each
+track fits both left and right models and selects the lower accepted RMSE. That handedness
+and the selected ten shape coefficients are then shared by the track; later fits optimize
+only pose, global orientation, and translation with beta frozen. The explicit mapping
+`mano-v1.2-j16-tips-to-fhp21/v1` converts the MANO 16 joints plus five topology fingertip
+vertices to FHP21 order.
+
+The temporal stage is deliberately labeled a baseline, not a learned smoother. Its causal
+EMA coefficient is `1 - exp(-dt/tau)` using each record's real timestamp. It resets on a
+configured time gap, non-monotonic timestamp, or switch between raw and MANO input; it
+never substitutes a fixed per-frame alpha or silently blends two geometry sources.
+
+`license_risk_acknowledged` does not bypass any identity check. Before deserializing a
+checkpoint, the worker verifies the manifest schema, fixed config binding, size and full
+SHA-256 of both weights. It also requires the clean MMPose v1.3.2 commit and records its
+config Git blobs. Both detector and pose model are initialized exactly once per request.
+
+Every previously absent result path becomes one immutable process package:
+
+```text
+worker-result/
+  manifest.json              # request, calibration, model/source provenance
+  events.jsonl               # complete stage DAG through EXPORT
+  summary.json               # terminal status and aggregate counts
+  fhp21.jsonl                # one final FHP21 record per produced track/frame
+  blobs/sha256/ab/...json     # raw, MANO and temporal stage payloads
+  blobs/sha256/ab/...jpg      # optional content-addressed source frames
+```
+
+`events.jsonl` retains native and rectified 2D points, all 21 confidence values, matched
+and unmatched candidate IDs, metric `landmarks_xyz_m`, per-joint validity, epipolar error,
+left/right reprojection error, ray angle, track decisions, MANO parameters and fit quality,
+temporal reset state, and export provenance. Viewer records use top-level `track_id`,
+`detections[]`, `keypoints_uv`, `keypoint_scores`, `landmarks_xyz_m`, and `validity`; the
+aggregate pose evidence is retained separately. `NONE`, `ALL`, and `SAMPLED` source-frame
+policies control source image storage without changing inference. An existing result
+directory is never overwritten. A stage with no actual output uses `NOT_PRODUCED` and is
+never summarized as produced. If a late failure occurs after earlier frames were written,
+the summary hashes that file as `partial_fhp21_output`; the bridge imports it only as a
+debug artifact and keeps the package output status `NOT_PRODUCED`.
+
+Each `fhp21.jsonl` line uses `fisheye-handpose/fhp21-output/v1` and contains the global
+integer `frame_index`, lossless source `frame_id`, `timestamp_ns`, `track_id`, raw evidence,
+an optional MANO result, temporal result, `selected_output_stage`, final 21 metric XYZ
+values, and per-joint validity. It is created only when at least one final record exists.
+
+### Import into the canonical core trace
+
+The worker package is staging output, not a second front-end catalog. The backend does not
+scan `events.jsonl` directly. A core `PipelineStageExecutor` must run the worker in a
+separate result directory and then import it through the standard-library-only bridge:
+
+```python
+from fisheye_h20_worker.bridge import load_import_bundle
+
+bundle = load_import_bundle(worker_result_dir)
+record_ids = []
+for record in bundle.core_records(external_parent_id=audit_record_id):
+    blobs = tuple(
+        writer.put_blob(
+            blob.source_path.read_bytes(),
+            role=blob.role,
+            media_type=blob.media_type,
+            suffix=blob.suffix,
+        )
+        for blob in record.blobs
+    )
+    persisted = writer.append(
+        record_id=record.record_id,
+        stage=TraceStage(record.stage),
+        status=TraceStatus(record.status),
+        event=record.event,
+        payload=record.payload,
+        parent_ids=record.parent_ids,
+        blobs=blobs,
+    )
+    record_ids.append(persisted.record_id)
+```
+
+The bridge validates manifest/summary schemas, event ordinals and DAG parents, strict JSON,
+blob paths, sizes, and SHA-256 digests. It attaches the complete worker manifest,
+`events.jsonl`, summary, and (when produced) `fhp21.jsonl` to the first imported record,
+then copies every referenced source/raw/MANO/temporal blob through the core writer.
+Therefore the canonical `runs/<item>/<run>/` directory still has exactly one writer and one
+hash chain.
+
+`payload.frame_index` is a globally increasing integer across all video parts for backend
+routing. `payload.frame_id` retains the lossless source identity such as
+`part0002/pair000000`; the per-part `pair_index` may restart at zero and must not be used as
+the catalog frame key. Event/record IDs use the URL-safe equivalent
+`part0002:pair000000:...`, while the payload remains lossless. The core
+`H20WorkerExecutor` provides this process/import adapter;
+configure it through the core `run-item --h20-executor-config ...` option. Without that option,
+`run-item` correctly records model stages as `SKIPPED / NOT_PRODUCED`.
+
+### Canonical end-to-end invocation
+
+[`h20-executor.example.json`](h20-executor.example.json) wraps the request above in the
+required `fisheye-handpose/h20-executor/v1` process configuration. It contains the exact
+paths of the existing H20 installation. The core replaces session path, calibration path,
+camera IDs, units, output size, and timestamp settings from the audited item; `max_pairs`
+and perception/MANO/temporal settings remain controlled by the template.
+
+```bash
+cd /mnt/workspace/zyf/fisheye/fisheye-handpose
+.venv/bin/fisheye-handpose run-item \
+  /mnt/workspace/zyf/fisheye/data/Orbbec_Ego_AZEL764000H_19700102_204253 \
+  --runs-root /mnt/workspace/zyf/fisheye/fisheye-handpose/runs \
+  --run-id h20-e2e-20260813 \
+  --left-id cam_0 --right-id cam_1 \
+  --translation-unit mm \
+  --extrinsics-convention reference_to_camera \
+  --max-skew-us 1000 \
+  --h20-executor-config deploy/mmpose-h20/h20-executor.example.json
+```
+
+The worker staging directory is temporary. After validation, events and blobs enter the
+canonical `runs/<item>/<run>/` hash chain. The final JSONL is retained under blob role
+`worker_fhp21_output`; it is downloadable from the React inspector/API and is not
+duplicated as a mutable `runs/<item>/<run>/fhp21.jsonl` file.
+
 ## Tests
 
 The deployment contract tests use only the Python standard library, so manifest and CLI
@@ -151,6 +408,13 @@ validation can run before installing the Linux-only CUDA environment:
 
 ```bash
 python3 -m unittest discover -s tests -v
+```
+
+The worker tests use a fake model/video runtime but real KB4 rectification and stereo
+geometry, so they do not initialize CUDA or deserialize checkpoints:
+
+```bash
+python3 -m unittest tests/test_worker.py -v
 ```
 
 Do not run `uv sync` for this subproject on macOS: the pinned MMCV wheel intentionally

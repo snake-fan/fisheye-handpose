@@ -155,7 +155,7 @@ Advanced implementations may retain per-view reprojection evidence, optimize roo
 and local articulation separately, and use causal, fixed-lag, or bidirectional windows.
 They must preserve source observation IDs and distinguish prediction from refinement.
 
-## Milestone 1: geometry foundation
+## Implemented foundation and H20 compatibility baseline
 
 Implemented now:
 
@@ -168,12 +168,19 @@ Implemented now:
 - true `cv2.fisheye.stereoRectify` geometry and remap construction for QA/debugging;
 - empirical rectified epipolar, disparity-sign, and positive-depth QA;
 - versioned `fhp21/v1` definitions and model-neutral contracts;
-- atomic JSON/CSV CLI artifacts with calibration hashes and provenance.
+- atomic JSON/CSV CLI artifacts with calibration hashes and provenance;
+- one immutable `runs/<item>/<run>/` trace shared by audit and worker stages;
+- a process-isolated H20 baseline with RTMDet/RTMPose, calibrated point rectification,
+  cross-view association, metric triangulation, track-local MANO, real-time-delta EMA,
+  and FHP21 JSONL export;
+- a multi-run read-only API and independent React inspector.
 
 Not yet implemented:
 
-- native-fisheye hand detection and virtual crop generation;
-- landmark mapper implementations, association/fusion, and temporal refinement.
+- explicit hand-centred virtual-perspective crop generation (the compatibility worker
+  currently detects on the raw fisheye frame and uses the top-down model crop);
+- learned ray/feature fusion, calibrated 2D covariance, and a learned temporal prior;
+- a production-safe replacement for the legacy OpenMMLab/PyTorch environment.
 
 ## Non-negotiable invariants
 

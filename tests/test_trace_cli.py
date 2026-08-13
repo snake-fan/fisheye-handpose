@@ -259,3 +259,106 @@ def test_failed_audit_still_publishes_a_valid_failed_trace(
     )
     assert report_record.status is TraceStatus.FAILED
     assert "session failed" in capsys.readouterr().err
+
+
+def test_run_item_cli_returns_one_json_result_and_creates_the_catalog_path(
+    trace_tiny_session: Path,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    arguments = _audit_args(trace_tiny_session, tmp_path / "unused-audit.json")
+    arguments[0] = "run-item"
+    output_index = arguments.index("--output")
+    del arguments[output_index : output_index + 2]
+    arguments.extend(
+        (
+            "--runs-root",
+            str(tmp_path / "runs"),
+            "--item-id",
+            "trace-tiny-item",
+            "--run-id",
+            "cli-run-0001",
+        )
+    )
+
+    assert main(arguments) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result == {
+        "audit_status": "WARN",
+        "item_id": "trace-tiny-item",
+        "output_status": "NOT_PRODUCED",
+        "run_dir": str((tmp_path / "runs/trace-tiny-item/cli-run-0001").resolve()),
+        "run_id": "cli-run-0001",
+        "status": "COMPLETED",
+    }
+
+
+def test_run_item_cli_loads_an_explicit_h20_executor_config(
+    trace_tiny_session: Path,
+    tmp_path: Path,
+    capsys,
+    monkeypatch,
+) -> None:
+    from fisheye_handpose.pipeline import PipelineExecutionSummary
+    from fisheye_handpose.trace import TraceStage, TraceStatus
+
+    executor_config = tmp_path / "h20-executor.json"
+    worker_python = tmp_path / "worker-python"
+    worker_python.write_text("", encoding="utf-8")
+    worker_root = tmp_path / "worker-root"
+    worker_root.mkdir()
+    executor_config.write_text(
+        json.dumps(
+            {
+                "schema_version": "fisheye-handpose/h20-executor/v1",
+                "worker_python": str(worker_python),
+                "worker_module_root": str(worker_root),
+                "request": {
+                    "session": {"max_pairs": 5},
+                    "thresholds": {},
+                    "models": {},
+                    "artifacts": {},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    received: dict[str, object] = {}
+
+    class FakeExecutor:
+        def __init__(self, config) -> None:
+            received["config"] = config
+
+        def execute(self, context, writer) -> PipelineExecutionSummary:
+            record = writer.append(
+                record_id="fake-h20:export",
+                stage=TraceStage.EXPORT,
+                status=TraceStatus.SUCCEEDED,
+                event="fhp21_pose_exported",
+                payload={"output_status": "PRODUCED"},
+                parent_ids=(context.audit_record_ids[-1],),
+            )
+            return PipelineExecutionSummary("PRODUCED", (record.record_id,))
+
+    monkeypatch.setattr("fisheye_handpose.h20_executor.H20WorkerExecutor", FakeExecutor)
+    arguments = _audit_args(trace_tiny_session, tmp_path / "unused-audit.json")
+    arguments[0] = "run-item"
+    output_index = arguments.index("--output")
+    del arguments[output_index : output_index + 2]
+    arguments.extend(
+        (
+            "--runs-root",
+            str(tmp_path / "runs"),
+            "--run-id",
+            "h20-cli-run",
+            "--h20-executor-config",
+            str(executor_config),
+        )
+    )
+
+    assert main(arguments) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["output_status"] == "PRODUCED"
+    assert received["config"].worker_python == worker_python

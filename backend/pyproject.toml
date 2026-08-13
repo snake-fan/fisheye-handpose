@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fisheye-trace-api"
+version = "0.1.0"
+description = "Read-only multi-run trace catalog API for fisheye-handpose"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<0.116",
+  "fisheye-handpose==0.1.0",
+  "uvicorn>=0.34,<0.35",
+]
+
+[tool.uv.sources]
+fisheye-handpose = { path = ".." }
+
+[project.scripts]
+fisheye-trace-api = "fisheye_trace_api.cli:main"
+
+[dependency-groups]
+dev = [
+  "httpx>=0.28,<0.29",
+  "pytest>=8,<9",
+  "ruff>=0.9,<1",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fisheye_trace_api"]

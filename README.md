@@ -4,17 +4,18 @@ An independent, calibration-first project for extracting metric 21-landmark hand
 from synchronized stereo fisheye video. It does **not** import or execute the existing
 VLA pipeline.
 
-The project is intentionally split into two layers:
+The project is intentionally split into three independently deployable layers:
 
 1. A strict geometry foundation: session discovery, timestamp pairing, Orbbec KB4
    calibration normalization, full video decode audit, true stereo rectification/QA,
    timestamp-indexed stereo reading, and a versioned 21-landmark contract.
-2. Pluggable perception: native-fisheye detection, virtual perspective hand crops,
-   per-view pose evidence, calibrated fusion, optional kinematic refinement, and
-   confidence-aware temporal refinement.
+2. An isolated H20 worker: RTMDet + RTMPose evidence, calibrated stereo fusion,
+   tracking, optional MANO fitting, temporal refinement, and FHP21 export.
+3. A read-only FastAPI run catalog and an independent React/TypeScript inspector.
 
-Only the first layer is implemented in the initial milestone. No model weights or
-model-specific licenses are embedded in the core package.
+The worker is a real compatibility baseline, but currently detects on full raw fisheye
+frames and relies on the top-down model crop. Explicit virtual-perspective crops remain
+future accuracy work. No weights, MANO files, or private manifests are embedded here.
 
 ## Coordinate and unit conventions
 
@@ -32,17 +33,14 @@ extrinsics. Commands therefore require both values explicitly; they are never gu
 
 ```bash
 uv python install 3.11
-uv sync --locked --extra dev --no-editable
-uv run --locked --no-editable fisheye-handpose schema
+uv sync --locked --extra dev
+uv run --locked fisheye-handpose schema
 ```
 
 `uv.lock` is the source of truth for the cross-platform geometry environment. Use
-`uv lock --check` in CI and `uv sync --locked --no-editable` when reproducing an existing
-lock; do not replace these commands with an unconstrained `pip install`. The non-editable
-install also tests the actual packaged artifact instead of letting source-tree imports
-hide packaging mistakes. Keep both `--locked` and `--no-editable` on subsequent `uv run`
-commands so uv neither changes the resolution nor switches the project back to an
-editable install.
+`uv lock --check` in CI and `uv sync --locked` in development; do not replace these with
+an unconstrained `pip install`. CI/release verification additionally uses
+`uv sync --locked --no-editable` so source-tree imports cannot hide packaging mistakes.
 
 ## Geometry CLI
 
@@ -84,7 +82,38 @@ empirical epipolar/disparity/positive-depth QA. Its JSON report is written atomi
 invalid or inconclusive physical geometry exits non-zero. Other commands write
 machine-readable JSON to stdout unless `--output` is supplied; diagnostics go to stderr.
 
-## Stage traces and local inspection UI
+## One immutable folder per data item
+
+`run-item` creates one non-overwriting attempt under
+`runs/<item_id>/<run_id>/`. The folder contains `run_manifest.json`, `trace.jsonl`,
+`run_summary.json`, and content-addressed `blobs/sha256/...`. Audit, perception, MANO,
+temporal, export, warning, and failure records share one hash chain; an absent stage is
+recorded as `SKIPPED / NOT_PRODUCED`.
+
+On the configured H20, run one real data item with the checked-in executor profile:
+
+```bash
+cd /mnt/workspace/zyf/fisheye/fisheye-handpose
+.venv/bin/fisheye-handpose run-item \
+  /mnt/workspace/zyf/fisheye/data/Orbbec_Ego_AZEL764000H_19700102_204253 \
+  --runs-root /mnt/workspace/zyf/fisheye/fisheye-handpose/runs \
+  --run-id h20-e2e-20260813 \
+  --left-id cam_0 --right-id cam_1 \
+  --translation-unit mm \
+  --extrinsics-convention reference_to_camera \
+  --max-skew-us 1000 \
+  --h20-executor-config deploy/mmpose-h20/h20-executor.example.json
+```
+
+The checked-in debugging template processes at most 120 synchronized pairs, saves source
+evidence for every processed pair, and uses the reviewed H20 asset locations. Once a run
+has been visually accepted, increase `artifacts.sample_every` to reduce storage. The
+orchestrator replaces its session/calibration fields with audited values.
+The final `fhp21.jsonl` is imported as a verified content-addressed blob with role
+`worker_fhp21_output`, not copied to a mutable top-level run file. Download it through the
+React/API artifact link or locate it from the EXPORT provenance.
+
+## Stage traces and inspection UIs
 
 Every pipeline stage can write append-only records to a run artifact directory. Records
 carry explicit parent IDs and form a SHA-256 chain; source images, overlays, arrays, and
@@ -96,7 +125,7 @@ The on-disk v1 protocol, payload conventions, lifecycle, and integrity guarantee
 defined in [docs/trace-format.md](docs/trace-format.md).
 
 Generate a deterministic three-frame stereo example, validate it, then inspect it in the
-local read-only UI:
+legacy single-run read-only UI:
 
 ```bash
 uv run --locked --no-editable fisheye-handpose trace-demo runs/demo
@@ -109,6 +138,23 @@ Open `http://127.0.0.1:8000/`. The example contains three frames and the complet
 stage vocabulary, including stereo source SVGs, detections, virtual crops, per-view 2D
 evidence, association, raw 3D fusion, kinematic/temporal refinement, QA, and export links.
 It is synthetic inspection data and must not be interpreted as a model accuracy result.
+
+For the normal multi-item workflow, start the independent API and React application:
+
+```bash
+cd backend
+uv sync --locked --group dev
+uv run --locked --no-editable fisheye-trace-api --catalog-root ../runs \
+  --host 127.0.0.1 --port 8000
+
+# another terminal
+cd frontend
+npm ci
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`. Remote H20 inspection uses an SSH tunnel; see
+[backend/README.md](backend/README.md) and [frontend/README.md](frontend/README.md).
 
 To persist the stages already executed by `audit-session`, add a trace directory:
 
@@ -134,10 +180,9 @@ run. `RunArtifactWriter.open(RUN_DIR)` resumes that run under a single-writer lo
 run directory as immutable after finalization; `trace-validate` checks both its record
 chain and referenced blob hashes and exits non-zero on corruption.
 
-Full-frame stereo rectification is a geometry/QA utility, not the mandatory image fed
-to a hand model. The perception path will detect in native fisheye pixels and resample
-only hand-centred virtual perspective crops so that peripheral field of view is not
-silently discarded.
+Full-frame stereo rectification is a geometry/QA utility, not the mandatory model image.
+The current compatibility worker detects in native fisheye pixels and uses RTMPose's
+top-down crop. A future backend should add explicit hand-centred virtual-perspective crops.
 
 ## Tests
 
@@ -149,6 +194,7 @@ uv run --locked --extra dev --no-editable ruff check .
 The tests include synthetic projection/rectification geometry, timestamp drops and
 offset tails, full video decode and frame selection, CLI failure reports, calibration
 direction/unit checks, deterministic discovery, and the `fhp21/v1` contract.
+The H20 worker, process bridge, multi-run API, and React project have separate tests too.
 
 See [docs/architecture.md](docs/architecture.md) for the planned model-facing APIs and
 the next implementation milestone. The attached engineering proposal has been evaluated

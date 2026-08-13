@@ -7,6 +7,44 @@ changed after the run.
 
 ## Directory layout
 
+Completed data items are catalogued with two immutable identity levels:
+
+```text
+runs/
+  SAFE_ITEM_ID/
+    RUN_ID/
+      run_manifest.json
+      trace.jsonl
+      run_summary.json
+      .writer.lock
+      blobs/sha256/...
+```
+
+`SAFE_ITEM_ID` identifies the source data item and `RUN_ID` identifies one execution of
+the pipeline. An explicit ID is accepted only when it is one safe ASCII path component
+matching `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`. If the source session ID needs
+normalization, the default item ID adds the first eight hexadecimal characters of its
+SHA-256 digest so two distinct source IDs cannot silently collapse onto one slug. A
+generated run ID combines UTC time with a random suffix. An existing run directory is
+never reopened or overwritten by `run-item`.
+
+The command that creates this catalog entry is:
+
+```bash
+fisheye-handpose run-item /path/to/session \
+  --runs-root runs \
+  --left-id cam_0 --right-id cam_1 \
+  --translation-unit mm \
+  --extrinsics-convention reference_to_camera \
+  --max-skew-us 1000
+```
+
+`--item-id` and `--run-id` may be supplied for deterministic orchestration. The command
+prints one JSON result containing `item_id`, `run_id`, `run_dir`, terminal `status`,
+`audit_status`, and `output_status`.
+
+Each leaf directory is one canonical stage trace:
+
 ```text
 RUN_DIR/
   run_manifest.json       # immutable run identity, config, inputs, manifest hash
@@ -16,6 +54,16 @@ RUN_DIR/
   blobs/sha256/ab/
     abcdef...png           # content-addressed images, arrays, reports, and video clips
 ```
+
+The current core runner uses one `RunArtifactWriter` for the complete leaf directory.
+It appends the audit as the provenance prefix, then appends later stage records to that
+same hash chain. External model workers attach through the minimal
+`PipelineStageExecutor.execute(context, writer)` boundary and return a
+`PipelineExecutionSummary`; the core does not import or pre-compose their model stacks.
+When perception/MANO/temporal backends are absent, their stages are not
+silently omitted: each has a `SKIPPED` record with `output_status: NOT_PRODUCED`. An
+audit-gate failure still finalizes and retains the leaf with terminal status `FAILED`, so
+the front end can inspect the failure instead of losing its intermediate evidence.
 
 `run_manifest.json` starts the run with status `ACTIVE`. The manifest is never rewritten.
 The terminal status (`COMPLETED` or `FAILED`) is written separately to
@@ -106,15 +154,20 @@ published atomically.
 The integrity chain is tamper-evident, not a cryptographic signature. If traces cross a
 trust boundary, sign or archive the completed directory with an external trusted system.
 
-## Local viewer
+## Inspection frontends
 
 `trace-serve` exposes a loopback-only, read-only HTTP server. It has no upload or mutation
 endpoint. The UI displays run validation, global records, the frame timeline, stage and
 track filters, artifact previews, 2D overlays, a FHP21 3D canvas, and the original JSON.
 Artifacts are served only after their content hash and in-run path have been verified.
 
-The deterministic `trace-demo` command exercises the full planned stage vocabulary for
-UI testing. Its records are synthetic and are not model outputs. Currently,
-`audit-session --trace-output` emits real discovery, calibration, timestamp, decode,
-rectification, epipolar-QA, warning, and failure records. Perception/MANO/temporal records
-will become real only when those producers are implemented and call the same writer API.
+The deterministic `trace-demo` command exercises the full stage vocabulary for UI testing;
+its records are synthetic. `audit-session --trace-output` emits only the real audit stages.
+`run-item --h20-executor-config ...` keeps that audit evidence in the same writer and then
+imports real worker detection, pose, association, fusion, optional MANO, temporal, export,
+warning, and failure records through a validated process package.
+
+The normal catalog UI is split into `backend/` (read-only FastAPI, recursive multi-run
+catalog) and `frontend/` (React/TypeScript). It uses opaque `run_key` and `frame_key`
+identities, paginates long sequences, and can download the content-addressed final JSONL.
+The legacy `trace-serve` remains useful for one-run, dependency-free inspection.

@@ -1,0 +1,243 @@
+"""Deterministic epipolar association and metric rectified stereo triangulation."""
+
+from __future__ import annotations
+
+import math
+import statistics
+from itertools import combinations
+from typing import Any
+
+from .calibration import RectifiedStereo
+from .contracts import ThresholdRequest, WorkerError
+
+
+def normalize_instances(
+    instances: Any,
+    *,
+    side: str,
+    rectification: RectifiedStereo,
+) -> list[dict[str, Any]]:
+    if not isinstance(instances, list):
+        raise WorkerError("runtime inference must return a list")
+    normalized: list[dict[str, Any]] = []
+    for index, instance in enumerate(instances):
+        if not isinstance(instance, dict):
+            raise WorkerError("runtime pose instance must be an object")
+        bbox = instance.get("bbox_xyxy")
+        points = instance.get("keypoints_uv")
+        scores = instance.get("keypoint_scores")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            raise WorkerError("runtime bbox_xyxy must contain four values")
+        if not isinstance(points, list) or len(points) != 21:
+            raise WorkerError("runtime keypoints_uv must contain 21 points")
+        if not isinstance(scores, list) or len(scores) != 21:
+            raise WorkerError("runtime keypoint_scores must contain 21 values")
+        if any(not isinstance(point, list) or len(point) != 2 for point in points):
+            raise WorkerError("each runtime keypoint must contain u and v")
+        bbox_score = instance.get("bbox_score")
+        label = instance.get("label")
+        if isinstance(label, bool) or not isinstance(label, int):
+            raise WorkerError("runtime detection label must be an integer")
+        numeric = [
+            *bbox,
+            *scores,
+            bbox_score,
+            *(value for point in points for value in point),
+        ]
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            for value in numeric
+        ):
+            raise WorkerError("runtime inference contains a non-finite numeric value")
+        normalized.append(
+            {
+                "candidate_id": f"{side}-{index}",
+                "bbox_xyxy": [float(value) for value in bbox],
+                "bbox_score": float(bbox_score),
+                "label": label,
+                "keypoints_uv": [[float(u), float(v)] for u, v in points],
+                "keypoints_uv_rectified": rectification.rectify_points(side, points),
+                "keypoint_scores": [float(value) for value in scores],
+            }
+        )
+    return normalized
+
+
+def _association_cost(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    keypoint_threshold: float,
+) -> tuple[float, int]:
+    residuals = [
+        abs(left_point[1] - right_point[1])
+        for left_point, right_point, left_score, right_score in zip(
+            left["keypoints_uv_rectified"],
+            right["keypoints_uv_rectified"],
+            left["keypoint_scores"],
+            right["keypoint_scores"],
+            strict=True,
+        )
+        if left_score >= keypoint_threshold and right_score >= keypoint_threshold
+    ]
+    return (float(statistics.median(residuals)), len(residuals)) if residuals else (math.inf, 0)
+
+
+def associate(
+    left_instances: list[dict[str, Any]],
+    right_instances: list[dict[str, Any]],
+    thresholds: ThresholdRequest,
+) -> dict[str, Any]:
+    if len(left_instances) > 2 or len(right_instances) > 2:
+        raise WorkerError("association supports at most two candidates per view")
+    candidates: list[tuple[float, int, int, int]] = []
+    for left_index, left in enumerate(left_instances):
+        for right_index, right in enumerate(right_instances):
+            cost, support = _association_cost(left, right, thresholds.keypoint_score)
+            if support and cost <= thresholds.association_epipolar_px:
+                candidates.append((cost, -support, left_index, right_index))
+    candidates.sort(key=lambda value: (value[2], value[3], value[0], value[1]))
+    assignments: list[tuple[tuple[float, int, int, int], ...]] = [()]
+    for size in range(1, min(len(left_instances), len(right_instances)) + 1):
+        for subset in combinations(candidates, size):
+            left_indices = {candidate[2] for candidate in subset}
+            right_indices = {candidate[3] for candidate in subset}
+            if len(left_indices) == size and len(right_indices) == size:
+                assignments.append(subset)
+    selected = min(
+        assignments,
+        key=lambda subset: (
+            -len(subset),
+            sum(candidate[0] for candidate in subset),
+            tuple((candidate[2], candidate[3]) for candidate in subset),
+        ),
+    )
+    selected = tuple(sorted(selected, key=lambda value: (value[2], value[3])))
+    used_left = {candidate[2] for candidate in selected}
+    used_right = {candidate[3] for candidate in selected}
+    matches: list[dict[str, Any]] = []
+    for cost, negative_support, left_index, right_index in selected:
+        matches.append(
+            {
+                "match_id": f"match-{len(matches)}",
+                "left_index": left_index,
+                "right_index": right_index,
+                "left_candidate_id": left_instances[left_index]["candidate_id"],
+                "right_candidate_id": right_instances[right_index]["candidate_id"],
+                "median_epipolar_error_px": cost,
+                "supporting_keypoint_count": -negative_support,
+            }
+        )
+    return {
+        "matches": matches,
+        "unmatched_left_indices": [
+            index for index in range(len(left_instances)) if index not in used_left
+        ],
+        "unmatched_right_indices": [
+            index for index in range(len(right_instances)) if index not in used_right
+        ],
+    }
+
+
+def _camera_center_and_inverse(projection: Any) -> tuple[Any, Any]:
+    import numpy as np
+
+    matrix = projection[:, :3]
+    inverse = np.linalg.inv(matrix)
+    center = -inverse @ projection[:, 3]
+    return center, inverse
+
+
+def triangulate_match(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    rectification: RectifiedStereo,
+    thresholds: ThresholdRequest,
+) -> dict[str, Any]:
+    import cv2
+    import numpy as np
+
+    _, left_inverse = _camera_center_and_inverse(rectification.p1)
+    _, right_inverse = _camera_center_and_inverse(rectification.p2)
+    landmarks: list[list[float] | None] = []
+    validity: list[str] = []
+    metrics: list[dict[str, Any]] = []
+    for joint_index, (left_uv, right_uv, left_score, right_score) in enumerate(
+        zip(
+            left["keypoints_uv_rectified"],
+            right["keypoints_uv_rectified"],
+            left["keypoint_scores"],
+            right["keypoint_scores"],
+            strict=True,
+        )
+    ):
+        metric: dict[str, Any] = {
+            "joint_index": joint_index,
+            "epipolar_error_px": abs(left_uv[1] - right_uv[1]),
+            "left_score": left_score,
+            "right_score": right_score,
+            "left_reprojection_error_px": None,
+            "right_reprojection_error_px": None,
+            "ray_angle_deg": None,
+        }
+        reason: str | None = None
+        point: Any | None = None
+        if left_score < thresholds.keypoint_score or right_score < thresholds.keypoint_score:
+            reason = "LOW_KEYPOINT_SCORE"
+        elif metric["epipolar_error_px"] > thresholds.association_epipolar_px:
+            reason = "EPIPOLAR_ERROR"
+        else:
+            homogeneous = cv2.triangulatePoints(
+                rectification.p1,
+                rectification.p2,
+                np.asarray(left_uv, dtype=np.float64).reshape(2, 1),
+                np.asarray(right_uv, dtype=np.float64).reshape(2, 1),
+            )[:, 0]
+            if not np.all(np.isfinite(homogeneous)) or abs(float(homogeneous[3])) <= 1e-12:
+                reason = "DEGENERATE_TRIANGULATION"
+            else:
+                point = homogeneous[:3] / homogeneous[3]
+                if not np.all(np.isfinite(point)) or point[2] <= 0:
+                    reason = "BEHIND_CAMERA"
+                else:
+                    reprojections: list[float] = []
+                    for projection, observed, label in (
+                        (rectification.p1, left_uv, "left"),
+                        (rectification.p2, right_uv, "right"),
+                    ):
+                        projected = projection @ np.append(point, 1.0)
+                        projected_uv = projected[:2] / projected[2]
+                        error = float(np.linalg.norm(projected_uv - np.asarray(observed)))
+                        metric[f"{label}_reprojection_error_px"] = error
+                        reprojections.append(error)
+                    left_ray = left_inverse @ np.asarray([*left_uv, 1.0])
+                    right_ray = right_inverse @ np.asarray([*right_uv, 1.0])
+                    left_ray /= np.linalg.norm(left_ray)
+                    right_ray /= np.linalg.norm(right_ray)
+                    cosine = float(np.clip(np.dot(left_ray, right_ray), -1.0, 1.0))
+                    metric["ray_angle_deg"] = math.degrees(math.acos(cosine))
+                    if max(reprojections) > thresholds.max_reprojection_error_px:
+                        reason = "REPROJECTION_ERROR"
+                    elif metric["ray_angle_deg"] < thresholds.min_ray_angle_deg:
+                        reason = "RAY_ANGLE_TOO_SMALL"
+        if reason is None and point is not None:
+            landmarks.append([float(value) for value in point])
+            validity.append("VALID")
+        else:
+            landmarks.append(None)
+            validity.append(reason or "INVALID")
+        metrics.append(metric)
+    return {
+        "coordinate_frame": "rectified_left_camera",
+        "length_unit": "m",
+        "landmark_schema": "fhp21/v1",
+        "landmarks_xyz_m": landmarks,
+        "validity": validity,
+        "metrics": metrics,
+        "valid_landmark_count": sum(value == "VALID" for value in validity),
+    }
+
+
+__all__ = ["associate", "normalize_instances", "triangulate_match"]

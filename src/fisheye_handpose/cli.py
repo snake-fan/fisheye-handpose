@@ -688,6 +688,69 @@ def _command_audit_session(args: argparse.Namespace) -> None:
         raise FisheyeHandposeError("session failed one or more hard audit gates")
 
 
+def _command_run_item(args: argparse.Namespace) -> None:
+    from .h20_executor import H20ExecutorConfig, H20WorkerExecutor
+    from .pipeline import PipelineRunRequest, run_data_item
+
+    executor = None
+    if args.h20_executor_config:
+        executor = H20WorkerExecutor(H20ExecutorConfig.from_file(args.h20_executor_config))
+    result = run_data_item(
+        PipelineRunRequest(
+            session_path=args.session,
+            runs_root=args.runs_root,
+            audit_config=_audit_config(args),
+            item_id=args.item_id,
+            run_id=args.run_id,
+            pipeline_version=args.pipeline_version,
+        ),
+        backends=executor,
+    )
+    _write_json(result.to_dict(), None)
+    if result.status.value == "FAILED":
+        raise FisheyeHandposeError("data item failed one or more hard pipeline gates")
+
+
+def _add_audit_execution_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--column", default="timestamp_us")
+    parser.add_argument("--timestamp-unit", choices=("ns", "us", "ms"), default="us")
+    parser.add_argument("--max-skew-us", required=True, type=_positive_int)
+    parser.add_argument("--clock-offset-us", type=int, default=0)
+    parser.add_argument(
+        "--min-video-bytes",
+        type=_nonnegative_int,
+        default=0,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--min-pair-count", type=_positive_int, default=20)
+    parser.add_argument("--min-overlap-duration-s", type=_positive_float, default=0.75)
+    parser.add_argument("--min-overlap-match-rate", type=_unit_interval, default=0.0)
+    parser.add_argument("--min-timestamp-fps", type=_positive_float, default=29.5)
+    parser.add_argument("--max-timestamp-fps", type=_positive_float, default=30.5)
+    parser.add_argument(
+        "--max-timestamp-fps-relative-difference",
+        type=_unit_interval,
+        default=0.001,
+    )
+    parser.add_argument("--max-p99-skew-us", type=_positive_int, default=250)
+    parser.add_argument("--max-observed-skew-us", type=_positive_int, default=500)
+    parser.add_argument("--output-width", type=_positive_int, default=1600)
+    parser.add_argument("--output-height", type=_positive_int, default=1300)
+    parser.add_argument("--balance", type=_unit_interval, default=0.8)
+    parser.add_argument("--fov-scale", type=_positive_float, default=1.0)
+    parser.add_argument("--min-common-valid-fraction", type=_unit_interval, default=0.80)
+    parser.add_argument("--min-camera-valid-fraction", type=_unit_interval, default=0.82)
+    parser.add_argument("--min-hfov-deg", type=_positive_float, default=150.0)
+    parser.add_argument("--min-vfov-deg", type=_positive_float, default=145.0)
+    parser.add_argument("--allow-short-session", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--skip-epipolar-qa", action="store_true")
+    parser.add_argument("--epipolar-sample-pairs", type=int, default=12)
+    parser.add_argument("--epipolar-min-inliers", type=int, default=60)
+    parser.add_argument("--max-median-epipolar-error-px", type=float, default=0.75)
+    parser.add_argument("--max-p95-epipolar-error-px", type=float, default=2.0)
+    _add_calibration_arguments(parser)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fisheye-handpose")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -753,44 +816,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--trace-output",
         help="create an immutable stage trace directory after writing the audit report",
     )
-    audit.add_argument("--column", default="timestamp_us")
-    audit.add_argument("--timestamp-unit", choices=("ns", "us", "ms"), default="us")
-    audit.add_argument("--max-skew-us", required=True, type=_positive_int)
-    audit.add_argument("--clock-offset-us", type=int, default=0)
-    audit.add_argument(
-        "--min-video-bytes",
-        type=_nonnegative_int,
-        default=0,
-        help=argparse.SUPPRESS,
-    )
-    audit.add_argument("--min-pair-count", type=_positive_int, default=20)
-    audit.add_argument("--min-overlap-duration-s", type=_positive_float, default=0.75)
-    audit.add_argument("--min-overlap-match-rate", type=_unit_interval, default=0.0)
-    audit.add_argument("--min-timestamp-fps", type=_positive_float, default=29.5)
-    audit.add_argument("--max-timestamp-fps", type=_positive_float, default=30.5)
-    audit.add_argument(
-        "--max-timestamp-fps-relative-difference",
-        type=_unit_interval,
-        default=0.001,
-    )
-    audit.add_argument("--max-p99-skew-us", type=_positive_int, default=250)
-    audit.add_argument("--max-observed-skew-us", type=_positive_int, default=500)
-    audit.add_argument("--output-width", type=_positive_int, default=1600)
-    audit.add_argument("--output-height", type=_positive_int, default=1300)
-    audit.add_argument("--balance", type=_unit_interval, default=0.8)
-    audit.add_argument("--fov-scale", type=_positive_float, default=1.0)
-    audit.add_argument("--min-common-valid-fraction", type=_unit_interval, default=0.80)
-    audit.add_argument("--min-camera-valid-fraction", type=_unit_interval, default=0.82)
-    audit.add_argument("--min-hfov-deg", type=_positive_float, default=150.0)
-    audit.add_argument("--min-vfov-deg", type=_positive_float, default=145.0)
-    audit.add_argument("--allow-short-session", action="store_true", help=argparse.SUPPRESS)
-    audit.add_argument("--skip-epipolar-qa", action="store_true")
-    audit.add_argument("--epipolar-sample-pairs", type=int, default=12)
-    audit.add_argument("--epipolar-min-inliers", type=int, default=60)
-    audit.add_argument("--max-median-epipolar-error-px", type=float, default=0.75)
-    audit.add_argument("--max-p95-epipolar-error-px", type=float, default=2.0)
-    _add_calibration_arguments(audit)
+    _add_audit_execution_arguments(audit)
     audit.set_defaults(func=_command_audit_session)
+
+    run_item = subparsers.add_parser(
+        "run-item",
+        help="run one stereo data item into an immutable catalog directory",
+    )
+    run_item.add_argument("session")
+    run_item.add_argument("--runs-root", required=True)
+    run_item.add_argument("--item-id", type=_nonempty_text)
+    run_item.add_argument("--run-id", type=_nonempty_text)
+    run_item.add_argument("--pipeline-version", type=_nonempty_text, default=__version__)
+    run_item.add_argument(
+        "--h20-executor-config",
+        help="run model, MANO, temporal, and export stages in the isolated H20 worker",
+    )
+    _add_audit_execution_arguments(run_item)
+    run_item.set_defaults(func=_command_run_item)
     return parser
 
 

@@ -1,0 +1,47 @@
+{
+  "schema_version": "fisheye-handpose/h20-executor/v1",
+  "worker_python": "/mnt/workspace/zyf/fisheye/fisheye-handpose/deploy/mmpose-h20/.venv/bin/python",
+  "worker_module_root": "/mnt/workspace/zyf/fisheye/fisheye-handpose/deploy/mmpose-h20/worker",
+  "request": {
+    "session": {
+      "max_pairs": 120
+    },
+    "thresholds": {
+      "bbox_score": 0.3,
+      "keypoint_score": 0.2,
+      "association_epipolar_px": 5.0,
+      "max_reprojection_error_px": 3.0,
+      "min_ray_angle_deg": 0.5
+    },
+    "models": {
+      "manifest": "/mnt/workspace/zyf/fisheye/fisheye-handpose/deploy/mmpose-h20/model-assets.json",
+      "model_dir": "/mnt/workspace/zyf/fisheye/fisheye-handpose/models/openmmlab",
+      "mmpose_source": "/mnt/workspace/zyf/.cache/fhp-src/mmpose-5408bc76",
+      "device": "cuda:0",
+      "detector_category_id": 0,
+      "license_risk_acknowledged": true
+    },
+    "artifacts": {
+      "source_frames": "SAMPLED",
+      "sample_every": 1,
+      "image_format": "jpg"
+    },
+    "tracking": {
+      "max_root_distance_m": 0.15,
+      "max_gap_ms": 250
+    },
+    "mano": {
+      "model_root": "/mnt/workspace/zyf/fisheye/fisheye-handpose/models",
+      "manifest": "/mnt/workspace/zyf/.private/fisheye-handpose/mano-assets.json",
+      "min_valid_landmarks": 15,
+      "max_fit_rmse_m": 0.02,
+      "iterations": 40,
+      "learning_rate": 0.03
+    },
+    "temporal": {
+      "method": "causal_time_ema_v1",
+      "time_constant_ms": 80,
+      "gap_reset_ms": 250
+    }
+  }
+}
