@@ -84,6 +84,56 @@ empirical epipolar/disparity/positive-depth QA. Its JSON report is written atomi
 invalid or inconclusive physical geometry exits non-zero. Other commands write
 machine-readable JSON to stdout unless `--output` is supplied; diagnostics go to stderr.
 
+## Stage traces and local inspection UI
+
+Every pipeline stage can write append-only records to a run artifact directory. Records
+carry explicit parent IDs and form a SHA-256 chain; source images, overlays, arrays, and
+reports are content-addressed blobs with explicit semantic roles. Finalization writes a separate immutable summary,
+so raw evidence is never overwritten by MANO or temporal output and interrupted runs can
+be reopened while they remain active.
+
+The on-disk v1 protocol, payload conventions, lifecycle, and integrity guarantees are
+defined in [docs/trace-format.md](docs/trace-format.md).
+
+Generate a deterministic three-frame stereo example, validate it, then inspect it in the
+local read-only UI:
+
+```bash
+uv run --locked --no-editable fisheye-handpose trace-demo runs/demo
+uv run --locked --no-editable fisheye-handpose trace-validate runs/demo
+uv run --locked --no-editable fisheye-handpose trace-serve runs/demo \
+  --host 127.0.0.1 --port 8000
+```
+
+Open `http://127.0.0.1:8000/`. The example contains three frames and the complete planned
+stage vocabulary, including stereo source SVGs, detections, virtual crops, per-view 2D
+evidence, association, raw 3D fusion, kinematic/temporal refinement, QA, and export links.
+It is synthetic inspection data and must not be interpreted as a model accuracy result.
+
+To persist the stages already executed by `audit-session`, add a trace directory:
+
+```bash
+uv run --locked --no-editable fisheye-handpose audit-session /path/to/session \
+  --left-id cam_0 --right-id cam_1 \
+  --translation-unit mm \
+  --extrinsics-convention reference_to_camera \
+  --max-skew-us 1000 \
+  --output runs/session-audit.json \
+  --trace-output runs/session-audit-trace
+```
+
+The audit trace records discovery, calibration, rectification, both timestamp streams,
+pairing, full video decode reports, epipolar QA, warnings, and failures. The complete audit
+JSON is attached as a verified blob. It deliberately does not create detector, pose,
+fusion, MANO, or temporal records, because those stages have not run. It also omits image
+previews instead of decoding the videos a second time; perception stages attach source
+frames and overlays as they execute.
+
+For a producer that will append records later, `trace-init RUN_DIR` creates an empty ACTIVE
+run. `RunArtifactWriter.open(RUN_DIR)` resumes that run under a single-writer lock. Treat a
+run directory as immutable after finalization; `trace-validate` checks both its record
+chain and referenced blob hashes and exits non-zero on corruption.
+
 Full-frame stereo rectification is a geometry/QA utility, not the mandatory image fed
 to a hand model. The perception path will detect in native fisheye pixels and resample
 only hand-centred virtual perspective crops so that peripheral field of view is not

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>FHP Trace Inspector</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">FISHEYE HANDPOSE</p>
+        <h1>Trace Inspector</h1>
+      </div>
+      <div id="validation-badge" class="status pending">正在检查…</div>
+    </header>
+
+    <section id="run-summary" class="run-summary" aria-label="运行摘要"></section>
+
+    <div class="workspace">
+      <aside class="sidebar">
+        <section class="panel controls">
+          <h2>检索</h2>
+          <label for="stage-filter">阶段</label>
+          <input id="stage-filter" list="stage-options" placeholder="例如 pose_2d">
+          <datalist id="stage-options"></datalist>
+          <label for="track-filter">Track ID</label>
+          <input id="track-filter" placeholder="例如 hand-0">
+          <button id="apply-filters" type="button">应用过滤</button>
+        </section>
+
+        <section class="panel">
+          <div class="panel-heading">
+            <h2>全局记录</h2>
+            <span id="global-count" class="count">0</span>
+          </div>
+          <div id="global-record-list" class="global-records muted">暂无记录</div>
+        </section>
+
+        <section class="panel">
+          <h2>阶段统计</h2>
+          <div id="stage-summary" class="stage-summary muted">等待 trace summary</div>
+        </section>
+      </aside>
+
+      <main>
+        <section class="panel timeline-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">TIMELINE</p>
+              <h2>帧</h2>
+            </div>
+            <div class="pager">
+              <button id="previous-page" type="button" aria-label="上一页">←</button>
+              <span id="page-status">0 / 0</span>
+              <button id="next-page" type="button" aria-label="下一页">→</button>
+            </div>
+          </div>
+          <div id="frame-list" class="frame-list" aria-live="polite"></div>
+        </section>
+
+        <section class="inspection-grid">
+          <div class="panel record-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">STAGE EVIDENCE</p>
+                <h2 id="selected-frame-title">选择一帧</h2>
+              </div>
+            </div>
+            <div id="record-list" class="record-list muted">
+              从时间轴选择一帧，检查每个阶段的输入、输出和工件。
+            </div>
+          </div>
+
+          <div class="panel skeleton-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">FHP21</p>
+                <h2>3D 骨架</h2>
+              </div>
+              <span id="skeleton-meta" class="muted">无 3D 数据</span>
+            </div>
+            <canvas id="skeleton-canvas" width="720" height="520">
+              浏览器不支持 Canvas。
+            </canvas>
+          </div>
+        </section>
+
+        <section class="panel raw-panel">
+          <details>
+            <summary>原始记录 JSON</summary>
+            <pre id="raw-json">[]</pre>
+          </details>
+        </section>
+      </main>
+    </div>
+
+    <template id="record-template">
+      <article class="stage-card">
+        <header>
+          <div>
+            <span class="stage-name"></span>
+            <span class="record-status"></span>
+          </div>
+          <button class="copy-record" type="button">复制 JSON</button>
+        </header>
+        <dl class="record-meta"></dl>
+        <div class="artifact-grid"></div>
+        <div class="payload-summary"></div>
+      </article>
+    </template>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

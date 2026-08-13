@@ -1,0 +1,120 @@
+# Stage trace format
+
+`fisheye-handpose` stores one pipeline run as an append-only, content-addressed directory.
+The trace is designed for stage-by-stage diagnosis: a consumer can replay provenance,
+compare raw and refined outputs, and verify that neither records nor attached artifacts
+changed after the run.
+
+## Directory layout
+
+```text
+RUN_DIR/
+  run_manifest.json       # immutable run identity, config, inputs, manifest hash
+  trace.jsonl             # append-only ordered stage records and hash chain
+  run_summary.json        # immutable terminal status and last-record hash
+  .writer.lock            # single-writer advisory lock
+  blobs/sha256/ab/
+    abcdef...png           # content-addressed images, arrays, reports, and video clips
+```
+
+`run_manifest.json` starts the run with status `ACTIVE`. The manifest is never rewritten.
+The terminal status (`COMPLETED` or `FAILED`) is written separately to
+`run_summary.json`. Absence of the summary means that an ACTIVE run may be resumed with
+`RunArtifactWriter.open()`.
+
+## Trace record
+
+Every line of `trace.jsonl` is one `fisheye-handpose/trace-record/v1` JSON object:
+
+```json
+{
+  "schema_version": "fisheye-handpose/trace-record/v1",
+  "ordinal": 12,
+  "record_id": "session:000123:pose2d:left",
+  "timestamp_utc": "2026-08-13T04:00:00.000000Z",
+  "stage": "POSE_2D",
+  "status": "SUCCEEDED",
+  "event": "view_keypoints_inferred",
+  "parent_ids": ["session:000123:crop:left"],
+  "blobs": [
+    {
+      "sha256": "...64 lowercase hex characters...",
+      "bytes": 18422,
+      "role": "crop",
+      "media_type": "image/png",
+      "relative_path": "blobs/sha256/ab/abcdef...png"
+    }
+  ],
+  "payload": {
+    "frame_id": "frame/000123",
+    "timestamp_ns": 5100000000,
+    "view_id": "left",
+    "track_id": "hand-0",
+    "keypoints_uv": [[123.4, 98.7]],
+    "keypoint_scores": [0.96]
+  },
+  "previous_hash": "...previous record hash or null...",
+  "record_hash": "...hash of this record body..."
+}
+```
+
+The required stage vocabulary is `SYSTEM`, `DISCOVERY`, `CALIBRATION`, `DECODE`,
+`SYNCHRONIZATION`, `RECTIFICATION`, `DETECTION`, `POSE_2D`,
+`CROSS_VIEW_ASSOCIATION`, `RAW_FUSION`, `KINEMATIC_REFINEMENT`,
+`TEMPORAL_REFINEMENT`, `QA`, and `EXPORT`. A stage must record `SKIPPED`, `WARNING`, or
+`FAILED` explicitly; absence of a record must not be interpreted as success.
+
+`parent_ids` form the provenance DAG. For example, a stereo fusion record points to the
+left/right per-view evidence and calibration record; a temporal estimate points to its
+current kinematic estimate and, when applicable, the previous temporal estimate.
+
+## Payload conventions
+
+The viewer groups records by `payload.frame_id` and filters by `payload.track_id`.
+Producers should also use the following stable evidence keys:
+
+- detection: `view_id`, `detections[]`, each with `bbox_xyxy`, `score`, and `label`;
+- per-view pose: `view_id`, `keypoints_uv[21][2]`, and `keypoint_scores[21]`;
+- raw/refined 3D: `landmarks_xyz_m[21][3]`, `validity[21]`, plus contract provenance;
+- ordering/time: stable `frame_id` association and integer hardware `timestamp_ns`;
+- invalid JSON values: `null`, never the non-standard tokens `NaN` or `Infinity`.
+
+Use `contract_to_trace_payload()` for `SpatialObservation` and `PoseEstimate`. It keeps
+the immutable raw-observation link, converts backend arrays to JSON values, maps
+non-finite sentinels to `null` only for explicitly invalid landmarks, and rejects a
+non-finite value on a valid landmark.
+
+Blob roles are record-local semantics, not inferred from file names. Recommended roles
+include `source_left`, `source_right`, `rectified_left`, `rectified_right`, `crop`,
+`heatmap`, `overlay`, `array`, and `audit_report`. A SHA-256 path still deduplicates
+identical bytes even when the same content is referenced under different roles.
+
+## Integrity and lifecycle
+
+The writer enforces a single process at a time with an OS advisory lock. It rejects
+duplicate record IDs, unknown or forward parent IDs, non-JSON payloads, non-finite JSON
+numbers, and blob paths outside the run directory. Writes are flushed and blobs are
+published atomically.
+
+`trace-validate` verifies:
+
+- manifest and summary self-hashes;
+- record ordinals, IDs, parent ordering, and the complete SHA-256 chain;
+- final record count and last-record hash;
+- each referenced blob's path, byte count, and SHA-256 digest.
+
+The integrity chain is tamper-evident, not a cryptographic signature. If traces cross a
+trust boundary, sign or archive the completed directory with an external trusted system.
+
+## Local viewer
+
+`trace-serve` exposes a loopback-only, read-only HTTP server. It has no upload or mutation
+endpoint. The UI displays run validation, global records, the frame timeline, stage and
+track filters, artifact previews, 2D overlays, a FHP21 3D canvas, and the original JSON.
+Artifacts are served only after their content hash and in-run path have been verified.
+
+The deterministic `trace-demo` command exercises the full planned stage vocabulary for
+UI testing. Its records are synthetic and are not model outputs. Currently,
+`audit-session --trace-output` emits real discovery, calibration, timestamp, decode,
+rectification, epipolar-QA, warning, and failure records. Perception/MANO/temporal records
+will become real only when those producers are implemented and call the same writer API.
