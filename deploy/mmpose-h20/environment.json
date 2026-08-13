@@ -1,0 +1,44 @@
+{
+  "schema_version": "fisheye-handpose/h20-environment/v1",
+  "profile": "mmpose-h20-cu121",
+  "intent": "legacy-compatibility-reproduction",
+  "security_status": "not-approved-for-production",
+  "security_note": "This profile freezes an old upstream stack for reproducibility. It is not a claim that the packages are currently supported or free of known vulnerabilities.",
+  "resolution": {
+    "uv": ">=0.12.3,<0.13",
+    "exclude_newer": "2024-08-01T00:00:00Z"
+  },
+  "target": {
+    "platform": "linux-x86_64",
+    "python": "3.10",
+    "cuda": "12.1",
+    "gpu": "NVIDIA H20",
+    "compute_capability": "9.0"
+  },
+  "packages": {
+    "torch": "2.1.0",
+    "torchvision": "0.16.0",
+    "mmcv": "2.1.0",
+    "mmengine": "0.10.3",
+    "mmdet": "3.2.0",
+    "mmpose": "1.3.2",
+    "numpy": "1.26.4",
+    "chumpy": "0.71",
+    "smplx": "0.1.28"
+  },
+  "binary_sources": {
+    "torch": "https://download.pytorch.org/whl/cu121",
+    "torchvision": "https://download.pytorch.org/whl/cu121",
+    "mmcv": "https://download.openmmlab.com/mmcv/dist/cu121/torch2.1.0/mmcv-2.1.0-cp310-cp310-manylinux1_x86_64.whl",
+    "chumpy": "git+https://github.com/nim65s/chumpy.git@2816a138d2f60bc8a77eddb9962c4c825179cb56"
+  },
+  "runtime_requirements": {
+    "cuda_available": true,
+    "mmcv_cuda_ops": [
+      "mmcv.ops.nms"
+    ],
+    "dtypes": [
+      "float16"
+    ]
+  }
+}

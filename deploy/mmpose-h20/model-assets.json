@@ -1,0 +1,25 @@
+{
+  "schema_version": "fisheye-handpose/model-assets/v1",
+  "artifacts": [
+    {
+      "id": "rtmdet-nano-hand",
+      "filename": "rtmdet_nano_8xb32-300e_hand-267f9c8f.pth",
+      "url": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/rtmdet_nano_8xb32-300e_hand-267f9c8f.pth",
+      "sha256": "267f9c8f780578961adaa5d7137cdff0840c33efdef0d9bb353437912e1540c4",
+      "bytes": 4225143,
+      "config": "demo/mmdetection_cfg/rtmdet_nano_320-8xb32_hand.py",
+      "license_status": "REVIEW_REQUIRED",
+      "license_note": "Checkpoint training-data rights are separate from the Apache-2.0 code license."
+    },
+    {
+      "id": "rtmpose-m-hand5",
+      "filename": "rtmpose-m_simcc-hand5_pt-aic-coco_210e-256x256-74fb594_20230320.pth",
+      "url": "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/rtmpose-m_simcc-hand5_pt-aic-coco_210e-256x256-74fb594_20230320.pth",
+      "sha256": "b74fb5941684fe13c337b8d4fce644293e12903fed5407f8b27921f107dc6003",
+      "bytes": 55287475,
+      "config": "configs/hand_2d_keypoint/rtmpose/hand5/rtmpose-m_8xb256-210e_hand5-256x256.py",
+      "license_status": "REVIEW_REQUIRED",
+      "license_note": "Hand5 combines multiple datasets, including research-only FreiHAND; approve intended use before deployment."
+    }
+  ]
+}

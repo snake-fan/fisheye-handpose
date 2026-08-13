@@ -1,0 +1,25 @@
+{
+  "schema_version": "fisheye-handpose/mano-assets/v1",
+  "license": {
+    "acknowledged": false,
+    "reference": "REPLACE with the supplying user's MANO license acceptance or approval record"
+  },
+  "provenance": {
+    "acknowledged": false,
+    "source": "REPLACE with how the supplying user obtained the official MANO v1.2 files"
+  },
+  "artifacts": [
+    {
+      "side": "left",
+      "filename": "mano/MANO_LEFT.pkl",
+      "sha256": "REPLACE_WITH_64_HEX_CHARACTERS_FROM_SHA256SUM",
+      "bytes": 0
+    },
+    {
+      "side": "right",
+      "filename": "mano/MANO_RIGHT.pkl",
+      "sha256": "REPLACE_WITH_64_HEX_CHARACTERS_FROM_SHA256SUM",
+      "bytes": 0
+    }
+  ]
+}
