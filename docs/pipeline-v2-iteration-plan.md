@@ -6,6 +6,8 @@
 
 适用范围：本仓库本地开发、H20 兼容 worker、Trace API 与 React 检查前端
 基线代码：`5eacb7a` 及其 H20 实跑 `h20-stage-video-5eacb7a`
+当前候选代码：`8e49061`；H20 package smoke `v2-8e49061-h20-smoke1`；
+120-pair canonical run `v2-8e49061-h20-120`
 
 本文是后续算法迭代的实施依据。代码实现若因真实数据、依赖能力或性能约束而改变本文
 方案，必须在同一个提交中更新“决策与偏离记录”和文末变更日志；不得只修改代码、不
@@ -65,7 +67,7 @@ native distorted fisheye frame
 trace，但**没有进入 detector 或 RTMPose 的实际输入链**。当前 Temporal 阶段是
 `causal_time_ema_v1`，不是 Temporal MANO Optimization。
 
-### 2.2 当前 120 pair 的证据
+### 2.2 `5eacb7a` 历史 baseline 的 120-pair 证据
 
 以下数字只描述当前 session 的前 120/176 个同步 pair，不应外推为总体精度：
 
@@ -90,23 +92,41 @@ GT 时，低重投影误差、MANO 自拟合 RMSE 和“视频看起来更平滑
 三角化失败原因、追踪 gap reset、MANO 文件校验与 FHP21 映射、左右手选择与 beta 冻结、
 Temporal 时间戳语义、失败回退、Trace parent、全轨迹 overlay video 和大文件流式导入。
 
-当前本地工作树另有独立测试覆盖：KB4 virtual crop/ray round-trip/valid mask/左右相机 rig
+候选提交 `8e49061` 的独立测试覆盖：KB4 virtual crop/ray round-trip/valid mask/左右相机 rig
 transform、virtual crop pose adapter 的 0-hand/cardinality/fail-closed、seed/recovery/top-4
 候选分类、Huber IRLS stereo fusion/深度与掌心 gate/启发式 covariance、固定掌心 anchor/
 constant-velocity/TTL，以及“仅 accepted MANO 参数可成为下一帧 warm-start”的控制器 seam。
-这些本地测试不等于真实 OpenMMLab、MANO 或 H20 数据验收；逐切片状态见 8.3。
+该提交已在真实 H20/OpenMMLab/MANO 环境完成 1-pair smoke 和 120-pair canonical
+run，证明主链、package validator 与产物导入可运行。这仍不等于已有 GT 的精度
+验收或所有 phase gate 通过；逐切片状态见 8.3，实跑证据见 8.5–8.7。
 
 仍无覆盖或尚未接通的关键项包括：
 
 - crop resize/letterbox/mirror 的完整逆变换；
 - SimCC covariance 提取或目标域 score calibration；
-- top-4 recovery 到鲁棒跨视角关联的主链回归；
+- top-4 recovery 已经真实 H20 主链运行，但仍无目标域候选/ghost/duplicate 标注验收；
 - 极线一致的错手/错点配对、track-aware association 和 anatomical gate；
 - covariance-aware tracking gate、完整 cost matrix、scene/calibration reset；
 - PCA coarse → 45D fine 参数转换、锚点选择、双向 warm-start；
 - 逐关节 MANO residual、2D 重投影 loss 和收敛曲线；
-- 新 MANO 控制器与真实 `OpenMMLabRuntime.fit_mano()` 的接口/数值集成；
+- MANO wrist/tip 分组 residual、每 hand-frame 耗时和 peak GPU memory 记录；
 - MANO 参数空间的滑窗/离线时序优化。
+
+### 2.4 `8e49061` 候选链路对比
+
+下表保留历史 baseline、首次失败包的诊断证据和修正后 canonical run 的不同
+身份。`v2-0782688-h20-120` 不是成功 baseline；其数字仅用于解释现场失败。
+
+| 指标 | `5eacb7a` 历史 baseline | `0782688` FAILED 诊断 | `8e49061` canonical |
+|---|---:|---:|---:|
+| 120 帧中两个跨视图 match | 113 | 120 | 120 |
+| Raw produced / hand-gate rejected | 233 / 旧链无该门禁 | 238 / 2 | 238 / 2 |
+| Raw valid joints | 4,634 / 4,893 | 诊断包未登记 canonical baseline | 4,764 / 4,998 |
+| track 数 | 3 | 2 | 2 |
+| MANO produced | 0 / 233 | 213 / 238 | 213 / 238 |
+| accepted MANO RMSE median / P95 | 无 accepted fit | 9.008 / 16.960 mm | 9.008 / 16.960 mm |
+| export | 233 | 238 条位于失败包中 | 238 |
+| 最终 package | `COMPLETED` | `FAILED / NOT_PRODUCED` | `COMPLETED / PRODUCED` |
 
 ## 3. 公开 seams 与实施约束
 
@@ -303,6 +323,33 @@ L = L_2d_left + L_2d_right
 分组 residual、关节角合法性、有限 mesh 和优化收敛状态。20 mm 继续作为 3D 上限，不因
 产出率低而放宽。
 
+#### 6.3.1 V7.1：实证触发的二阶段鲁棒拟合与一致门禁
+
+`v2-8e49061-h20-120` 中 25 个 MANO 拒绝帧全部包含明显的局部解剖离群点，最大异常骨段
+均为 wrist→little MCP；失败帧该骨段中位数为 155.7 mm，而 accepted 帧为 105.6 mm。
+这些帧的双目重投影误差并不更差，说明它们属于“极线一致但解剖上错误”的 Raw 3D
+观测。现有优化使用 Huber loss，验收却使用所有有效关节的普通 RMSE，两者目标不一致。
+
+V7.1 在不修改 Raw observation 的前提下采用以下确定性流程：
+
+1. 第一阶段继续使用全部有效 Raw joints 做当前 Huber fit，并保存逐关节 residual 与普通
+   `raw_rmse_m`；
+2. 只有普通 RMSE 未通过 20 mm 时，才从 residual 大于 20 mm 的关节中按 residual 降序选择
+   最多 `floor(valid_count * 0.10)` 个离群点；任何情况下都保留至少 15 个有效支持点；
+3. 使用第一阶段最佳参数作为初始化，对 inlier 权重重新拟合一次；被降权关节不从 Raw、
+   Trace 或最终 provenance 中删除；
+4. 接受条件为 `inlier_rmse_m <= 20 mm`、`effective_joint_count >= 15`，同时要求完整关节
+   `raw_rmse_m <= 40 mm` 作为灾难性错误上限；不满足任一条件仍为 `NOT_PRODUCED`；
+5. ordinary/full RMSE 不改名也不覆盖；新增 `inlier_rmse_m`、`weighted_rmse_m`、
+   `joint_weights[21]`、`inlier_mask[21]`、`effective_joint_count`、两阶段迭代数和 gate
+   reason。方法标识固定为 `RESIDUAL_TRIM_10PCT_V1`，uncertainty status 为
+   `HEURISTIC_UNCALIBRATED`。
+
+该切片是针对真实失败分布的可审计鲁棒门禁，不是对错误测量的概率校准，也不替代 V3
+robust association、PCA coarse-to-fine 或双向 Temporal MANO。离群点比例、15 点支持数和
+40 mm 安全上限必须通过新 H20 run 验证；若未达到产出率与残差 gate，继续保留失败结果并
+在本节和决策表记录改变，不允许直接放宽阈值。
+
 ### 6.4 Trace 与前端证据
 
 每个 track/frame 至少保存：anchor score、side hypothesis、seed ID、coarse/fine status、
@@ -419,38 +466,43 @@ native fisheye，RTMPose 只消费每个 hand-centred crop 的完整物理 bbox�
 native，再由既有标定映射到 rectified inspection space。零 detection 不调用 pose；crop
 valid fraction 不足显式 `NOT_PRODUCED`；cardinality/non-finite fail closed。Trace 对每个
 candidate 保存 virtual camera、crop/native 21 点、valid mask 统计，并在 retention 命中时保存
-crop 与 mask 图像。该 profile 目前保持 opt-in，必须完成 H20 同帧 ablation 后才允许替换默认
-baseline。V3 recovery 已接入 native 与 virtual 两条路径，V4 fusion/hand gate 也已在后续
-切片接入；这些本地能力不应反向解读为 V2 已通过真实数据 gate。
+crop 与 mask 图像。提交 `8e49061` 已用该 opt-in profile 在 H20 上完成 1-pair smoke
+和 120-pair canonical run，因而“真实 OpenMMLab 无法运行 virtual crop”已不是缺口。但
+仍未对同一输入运行成对的 native ↔ virtual ablation，也无 2D GT，所以 profile 继续
+保持 opt-in，不得宣称 virtual 优于 native 或替换默认 baseline。V3 recovery 和 V4
+fusion/hand gate 虽均已进入此真实主链，各自完整 phase gate 仍未通过。
 
 每个算法 profile 都记录完整配置和 method/version ID。旧 profile 至少保留到相邻 phase
 通过冻结 gate，以便同 run 或同输入 ablation；不得靠切换未记录的默认值比较结果。
 
-### 8.3 V0–V7 当前代码状态快照
+### 8.3 V0–V7 `8e49061` 代码与 H20 状态快照
 
-本表描述当前本地工作树，不描述已经推送或已经在 H20 跑过的版本。“已接主链”仅表示
-`runner.py` 在相应 profile 下会调用该实现，不代表通过 phase gate。
+本表固定描述提交 `8e49061`，并以 `v2-8e49061-h20-smoke1` 和
+`v2-8e49061-h20-120` 为真实环境证据。“已接主链”或“H20 可运行”都不代表
+已通过需要 GT、ablation 或尚未实现能力的 phase gate。
 
 | 切片 | 独立 seam | 主链接入 | 本地验证边界 | H20/真实模型状态 | 当前结论 |
 |---|---|---|---|---|---|
-| V0 基线冻结 | `baseline.py` 与 `trace-baseline` CLI 已实现 | 已接公开 CLI，不改变 worker 算法 | reader/path/CLI/零手帧契约与确定性输出测试 | 尚未记录由当前工作树在 H20 重算完整封存 run | 本地实现完成，真实 run 复算待执行 |
-| V1 crop geometry | `crop.py` 已实现 KB4 ray crop、mask、双向 mapping 与 rig pose | 通过 V2 feature flag 间接接入；native 默认不调用 | geometry-only 数值与输入契约测试，不加载 RTMPose | 未 H20 实测 | seam 已实现，phase gate 未通过 |
-| V2 pose adapter | `pose_adapter.py` 与 runtime 的 `detect()`/`infer_pose()` 拆分已实现 | `virtual_perspective_kb4_v1` 时接入；默认仍是 `baseline_native_v1`，H20 example 选择 opt-in profile | fake runtime/worker 测试验证 detector 看 native、pose 看 crop、trace/blob；React 已能逐 candidate 对比 crop/native keypoints、mask 与虚拟相机；未验证真实 OpenMMLab 内部 resize | 未运行真实 OpenMMLab/H20 ablation | opt-in 主链与前端诊断已可达，尚不能据此宣告优于 native |
-| V3 双手 recovery | `candidates.py` 已实现 0.30 seed、0.20 recovery、top-4 分类和稳定 ID | 已接 runtime/contracts/runner；native/virtual 都只对 bounded pool 跑 pose，每视角最多 4 个候选，association 最终最多 2 matches | 单元和 fake worker 覆盖分类、provenance、candidate ID 贯穿、legacy fallback；duplicate/ghost 仍交给 association/track gate | 未 H20 实测 | recovery 已接主链但未通过真实双手 gate；不得把候选直接当最终手 |
-| V4 robust association/fusion | `fusion.py` 已实现 DLT 初始化、score/covariance 加权 Huber IRLS、逐点 gate 与 3D covariance | robust **fusion** 已由 `geometry.triangulate_match()` 接入；robust **association** 未实现，仍使用 median rectified-y；Raw hand gate 拒绝也会生成完整下游 `NOT_PRODUCED` 链 | 数值单测与 fake worker 契约；输入 covariance 缺失时使用单位阵，输出标记 `HEURISTIC_UNCALIBRATED`；进程边界强制 covariance 对称且 PSD | 未 H20 实测 | 仅 fusion/Raw hand gate 部分完成，association gate 未通过 |
-| V5 tracking | `tracking.py` 已实现固定掌心 median、constant velocity、TTL recovery 与 one-to-one assignment | 已替换 runner 主 tracker；无观测/部分缺手帧仍推进每条 active track 的 Trace 状态前驱，同时保持 last-seen 时间不变 | 本地确定性测试覆盖 palm 缺点、离群、交叉、短/长 gap、乱序时间与 observed→missing→recovered lineage | 未在 120-pair run 验证 split/ID switch | 主链已接，但 covariance-adaptive gate、完整 cost matrix 与 scene/calibration reset 尚缺 |
+| V0 基线冻结 | `baseline.py` 与 `trace-baseline` CLI 已实现 | 已接公开 CLI，不改变 worker 算法 | reader/path/CLI/零手帧契约与确定性输出测试 | 已对 completed 120-pair run 复算；baseline JSON SHA-256 `a9f633f58ae8db0d42c8a26b54af60b3f17f7b1e08ad768386e5af33574d84a5` | V0 代码与真实 run 复算已完成；指标本身仍受无 GT 边界限制 |
+| V1 crop geometry | `crop.py` 已实现 KB4 ray crop、mask、双向 mapping 与 rig pose | 通过 V2 feature flag 间接接入；native 默认不调用 | geometry-only 数值与输入契约测试，不加载 RTMPose | smoke 与 120-pair virtual profile 都实际产生 crop/mask/virtual-camera trace | 真实主链可运行；resize 数值逆变换与 native ablation gate 未通过 |
+| V2 pose adapter | `pose_adapter.py` 与 runtime 的 `detect()`/`infer_pose()` 拆分已实现 | `virtual_perspective_kb4_v1` 时接入；默认仍是 `baseline_native_v1`，H20 example 选择 opt-in profile | fake runtime/worker 验证 detector 看 native、pose 看 crop、trace/blob；React 可逐 candidate 对比证据 | 真实 OpenMMLab/H20 已完成 120-pair virtual run，但无 paired native run 和 2D GT | opt-in 主链通过运行性验证；不宣称优于 native，V2 质量 gate 未通过 |
+| V3 双手 recovery | `candidates.py` 已实现 0.30 seed、0.20 recovery、top-4 分类和稳定 ID | 已接 runtime/contracts/runner；native/virtual 都只对 bounded pool 跑 pose，最终最多 2 matches | 单元和 fake worker 覆盖分类、provenance、candidate ID 贯穿与 fallback | H20 记录 2,472 raw proposals：473 seed/27 recovery/1,972 rejected，pool=500；120/120 帧产生 2 matches | 候选恢复与数量回归通过；无 GT，不宣称 pair precision/recall 或 ghost/duplicate=0 |
+| V4 robust association/fusion | `fusion.py` 已实现 DLT 初始化、score/covariance 加权 Huber IRLS、逐点 gate 与 3D covariance | robust **fusion** 已接入；robust **association** 未实现，仍使用 median rectified-y；Raw hand gate 拒绝保留完整下游失败链 | 数值/契约测试与 covariance 对称/PSD 进程边界 | H20 Raw 238 produced/2 rejected，4,764/4,998 valid joints，112 个完整手；输出 covariance 为 `HEURISTIC_UNCALIBRATED` | robust fusion/hand gate 可运行；异常骨长仍明显，robust association 与 calibrated covariance gate 未通过 |
+| V5 tracking | `tracking.py` 已实现固定掌心 median、constant velocity、TTL recovery 与 one-to-one assignment | 已替换 runner 主 tracker；missing 帧仍推进 active-state lineage，last-seen 不变 | 本地确定性测试覆盖 palm 缺点、交叉、gap、乱序时间和 recovery | H20 只产生 2 tracks：118/120 hand-frames，NEW=2、MATCHED=236、recovered=2 | 无第三条 split 的回归通过；无身份 GT，不宣称 ID switch=0；covariance gate/cost matrix/reset 仍缺 |
 | V6 MANO anchor/coarse | `mano_anchor.py` 已实现 pose-agnostic、按 track、top-K 且时间去冗余的质量锚点选择 | **未接 runner**；PCA model 与 PCA→45D 转换仍未实现 | 仅独立 evidence/排序/fail-closed 测试；不会奖励首帧或平手 | 未 H20 实测 | anchor seam 已实现，coarse-to-fine 尚未实现，不能记作 V6 完成 |
-| V7 MANO bidirectional | `mano_fitting.py` 已实现 track-local accepted-state 控制器；runtime 支持完整参数 warm-start、Huber、best-so-far、early-stop 与诊断 | 已接 runner；MANO model 改为 `flat_hand_mean=False,use_pca=False`，冷启动为 MANO mean pose，accepted fit 才锁 side/beta/完整参数；warm attempt 不通过时在锁定 side/beta 下尝试 cold recovery；example 上限 200 iter | fake worker/controller、单步 optimizer post-step 与 model-config 契约通过；reject/error 不污染参数或 Trace 状态前驱，gap 可重启；仍只有按时间向前传播 | 尚未在当前代码上加载真实 MANO/H20 | frame-wise v2 主链已接，双向 pass、anchor 驱动和共享 shape 全轨复估仍未实现 |
+| V7 MANO bidirectional | `mano_fitting.py` 已实现 track-local accepted-state 控制器；runtime 支持完整参数 warm-start、Huber、best-so-far、early-stop 与诊断 | 已接 runner；`flat_hand_mean=False,use_pca=False`，mean-pose cold start，只有 accepted fit 更新状态，warm 失败后可 cold recovery，上限 200 iter | controller/runtime 契约覆盖 reject/error 不污染状态；仍只有按时间向前传播 | 真实 H20/MANO：213/238=89.496%；accepted RMSE median=9.008 mm、P95=16.960 mm、max=19.997 mm | 误差分布 gate 通过，产出率 95% gate 失败；双向 pass、anchor 驱动、PCA coarse 和共享 shape 全轨复估仍未实现 |
 
 V8/V9 尚未开始。当前 `runner.py` 仍是单遍 frame-major 调度，Temporal 仍为 Raw 或已接受
 frame-wise MANO 关节 XYZ 上的 `causal_time_ema_v1`；没有 Temporal MANO、三 pass spool 或
 离线前后向传播。V7 的本地接入只解决冷启动、欠迭代和失败状态污染的一部分问题，必须先
 通过 H20 MANO 产出率/RMSE gate，才允许把它当成后续 Temporal MANO 的可靠输入。
+`8e49061` 的 accepted RMSE 门禁通过，但产出率只有 89.496%，所以 V7 依然未通过。
 
 ### 8.4 已接入部分的当前语义与限制
 
 - virtual pose 路径是显式 feature flag；detector 保持 native fisheye 输入，只有 RTMPose
-  proposal 进入 virtual crop。未做 H20 ablation 前默认 profile 不变。
+  proposal 进入 virtual crop。该 profile 已完成 H20 真实运行，但未做成对 native
+  ablation，所以默认 profile 不变。
 - V4 的鲁棒优化只能处理已给定左右观测的数值融合。仅有两个视角时，极线一致的错手或
   错关节点配对可能同时具有很低重投影误差；该问题必须由 V3/association 的跨关节、track
   与必要时 anatomy 证据解决，不能把低 reprojection residual 当作配对正确证明。
@@ -459,7 +511,12 @@ frame-wise MANO 关节 XYZ 上的 `causal_time_ema_v1`；没有 Temporal MANO、
   `model_keypoint_scores`，并用版本化 `CLIP_0_1_V1` 生成兼容字段
   `keypoint_scores` 作为有界 operational quality weight；只有后者用于 threshold、association
   和单位 covariance 缩放。该缩放仍只是一种启发式权重，所以 Raw `covariance_m2` 明确标记
-  `HEURISTIC_UNCALIBRATED`，不得解释为校准概率不确定度。
+  `HEURISTIC_UNCALIBRATED`，不得解释为校准概率不确定度。canonical run 中以
+  `view_keypoints_inferred.instances[].model_keypoint_scores` 为 raw 口径，所有 pose candidate 共有
+  10,500 个 raw score，41 个超过 1，最大 1.162236；bounded 上界为
+  1，逐值与 `clip(raw, 0, 1)` 的 mismatch 为 0。visibility/confidence probability 仍全部为
+  null。FHP21 `raw.metrics[].left_score/right_score` 保存的是 bounded operational weight，
+  不是 raw SimCC response。
 - robust fusion 后要求当前帧至少 3 个有效掌心点。未通过时仍保存
   `raw_hand_gate_not_produced` 及逐点证据，但不创建假 track，也不向 MANO/Temporal/export
  传播 prior 生成的手；即使同帧另一个 hand 成功，该失败 hand 也保留独立的
@@ -492,6 +549,78 @@ producer 在每条 FHP21 append 前执行同一严格 validator，使此类错�
 处理结束后暴露。修正必须先过 1-pair package smoke，再使用新 run ID 重跑 120 pair；禁止
 覆盖或续跑上述 immutable FAILED run。
 
+修正后的 smoke 与 canonical run 分别记录在 8.6 和 8.7。它们是新的 immutable
+run，不改变也不删除本节的失败证据。
+
+### 8.6 `8e49061` 1-pair package smoke
+
+run `v2-8e49061-h20-smoke1` 以 `COMPLETED / PRODUCED` 结束；audit PASS，worker return
+code 为 0。1 个 pair 产生 2 个 match、2 个 Raw/Temporal/export 输出和 2 个新 track；
+MANO 2/2 产出，accepted RMSE median 为 8.123 mm。完整 `trace-validate` 得到
+39 records、27 blobs、0 error 和 0 warning。
+
+该 smoke 还直接覆盖了 score 修正边界：raw SimCC 最大值 1.00577068 被原样保留，
+bounded quality 对应为 1。overlay 为 H.264、1600×1300、`yuv420p`，可完整解码
+1 帧。因而本 smoke 只证明修正后的逐条 validator、raw/bounded score 双通道、真实
+OpenMMLab+MANO、artifact import 和 overlay 路径可运行；它不支持对 120 帧产出率、
+长期 tracking、jitter 或精度作结论。
+
+### 8.7 `8e49061` 120-pair canonical run
+
+run `v2-8e49061-h20-120` 是修正后的新封存 run，不是对 8.5 FAILED run 的续跑或
+覆盖。其系统与产物完整性如下。
+
+| 证据 | 观察值 | 结论边界 |
+|---|---|---|
+| 代码/run | commit `8e49061`；`v2-8e49061-h20-120` | 只对应本次封存配置与输入 |
+| 最终状态 | `COMPLETED / PRODUCED`；audit PASS；worker return code 0；120 pairs | 证明系统和 package 完成，不等于所有算法 gate 通过 |
+| Trace | 2,911 records；1,922 unique blobs；0 error/0 warning；last hash `349da756965b585f3215938cfa45250cd90c884af0d1ae429295ed2131bac423` | hash chain、parent DAG 与所有引用 blob 验证通过 |
+| 物理 blobs | 293,660,212 bytes | 内容寻址去重后的实际存储；不等于 blob reference 数 |
+| baseline | JSON SHA-256 `a9f633f58ae8db0d42c8a26b54af60b3f17f7b1e08ad768386e5af33574d84a5`；configuration snapshot SHA-256 `fd3ba6d5861ee87a9603f7c5676f6b5928e3aa44fbcd65a0f84cc118e115cbac` | 同一 run 可确定性复算 |
+| FHP21 | 238 records，6,550,860 bytes，SHA-256 `a435070c26efcc84cfd52842997a39bc671844e52e1f7da9f28979be730f59a2` | 达到当前 export 数量回归；2 个 hand-gate reject 不伪造输出 |
+| overlay | H.264 High、`yuv420p`、1600×1300、30 fps、120 decoded frames、4 s、2,443,157 bytes，SHA-256 `fa914b4b9443ae4056e3e552a5abe2f234c1386055cb446853e123e16c865f97` | 视频结构与帧数验证通过；观感不代替 jitter 数值指标 |
+| event status | WARNING=41，SKIPPED=6，FAILED=0 | warning/skipped 必须结合逐手拒绝原因解释，不证明算法质量 |
+| MANO 性能 | 每 hand-frame 耗时和 peak GPU memory 未埋点 | `NOT_MEASURED`；不用端到端 wall time 除以 hand 数冒充 |
+| Trace API/检查路径 | run key `36b9f22a092519c8`；health/list/detail/frames、首末帧 detail、Raw reject → MANO skipped 链和 MP4 HEAD+Range `206` 均 PASS | 功能 PASS；当前 H20 list 首次 6.6 s/重复 4.75 s、detail 4.05–4.6 s，frames/record/Range 1–10 ms；性能修正后待复测，不在本记录中宣称性能 PASS |
+
+算法层的观察和 gate 分开记录：
+
+| 层级 | 观察值 | gate/结论 |
+|---|---|---|
+| Candidate policy | 2,472 raw proposals：SEED=473、RECOVERY=27、REJECTED=1,972；bounded pool=500 | 分类与有界池可追溯；无 GT，不宣称 detector recall/FP |
+| Association | 120/120 帧均产生 2 matches，共 240；pool unmatched left=18/right=2 | `≥118/120` 数量回归 PASS；无 GT，不宣称 match 正确、precision/recall 或 ghost=0 |
+| Raw hand gate | 238 produced；frame 24 和 86 各 1 个 `INSUFFICIENT_PALM_SUPPORT` reject | fail-closed 语义 PASS；拒绝手不建假 track |
+| Raw joints | 4,764/4,998 valid=95.318%；112 个 complete-21 hand-frame | 仅是几何有效性，不是 3D 精度 |
+| Raw bones | median=33.540 mm，P95=108.005 mm，max=185.142 mm；217 个 hand-frame 存在 >50 mm 骨边，187 个存在 >100 mm 骨边 | 异常骨长目标未通过；无 GT 不报 MPJPE |
+| Tracking | `track-0000` 118 hand-frames（0–119），`track-0001` 120（0–119）；NEW=2、MATCHED=236、recovered=2 | 两条长轨且无第三条 split 的数量回归 PASS；无身份 GT，不宣称 ID switch=0 |
+| MANO production | 213/238=89.496%；25 no-fit | `≥95%` FAIL，不放宽 20 mm 门禁 |
+| MANO accepted residual | RMSE median=9.008 mm、P95=16.960 mm、max=19.997 mm | median/P95 residual gate PASS；这是对 Raw 3D 的拟合残差，不是 GT accuracy |
+| MANO failures | `track-0000`: frames 39–40；`track-0001`: 41、42、44–54、56、58–61、67–70、73 | 失败集中段需逐帧查上游 Raw/关联与初始化，不从成功分布中删除 |
+| MANO attempts | 266；init source `ACCEPTED_STATE`=231、`COLD_RECOVERY`=21、`COLD_START`=14 | 只说明控制器实际路径；PCA/anchor/bidirectional 仍未实现 |
+| Temporal | 238 produced；input MANO=213/Raw=25；method=`causal_time_ema_v1` | jitter gate `NOT_EVALUATED`；不是 Temporal MANO |
+| Score semantics | `view_keypoints_inferred` 口径 10,500 raw；41 个 >1，max=1.162236；bounded max=1，clip relation mismatch=0；method=`CLIP_0_1_V1`/`HEURISTIC_UNCALIBRATED` | score 契约修正 PASS；FHP21 left/right score 是 bounded；visibility/confidence probability 仍全为 null |
+| Export | 238/240 | `≥238/240` PASS；缺少的 2 个是显式 Raw hand-gate reject |
+
+逐阶段可追溯性统计如下。`blob refs` 是记录引用次数，`unique blobs` 是内容寻址
+去重后的物理对象数；两者不应相互替代。
+
+| Stage | records | blob refs | unique blobs |
+|---|---:|---:|---:|
+| SYSTEM | 2 | 7 | 7 |
+| DISCOVERY | 1 | 0 | 0 |
+| CALIBRATION | 1 | 0 | 0 |
+| SYNCHRONIZATION | 123 | 240 | 240 |
+| DECODE | 2 | 0 | 0 |
+| RECTIFICATION | 122 | 480 | 480 |
+| QA | 2 | 1 | 1 |
+| DETECTION | 240 | 0 | 0 |
+| POSE_2D | 1,216 | 1,000 | 501 |
+| CROSS_VIEW_ASSOCIATION | 240 | 0 | 0 |
+| RAW_FUSION | 240 | 240 | 240 |
+| KINEMATIC_REFINEMENT | 241 | 213 | 213 |
+| TEMPORAL_REFINEMENT | 240 | 238 | 238 |
+| EXPORT | 241 | 2 | 2 |
+
 ## 9. 总体验收矩阵
 
 | 层级 | 验收 |
@@ -507,6 +636,25 @@ producer 在每条 FHP21 append 前执行同一严格 validator，使此类错�
 | Temporal | MPJPE 不恶化；静止 jitter 降低 ≥ 30%；prediction/reset 语义正确 |
 | 可追溯性 | Raw/MANO/Temporal 均独立；`trace-validate` 通过；所有 applied method 可追溯 |
 | 前端 | 每帧/每手/每节点 before-after、失败原因、残差和三层视频均可检查；旧 run 可降级显示 |
+
+### 9.1 `v2-8e49061-h20-120` 验收观察
+
+本表不修改上述门禁。`NOT_EVALUATED` 不是 PASS；它表示当前 run 没有所需 GT、
+ablation、性能埋点或目标 Temporal MANO 实现。
+
+| 层级 | 当前证据 | 状态 |
+|---|---|---|
+| 数据/几何 | audit PASS；120 pairs；virtual crop/fusion 坐标契约与进程边界通过测试和实跑 | 运行性 PASS；无 GT 精度结论 |
+| Detection | 候选分类和 pool 完整留证 | `NOT_EVALUATED`；无 per-hand presence GT，不报 recall/FP |
+| 2D | raw/bounded score、crop/native/rectified 点和 mask 可查 | `NOT_EVALUATED`；无 2D GT，不报 NME/PCK |
+| Association | 120/120 帧产生两个 match | 数量回归 PASS；precision/recall、ghost/duplicate 为 `NOT_EVALUATED` |
+| 当前 120 帧回归 | association 120/120，export 238/240 | 两个数量 gate PASS；ghost/duplicate 未标注，整行仅 PARTIAL |
+| Raw 3D | valid point 有 support/residual 与 heuristic covariance；仍有大量 >100 mm 骨边 | 异常骨长 gate FAIL；MPJPE/scale accuracy `NOT_EVALUATED` |
+| Tracking | 2 条长轨，无第三条 split，2 次 recovery | 数量回归 PASS；ID switch `NOT_EVALUATED` |
+| MANO | production 89.496%；accepted RMSE median/P95 9.008/16.960 mm | production gate FAIL；aggregate residual gate PASS；wrist/tip 分组与 GPU 性能 `NOT_EVALUATED` |
+| Temporal | 213 个 MANO 与 25 个 Raw 输入均产生 causal XYZ EMA | `NOT_EVALUATED`；尚无 Temporal MANO、GT 对比或 jitter 指标 |
+| 可追溯性 | 2,911 records/1,922 blobs，0 校验错误或 warning；Raw/MANO/Temporal 独立且 method ID 可追溯 | PASS |
+| Trace API/前端检查路径 | real run 的 list/detail/frames、首末帧、Raw reject 失败链和 MP4 Range 功能通过 | 功能 PASS；H20 list/detail 性能待修正后复测 |
 
 “当前 120 帧回归”只能防止这个已知样本退化，不能代替目标域标注集。若 238/240 与人工
 presence GT 冲突，以 GT 为准并在偏离记录中修改该回归门槛，不能为了凑数制造手。
@@ -539,6 +687,9 @@ presence GT 冲突，以 GT 为准并在偏离记录中修改该回归门槛，�
 | 2026-08-14 | Trace UI / 本地工作树 | virtual crop 候选图像全部立即加载，run detail 每次重扫全部 blob | 候选证据改为一次只展开一个；内容寻址 artifact 使用 private immutable cache；封存 run 的完整 blob validation 使用 1 秒短缓存，artifact 访问仍实时校验，ACTIVE run 不缓存 | v2 每帧最多 8 份 crop/mask 证据，旧 eager/no-store 路径会重复下载并对数百 blob 逐次 stat，造成明显卡顿 | finalized run detail 的完整性状态最多延迟 1 秒反映未授权的磁盘篡改；直接 artifact 访问立即发现并失效缓存；算法输出与 trace schema 不变 | 接受短缓存折中；保留 fail-closed artifact 读取与测试时可注入时钟 |
 | 2026-08-14 | V8 / 本地工作树 | 三 pass 离线 Temporal MANO | 尚未实现；继续使用单遍 `causal_time_ema_v1` | runner 仍对 Raw/accepted MANO 的 XYZ 做 causal EMA，没有窗口参数优化或三层独立输出 | 当前 stable 只能声明 XYZ EMA；没有 Temporal MANO 指标、视频或能力标签，既有输出契约暂不变 | 不是设计替换，只是待实现；不得把 EMA 改名为 Temporal MANO |
 | 2026-08-14 | V2/V4 / H20 run `v2-0782688-h20-120` | RTMPose `keypoint_scores` 可直接作为 `[0,1]` confidence | 明确保留未归一化 `model_keypoint_scores`，另以 `CLIP_0_1_V1` 派生有界 operational quality；最终 probability 仍为空 | pinned SimCC codec `normalize=False`，真实 9,996 个 score 中 29 个 >1；直接作为 covariance 权重会制造过度自信并使严格 package validator 拒绝 | FHP21 bounded score contract 不放宽；Trace 增加 raw score 与 method/status；producer 改为逐条提前验证 | 现场证据驱动修正；clip 仅是兼容启发式，目标域 calibration/SimCC distribution covariance 仍属 V4 后续工作 |
+| 2026-08-14 | V2/V4 / `8e49061` smoke | score 修正必须先通过 1-pair package smoke | 使用新 immutable run `v2-8e49061-h20-smoke1` 完整执行 real OpenMMLab/MANO、逐条 validator、artifact import 和 overlay | raw max=1.00577068 原样留证且 bounded=1；2/2 export 与 MANO；39 records/27 blobs 完整校验 | 证明 package 修正可用，不使用 1 帧统计宣称长轨或质量 gate | smoke PASS；按原计划使用新 run ID 执行 120 pairs |
+| 2026-08-14 | V0–V7 / `v2-8e49061-h20-120` | 修正 package 后重跑 120 pairs，MANO production 目标 ≥95% | canonical run `COMPLETED / PRODUCED`，但 MANO production 仅 213/238=89.496%；25 个失败仍显式回退 Raw | Trace 2,911 records/1,922 blobs 完整校验；accepted RMSE median/P95 9.008/16.960 mm；2 个 Raw hand-gate reject；2 条长轨 | score/package 修正已验证；不放宽 20 mm 或 95% 门禁；Temporal 仍有 25 个 Raw fallback，新指标不可写回历史 baseline | canonical 系统 run PASS；V7 production gate FAIL；robust association、PCA/bidirectional、Temporal MANO 和 GT 精度继续待完成 |
+| 2026-08-14 | V7.1 / implementation plan | 继续增加迭代、放宽 20 mm 门槛或优先实现 PCA/双向传播 | 先实现二阶段 residual-trim refit，并用与鲁棒 loss 一致的 inlier gate；保留 ordinary RMSE 和 40 mm 全局安全上限 | 25/25 拒绝帧最大异常骨段均为 wrist→little MCP；失败/通过帧最大骨长中位数 155.7/105.6 mm，covariance std 48.9/21.6 mm，而失败帧重投影误差反而更低。反事实 trim-worst-1/10% 的预计产出率为 97.90%/99.16%；增加 seed、反向初始化和单纯增加 iteration 均未解决 | Raw observation 与 20 mm inlier 门槛不变；MANO Trace/attempt schema 增加权重、mask、两类 RMSE 和 gate reason；需要新 run ID 完整重跑，旧 run 不改写 | 方案先行，按 TDD 实现 `RESIDUAL_TRIM_10PCT_V1`；真实 H20 数据决定是否保留或修订该策略 |
 
 复制模板：
 
@@ -563,3 +714,6 @@ presence GT 冲突，以 GT 为准并在偏离记录中修改该回归门槛，�
 | 2026-08-14 | 加固 V4/V7 边界：covariance 跨进程校验对称/PSD；mixed-valid 双手保留逐手失败链；Trace 修正为 Raw→tracking；MANO 最后 optimizer step 纳入 best-state，并在 warm reject 后执行同侧 cold recovery，失败 attempt 不再成为状态前驱。 |
 | 2026-08-14 | React 增加 mixed-hand `PARTIAL`、untracked rejection 与 `hand_reason` 展示，并将 virtual crop/mask 改为单候选按需加载；Trace API 对内容寻址 artifact 启用 immutable 浏览器缓存及封存 run 的短时 validation 缓存。 |
 | 2026-08-14 | H20 首次 120-pair v2 worker 计算完成但因未归一化 SimCC score 超过 1 被 package validator 正确拒绝；记录 FAILED run、诊断指标与过程 blob 保留缺口，修正为 raw model response 与 bounded quality 双通道并将校验提前到逐条写出。 |
+| 2026-08-14 | `v2-8e49061-h20-smoke1` 完成 1-pair package smoke；raw >1 score 保留、bounded weight、strict validator、真实 MANO、完整 artifact import 与 1 帧 overlay 全部通过。 |
+| 2026-08-14 | `v2-8e49061-h20-120` 以 `COMPLETED / PRODUCED` 封存；回写 baseline/configuration hash、候选到导出的逐阶段证据、Trace API 功能验收与 gate 结论。双手/export 数量回归通过，MANO production 只有 89.496%，异常骨长、API 性能复测、native ablation、GT 精度、PCA/bidirectional 和 Temporal MANO 仍未完成。 |
+| 2026-08-14 | 在实现前冻结 V7.1 二阶段鲁棒 MANO 方案：第一阶段全有效点 Huber，失败后最多裁剪 10% 的高残差点并从最佳参数重拟合；使用 20 mm inlier RMSE、至少 15 点支持和 40 mm full-RMSE 安全上限，Raw 与失败证据保持不可变。 |

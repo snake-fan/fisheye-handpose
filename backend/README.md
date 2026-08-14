@@ -68,15 +68,28 @@ responses. Their URL identifies the verified bytes, so the browser can reuse fra
 and video content without downloading it again when the viewer changes stages. Referenced files
 outside that content-addressed layout remain `no-store`.
 
-For a finalized canonical run, the detail endpoint reuses a completed integrity-validation
-snapshot for at most one second. This bounds repeated viewer requests to one blob scan per short
-interaction while retaining periodic tamper detection: once the TTL expires, the next detail
-request validates every referenced blob again. ACTIVE runs are never covered by this cache. The
-artifact endpoint independently stats the file before serving and verifies its SHA-256 whenever
-that fingerprint is new or changed. If it detects a missing or changed artifact, it rejects the
-request and immediately invalidates the run's validation snapshot. Consequently, `validation`
-describes a check performed no more than one second before the detail response, rather than a
-filesystem lock or an indefinite seal.
+For a finalized canonical run, the detail endpoint keeps a completed full-SHA integrity snapshot
+for at most five minutes. Reusing that snapshot is conditional: every request compares each
+referenced artifact's resolved in-run path and stat fingerprint (`device`, inode, byte count,
+mtime, and ctime) with the fully validated snapshot. A missing file, changed path, or changed stat
+fingerprint forces an immediate full validation instead of returning the cached result. The next
+detail request after five minutes also recomputes every referenced SHA-256 even when all stat
+fingerprints remain unchanged. This leaves the response schema unchanged while avoiding repeated
+multi-gigabyte reads during one viewer session.
+
+ACTIVE runs are never covered by the validation cache. The artifact endpoint also remains
+independent: every `GET` or `HEAD` re-resolves the referenced path inside the run and checks its
+current stat fingerprint, then verifies SHA-256 whenever that fingerprint is new or changed. If it
+detects a missing or changed artifact, it rejects the request and immediately invalidates the
+run's validation snapshot.
+
+The consistency window is therefore explicit: a finalized run's `validation` is backed by a full
+hash pass no more than five minutes old plus current stat fingerprints, not by a filesystem lock.
+An out-of-band mutation engineered to preserve the resolved path and every stat field can remain
+covered by the prior result until the periodic full pass; normal writes, replacements, moves, and
+symlink changes invalidate it immediately. Catalog-directory discovery is cached for 30 seconds,
+but top-level item-directory changes invalidate it sooner; a manifest added later inside an
+already-existing nested directory can take up to 30 seconds to appear.
 
 `run_id` is only unique inside one data item, so it is display metadata rather than an API key.
 The catalog returns a stable opaque `run_key` (the first 16 hexadecimal characters of the
@@ -98,6 +111,12 @@ structurally unreadable runs return an empty object rather than placeholder valu
 Canonical runs use `run_manifest.json`, `trace.jsonl`, and optional `run_summary.json`. The
 reader also accepts the older `manifest.json`/`trace_manifest.json`, `records.jsonl`, and
 `summary.json` file names plus flat record metadata.
+
+Run-list queries apply `q` (run ID or item ID) and any cheaply decidable non-`INVALID` status
+against the small manifest/summary documents before opening trace files. Returned candidates are
+still fully summarized and post-filtered, so a trace that advertises `COMPLETED` but fails
+canonical validation cannot leak into a completed-only result. `status=INVALID` deliberately does
+not use the cheap status shortcut because corruption is only knowable after reading the trace.
 
 ## Verify
 

@@ -451,6 +451,54 @@ def test_run_summary_uses_canonical_item_id_metadata(tmp_path: Path) -> None:
     assert item["data_item_id"] == "capture-item"
 
 
+def test_run_query_filters_by_item_identity_before_reading_unmatched_traces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = _write_run(tmp_path / "selected-item", run_id="selected-run")
+    selected_manifest = json.loads((selected / "run_manifest.json").read_text(encoding="utf-8"))
+    selected_manifest["metadata"] = {"item_id": "needle-item"}
+    _write_json(selected / "run_manifest.json", selected_manifest)
+    _write_run(tmp_path / "excluded-item", run_id="excluded-run")
+    trace_reads: dict[Path, int] = {}
+    original_read_text = Path.read_text
+
+    def counted_read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if path.name == "trace.jsonl":
+            trace_reads[path] = trace_reads.get(path, 0) + 1
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+
+    page = TraceCatalog(tmp_path).list_runs(q="needle-item")
+
+    assert [item["run_id"] for item in page["items"]] == ["selected-run"]
+    assert trace_reads == {selected / "trace.jsonl": 1}
+
+
+def test_status_filter_skips_traces_with_a_known_different_terminal_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active = _write_run(tmp_path / "active-item", run_id="active-run")
+    (active / "run_summary.json").unlink()
+    _write_run(tmp_path / "completed-item", run_id="completed-run")
+    trace_reads: dict[Path, int] = {}
+    original_read_text = Path.read_text
+
+    def counted_read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if path.name == "trace.jsonl":
+            trace_reads[path] = trace_reads.get(path, 0) + 1
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+
+    page = TraceCatalog(tmp_path).list_runs(status="ACTIVE")
+
+    assert [item["run_id"] for item in page["items"]] == ["active-run"]
+    assert trace_reads == {active / "trace.jsonl": 1}
+
+
 def test_run_detail_reports_a_broken_canonical_record_hash(tmp_path: Path) -> None:
     run = tmp_path / "strict"
     run.mkdir()
@@ -804,6 +852,38 @@ def test_completed_run_reuses_one_parsed_index_across_catalog_queries(
     assert parse_count == 1
 
 
+def test_catalog_discovery_cache_does_not_rescan_during_a_viewer_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_run(tmp_path, run_id="discovery-cache")
+    rglob_count = 0
+    original_rglob = Path.rglob
+
+    def counted_rglob(path: Path, pattern: str):  # type: ignore[no-untyped-def]
+        nonlocal rglob_count
+        rglob_count += 1
+        return original_rglob(path, pattern)
+
+    monkeypatch.setattr(Path, "rglob", counted_rglob)
+    current_time = 100.0
+
+    def clock() -> float:
+        return current_time
+
+    catalog = TraceCatalog(
+        tmp_path,
+        discovery_cache_ttl_seconds=300.0,
+        clock=clock,
+    )
+    assert catalog.list_runs()["total"] == 1
+
+    current_time = 130.0
+    assert catalog.list_runs()["total"] == 1
+
+    assert rglob_count == len(catalog_module._MANIFEST_NAMES)
+
+
 def test_completed_run_index_is_rebuilt_when_trace_fingerprint_changes(tmp_path: Path) -> None:
     run = _write_run(tmp_path, run_id="changed-completed")
     catalog = TraceCatalog(tmp_path)
@@ -894,7 +974,52 @@ def test_completed_canonical_run_performs_full_validation_once_within_ttl(
     assert validation_modes == [False, True]
 
 
-def test_completed_run_detail_reuses_blob_validation_only_within_the_short_ttl(
+def test_completed_detail_reuses_full_validation_across_a_normal_viewer_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "viewer-session-cache"
+    writer = RunArtifactWriter.create(
+        run,
+        run_id="viewer-session-cache",
+        pipeline_version="test",
+    )
+    writer.append(
+        record_id="decode:0",
+        stage=TraceStage.DECODE,
+        status=TraceStatus.SUCCEEDED,
+        event="decoded",
+        payload={"frame_id": "frame/000000", "frame_index": 0},
+    )
+    writer.finalize(status=RunStatus.COMPLETED)
+    validation_modes: list[bool] = []
+    original_validate = catalog_module.RunArtifactReader.validate
+
+    def counted_validate(
+        reader: RunArtifactReader,
+        *,
+        verify_blobs: bool = True,
+    ) -> object:
+        validation_modes.append(verify_blobs)
+        return original_validate(reader, verify_blobs=verify_blobs)
+
+    monkeypatch.setattr(catalog_module.RunArtifactReader, "validate", counted_validate)
+    current_time = 100.0
+
+    def clock() -> float:
+        return current_time
+
+    catalog = TraceCatalog(tmp_path, clock=clock)
+    run_key = catalog.list_runs()["items"][0]["run_key"]
+    assert catalog.get_run(run_key)["validation"]["ok"] is True
+
+    current_time = 130.0
+    assert catalog.get_run(run_key)["validation"]["ok"] is True
+
+    assert validation_modes == [False, True]
+
+
+def test_completed_run_detail_reuses_blob_hash_validation_while_stats_stay_stable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -920,16 +1045,17 @@ def test_completed_run_detail_reuses_blob_validation_only_within_the_short_ttl(
     )
     writer.finalize(status=RunStatus.COMPLETED)
     artifact_path = (run / blob.relative_path).resolve()
-    artifact_stats = 0
-    original_stat = Path.stat
+    artifact_reads = 0
+    original_open = Path.open
 
-    def counted_stat(path: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
-        nonlocal artifact_stats
-        if path == artifact_path:
-            artifact_stats += 1
-        return original_stat(path, *args, **kwargs)
+    def counted_open(path: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal artifact_reads
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path == artifact_path and mode == "rb":
+            artifact_reads += 1
+        return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", counted_stat)
+    monkeypatch.setattr(Path, "open", counted_open)
     current_time = 100.0
 
     def clock() -> float:
@@ -939,15 +1065,15 @@ def test_completed_run_detail_reuses_blob_validation_only_within_the_short_ttl(
     run_key = catalog.list_runs()["items"][0]["run_key"]
 
     assert catalog.get_run(run_key)["validation"]["ok"] is True
-    first_request_stats = artifact_stats
-    assert first_request_stats > 0
+    first_request_reads = artifact_reads
+    assert first_request_reads > 0
 
     assert catalog.get_run(run_key)["validation"]["ok"] is True
-    assert artifact_stats == first_request_stats
+    assert artifact_reads == first_request_reads
 
     current_time = 101.0
     assert catalog.get_run(run_key)["validation"]["ok"] is True
-    assert artifact_stats > first_request_stats
+    assert artifact_reads > first_request_reads
 
 
 def test_artifact_hash_result_is_reused_until_the_file_stat_changes(
@@ -997,7 +1123,7 @@ def test_artifact_hash_result_is_reused_until_the_file_stat_changes(
         catalog.resolve_artifact(run_key, relative_path)
 
 
-def test_completed_run_detects_unrequested_blob_tamper_after_validation_ttl(
+def test_completed_run_detects_unrequested_blob_tamper_from_its_stat_change(
     tmp_path: Path,
 ) -> None:
     run = tmp_path / "validated-blob"
@@ -1033,9 +1159,45 @@ def test_completed_run_detects_unrequested_blob_tamper_after_validation_ttl(
 
     (run / blob.relative_path).write_bytes(b"tampered artifact")
 
+    validation = catalog.get_run(run_key)["validation"]
+    assert validation["ok"] is False
+    assert validation["mode"] == "CANONICAL_V1"
+
+
+def test_completed_detail_revalidates_when_a_blob_stat_changes_within_the_ttl(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "stat-invalidates-validation"
+    writer = RunArtifactWriter.create(
+        run,
+        run_id="stat-invalidates-validation",
+        pipeline_version="test",
+    )
+    blob = writer.put_blob(
+        b"trusted artifact",
+        role="source_left",
+        media_type="application/octet-stream",
+        suffix=".bin",
+    )
+    writer.append(
+        record_id="decode:0",
+        stage=TraceStage.DECODE,
+        status=TraceStatus.SUCCEEDED,
+        event="decoded",
+        payload={"frame_id": "frame/000000", "frame_index": 0},
+        blobs=(blob,),
+    )
+    writer.finalize(status=RunStatus.COMPLETED)
+    catalog = TraceCatalog(
+        tmp_path,
+        validation_cache_ttl_seconds=300.0,
+        clock=lambda: 100.0,
+    )
+    run_key = catalog.list_runs()["items"][0]["run_key"]
     assert catalog.get_run(run_key)["validation"]["ok"] is True
 
-    current_time = 101.0
+    (run / blob.relative_path).write_bytes(b"forged! artifact")
+
     validation = catalog.get_run(run_key)["validation"]
     assert validation["ok"] is False
     assert validation["mode"] == "CANONICAL_V1"
@@ -1067,7 +1229,7 @@ def test_artifact_integrity_failure_invalidates_completed_run_validation_within_
     writer.finalize(status=RunStatus.COMPLETED)
     catalog = TraceCatalog(
         tmp_path,
-        validation_cache_ttl_seconds=1.0,
+        validation_cache_ttl_seconds=300.0,
         clock=lambda: 100.0,
     )
     run_key = catalog.list_runs()["items"][0]["run_key"]
@@ -1108,7 +1270,7 @@ def test_active_run_revalidates_referenced_blobs_without_waiting_for_the_ttl(
     )
     catalog = TraceCatalog(
         tmp_path,
-        validation_cache_ttl_seconds=1.0,
+        validation_cache_ttl_seconds=300.0,
         clock=lambda: 100.0,
     )
     run_key = catalog.list_runs()["items"][0]["run_key"]

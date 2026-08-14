@@ -19,6 +19,8 @@ from fisheye_handpose.trace import RunArtifactReader, TraceValidationError
 _MANIFEST_NAMES = ("run_manifest.json", "trace_manifest.json", "manifest.json")
 _TRACE_NAMES = ("trace.jsonl", "records.jsonl")
 _SUMMARY_NAMES = ("run_summary.json", "summary.json")
+DEFAULT_DISCOVERY_CACHE_TTL_SECONDS = 30.0
+DEFAULT_VALIDATION_CACHE_TTL_SECONDS = 300.0
 
 
 class ArtifactNotFoundError(LookupError):
@@ -41,6 +43,7 @@ class ResolvedArtifact:
 _FileFingerprint = tuple[int, int, int, int, int]
 _RunFingerprint = tuple[tuple[str, _FileFingerprint] | None, ...]
 _ValidationFingerprint = _RunFingerprint
+_ArtifactFingerprint = tuple[tuple[str, str | None, _FileFingerprint | None], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +70,7 @@ class _VerifiedArtifact:
 class _CachedValidation:
     result: dict[str, Any]
     expires_at: float
+    artifact_fingerprint: _ArtifactFingerprint | None
 
 
 class TraceCatalog:
@@ -76,14 +80,18 @@ class TraceCatalog:
         self,
         root: str | Path,
         *,
-        validation_cache_ttl_seconds: float = 1.0,
+        discovery_cache_ttl_seconds: float = DEFAULT_DISCOVERY_CACHE_TTL_SECONDS,
+        validation_cache_ttl_seconds: float = DEFAULT_VALIDATION_CACHE_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
+        if discovery_cache_ttl_seconds < 0:
+            raise ValueError("discovery_cache_ttl_seconds must be non-negative")
         if validation_cache_ttl_seconds < 0:
             raise ValueError("validation_cache_ttl_seconds must be non-negative")
         self.root = Path(root).expanduser().resolve(strict=True)
         if not self.root.is_dir():
             raise NotADirectoryError(self.root)
+        self._discovery_cache_ttl_seconds = discovery_cache_ttl_seconds
         self._validation_cache_ttl_seconds = validation_cache_ttl_seconds
         self._clock = clock
         self._cache_lock = threading.RLock()
@@ -108,7 +116,26 @@ class TraceCatalog:
         status: str | None = None,
         q: str | None = None,
     ) -> dict[str, Any]:
-        items = [self._summarize_safe(path) for path in self._run_directories()]
+        paths = self._run_directories()
+        needle = q.casefold() if q is not None and q.strip() else None
+        if needle is not None or (status is not None and status != "INVALID"):
+            filtered_paths: list[Path] = []
+            for path in paths:
+                run_id, item_id, cheap_status = self._cheap_run_metadata(path)
+                if needle is not None and not any(
+                    needle in value.casefold() for value in (run_id, item_id)
+                ):
+                    continue
+                if (
+                    status is not None
+                    and status != "INVALID"
+                    and cheap_status is not None
+                    and cheap_status != status
+                ):
+                    continue
+                filtered_paths.append(path)
+            paths = tuple(filtered_paths)
+        items = [self._summarize_safe(path) for path in paths]
         if status is not None:
             items = [item for item in items if item["status"] == status]
         if q is not None and q.strip():
@@ -129,6 +156,35 @@ class TraceCatalog:
             "limit": limit,
             "total": len(items),
         }
+
+    def _cheap_run_metadata(self, run: Path) -> tuple[str, str, str | None]:
+        manifest = _load_json_safe(_first_existing(run, _MANIFEST_NAMES)) or {}
+        summary = _load_json_safe(_first_existing(run, _SUMMARY_NAMES))
+        metadata = manifest.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        relative_parts = run.relative_to(self.root).parts
+        fallback_item_id = relative_parts[-2] if len(relative_parts) > 1 else run.name
+        item_id = next(
+            (
+                value
+                for value in (
+                    metadata.get("item_id"),
+                    metadata.get("data_item_id"),
+                    metadata.get("source_item_id"),
+                    manifest.get("item_id"),
+                    manifest.get("data_item_id"),
+                )
+                if isinstance(value, str) and value
+            ),
+            fallback_item_id,
+        )
+        run_id = manifest.get("run_id")
+        cheap_status = (summary or manifest).get("status")
+        return (
+            run_id if isinstance(run_id, str) and run_id else run.name,
+            item_id,
+            cheap_status if isinstance(cheap_status, str) else None,
+        )
 
     def get_run(self, run_key: str) -> dict[str, Any]:
         run = self._find_run(run_key)
@@ -385,7 +441,7 @@ class TraceCatalog:
 
     def _run_directories(self) -> tuple[Path, ...]:
         marker = _directory_marker(self.root)
-        now = time.monotonic()
+        now = self._clock()
         with self._cache_lock:
             if (
                 self._discovered_runs is not None
@@ -407,7 +463,7 @@ class TraceCatalog:
         with self._cache_lock:
             self._discovered_runs = result
             self._discovery_marker = marker
-            self._discovery_deadline = now + 1.0
+            self._discovery_deadline = self._clock() + self._discovery_cache_ttl_seconds
             self._known_runs = {self._run_key(path): path for path in result}
         return result
 
@@ -578,24 +634,43 @@ class TraceCatalog:
         if not index.finalized:
             return _validate_canonical(run, verify_blobs=verify_blobs)
         key = (run, index.fingerprint, verify_blobs)
+        artifact_fingerprint = (
+            _artifact_fingerprint(run, index.artifacts_by_path) if verify_blobs else None
+        )
         now = self._clock()
         with self._cache_lock:
             cached = self._validation_cache.get(key)
-            if cached is not None and now < cached.expires_at:
+            if (
+                cached is not None
+                and now < cached.expires_at
+                and cached.artifact_fingerprint == artifact_fingerprint
+            ):
                 return cached.result
             validation_lock = self._validation_locks.setdefault(key, threading.Lock())
         with validation_lock:
+            artifact_fingerprint = (
+                _artifact_fingerprint(run, index.artifacts_by_path) if verify_blobs else None
+            )
             now = self._clock()
             with self._cache_lock:
                 cached = self._validation_cache.get(key)
-                if cached is not None and now < cached.expires_at:
+                if (
+                    cached is not None
+                    and now < cached.expires_at
+                    and cached.artifact_fingerprint == artifact_fingerprint
+                ):
                     return cached.result
             result = _validate_canonical(run, verify_blobs=verify_blobs)
-            with self._cache_lock:
-                self._validation_cache[key] = _CachedValidation(
-                    result=result,
-                    expires_at=self._clock() + self._validation_cache_ttl_seconds,
-                )
+            stable_artifact_fingerprint = (
+                _artifact_fingerprint(run, index.artifacts_by_path) if verify_blobs else None
+            )
+            if artifact_fingerprint == stable_artifact_fingerprint:
+                with self._cache_lock:
+                    self._validation_cache[key] = _CachedValidation(
+                        result=result,
+                        expires_at=self._clock() + self._validation_cache_ttl_seconds,
+                        artifact_fingerprint=stable_artifact_fingerprint,
+                    )
             return result
 
     def _invalidate_validation_cache(self, run: Path) -> None:
@@ -638,6 +713,29 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 def _file_fingerprint(path: Path) -> _FileFingerprint:
     stat = path.stat()
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _artifact_fingerprint(
+    run: Path,
+    artifacts_by_path: dict[str, dict[str, Any]],
+) -> _ArtifactFingerprint:
+    entries: list[tuple[str, str | None, _FileFingerprint | None]] = []
+    for relative_path in sorted(artifacts_by_path):
+        resolved_path: str | None = None
+        fingerprint: _FileFingerprint | None = None
+        try:
+            pure_path = PurePosixPath(relative_path)
+            if pure_path.is_absolute() or ".." in pure_path.parts:
+                raise ValueError(relative_path)
+            candidate = run.joinpath(*pure_path.parts).resolve(strict=True)
+            if not candidate.is_relative_to(run):
+                raise ValueError(relative_path)
+            resolved_path = candidate.as_posix()
+            fingerprint = _file_fingerprint(candidate)
+        except (OSError, ValueError):
+            pass
+        entries.append((relative_path, resolved_path, fingerprint))
+    return tuple(entries)
 
 
 def _run_fingerprint(run: Path) -> _RunFingerprint:
