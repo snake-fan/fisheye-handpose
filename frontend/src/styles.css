@@ -275,6 +275,8 @@ button { color: inherit; }
 .mano-joint-weights li i { display: block; width: 7px; height: 7px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 5px rgb(116 246 196 / 36%); }
 .mano-joint-weights li.trimmed { color: var(--amber); }
 .mano-joint-weights li.trimmed i { background: var(--amber); box-shadow: none; opacity: 0.32 !important; }
+.mano-joint-weights li.unsupported { color: var(--dim); }
+.mano-joint-weights li.unsupported i { background: var(--dim); box-shadow: none; opacity: 0.18 !important; }
 .candidate-decision-list { display: grid; gap: 5px; margin: 0; padding: 7px; border-top: 1px solid var(--line); background: #070b0d; list-style: none; }
 .candidate-decision-list li { position: relative; display: grid; min-width: 0; gap: 5px; padding: 7px 8px 7px 11px; overflow: hidden; border: 1px solid var(--line); border-radius: 4px; background: var(--panel); }
 .candidate-decision-list li::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--dim); }

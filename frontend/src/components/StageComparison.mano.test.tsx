@@ -58,7 +58,7 @@ test("operator can audit a produced MANO robust refit without treating its heuri
     minimum_effective_joint_count: 15,
     joint_weights: jointWeights,
     inlier_mask: inlierMask,
-    trimmed_joint_indices: [0, 17],
+    trimmed_joint_indices: [17],
     stage_iterations: [
       { stage: "FULL_HUBER", iterations_run: 200 },
       { stage: "WEIGHTED_REFIT", iterations_run: 84 },
@@ -99,11 +99,12 @@ test("operator can audit a produced MANO robust refit without treating its heuri
   expect(within(diagnostic).getByText("40.00 mm")).toBeVisible();
   expect(within(diagnostic).getByText("19 / 15")).toBeVisible();
   expect(within(diagnostic).getByText("YES · 2 STAGES")).toBeVisible();
-  expect(within(diagnostic).getByText("0 · wrist_center")).toBeVisible();
   expect(within(diagnostic).getByText("17 · little_mcp")).toBeVisible();
   expect(within(diagnostic).getByText("FULL_HUBER · 200")).toBeVisible();
   expect(within(diagnostic).getByText("WEIGHTED_REFIT · 84")).toBeVisible();
   expect(within(diagnostic).getByRole("list", { name: "track-0001 FHP21 joint weights" }).children).toHaveLength(21);
+  expect(within(diagnostic).getByTitle(/0 · wrist_center · weight 0\.00 · NO RAW SUPPORT/)).toBeVisible();
+  expect(within(diagnostic).getByTitle(/17 · little_mcp · weight 0\.00 · TRIMMED/)).toBeVisible();
   expect(within(diagnostic).queryByText(/probability|概率/i)).not.toBeInTheDocument();
   expect(screen.getByText("RAW_FUSION → MANO v1.2")).toBeVisible();
   expect(screen.getAllByLabelText(/track-0001 RAW_FUSION/)).toHaveLength(2);

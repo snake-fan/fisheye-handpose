@@ -1262,11 +1262,18 @@ function ManoGateDiagnostics({ records, selectedTrack }: { records: TraceRecord[
                     const inlier = typeof mask[jointIndex] === "boolean"
                       ? mask[jointIndex]
                       : weight === null || weight > 0;
+                    const explicitlyTrimmed = trimmedIndices.includes(jointIndex);
+                    const jointState = explicitlyTrimmed
+                      ? "trimmed"
+                      : inlier ? "inlier" : "unsupported";
+                    const stateLabel = explicitlyTrimmed
+                      ? "TRIMMED"
+                      : inlier ? "INLIER" : "NO RAW SUPPORT";
                     return (
                       <li
                         key={name}
-                        className={inlier ? "inlier" : "trimmed"}
-                        title={`${jointIndex} · ${name} · weight ${weight === null ? "—" : weight.toFixed(2)} · ${inlier ? "INLIER" : "TRIMMED"}`}
+                        className={jointState}
+                        title={`${jointIndex} · ${name} · weight ${weight === null ? "—" : weight.toFixed(2)} · ${stateLabel}`}
                       >
                         <span>{jointIndex}</span>
                         <i style={{ opacity: weight === null ? 0.35 : Math.max(0.18, Math.min(1, weight)) }} />
