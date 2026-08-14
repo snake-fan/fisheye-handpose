@@ -68,6 +68,7 @@ class ResultWriter:
         self._summary = self.root / "summary.json"
         self._fhp21 = self.root / "fhp21.jsonl"
         self._ordinal = 0
+        self._fhp21_count = 0
         self._finalized = False
         self._event_ids: set[str] = set()
         _write_new(
@@ -212,12 +213,17 @@ class ResultWriter:
     def append_fhp21(self, value: dict[str, Any]) -> None:
         if self._finalized:
             raise WorkerError("cannot append output to finalized result")
-        encoded = _json_bytes({**value, "schema_version": FHP21_OUTPUT_SCHEMA})
+        from .output_contract import validate_pose_estimate
+
+        document = {**value, "schema_version": FHP21_OUTPUT_SCHEMA}
+        validate_pose_estimate(document, line_number=self._fhp21_count + 1)
+        encoded = _json_bytes(document)
         mode = "ab" if self._fhp21.exists() else "xb"
         with self._fhp21.open(mode) as handle:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+        self._fhp21_count += 1
 
     def finalize(self, *, status: str, summary: dict[str, Any]) -> dict[str, Any]:
         if self._finalized:

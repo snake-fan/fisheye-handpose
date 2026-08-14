@@ -454,8 +454,11 @@ frame-wise MANO 关节 XYZ 上的 `causal_time_ema_v1`；没有 Temporal MANO、
 - V4 的鲁棒优化只能处理已给定左右观测的数值融合。仅有两个视角时，极线一致的错手或
   错关节点配对可能同时具有很低重投影误差；该问题必须由 V3/association 的跨关节、track
   与必要时 anatomy 证据解决，不能把低 reprojection residual 当作配对正确证明。
-- 当前 2D covariance 没有来自 SimCC 或目标域 calibration；单位 covariance 再按 score
-  缩放只是一种启发式权重，所以 Raw `covariance_m2` 明确标记
+- 当前 2D covariance 没有来自 SimCC 或目标域 calibration。固定 Hand5 配置的
+  `SimCCLabel(normalize=False)` 输出未归一化峰值，合法值可超过 1，不是概率。主链完整保留
+  `model_keypoint_scores`，并用版本化 `CLIP_0_1_V1` 生成兼容字段
+  `keypoint_scores` 作为有界 operational quality weight；只有后者用于 threshold、association
+  和单位 covariance 缩放。该缩放仍只是一种启发式权重，所以 Raw `covariance_m2` 明确标记
   `HEURISTIC_UNCALIBRATED`，不得解释为校准概率不确定度。
 - robust fusion 后要求当前帧至少 3 个有效掌心点。未通过时仍保存
   `raw_hand_gate_not_produced` 及逐点证据，但不创建假 track，也不向 MANO/Temporal/export
@@ -466,6 +469,28 @@ frame-wise MANO 关节 XYZ 上的 `causal_time_ema_v1`；没有 Temporal MANO、
 - V5 tracker 使用固定距离 gate，而非计划中的 covariance-adaptive gate；当前 trace 记录
   assignment 的 anchor/prediction/distance/recovery，但没有完整候选 cost matrix 和所有
   rejected track gate。
+
+### 8.5 `0782688` 第一次 H20 实跑证据与现场修正
+
+真实 120-pair run `v2-0782688-h20-120` 完成了 worker 计算，但 core 在导入时按设计
+fail-closed，最终状态为 `FAILED / NOT_PRODUCED`。失败不是 CUDA、模型或几何异常，而是
+旧输出契约错误地把 RTMPose 未归一化 SimCC 峰值当成 `[0,1]` 概率：9,996 个双目 joint
+score 中 29 个超过 1（0.290%），最大 1.09536755。worker return code 为 0，core trace
+保留 request/stdout/stderr/invalid manifest/events/summary/fhp21，并可完整校验 FAILED 状态；
+逐阶段图片与视频引用的 1,914 个 blob 未被导入，这是失败包可视化仍需补齐的已知缺口。
+
+从保留的 2,900 条事件与 238 条输出中得到的非最终诊断证据为：120/120 帧均有两个跨视图
+match；Raw 238 produced、2 rejected；track 数为 2（118 与 120 条）；frame-wise MANO
+213/238=89.50%，通过项 RMSE median=9.008 mm、P95=16.960 mm。双手、track、导出数量和
+通过项误差均较旧基线改善，但 MANO 产出率仍未达到 95% gate，且失败集中于右手
+frame 41–73。由于 package 最终失败，这些数字只能作为故障诊断，不能登记为 canonical
+成功基线。
+
+现场修正保持最终协议严格：raw `model_keypoint_scores` 原样留证；bounded
+`keypoint_scores` 才参与当前启发式权重；visibility/confidence probability 继续为 null。
+producer 在每条 FHP21 append 前执行同一严格 validator，使此类错误在首条记录而不是整段
+处理结束后暴露。修正必须先过 1-pair package smoke，再使用新 run ID 重跑 120 pair；禁止
+覆盖或续跑上述 immutable FAILED run。
 
 ## 9. 总体验收矩阵
 
@@ -513,6 +538,7 @@ presence GT 冲突，以 GT 为准并在偏离记录中修改该回归门槛，�
 | 2026-08-14 | Trace / 本地工作树 | tracking event 可直接 parent association，Raw 在其后补写 | Raw observation（包括 zero-match 的 `raw:none`）先落盘，tracking parent 指向本帧 accepted/rejected/empty Raw；MANO 从当前 tracking 开始；每个 rejected hand 都补齐下游失败链 | tracker 实际已消费 Raw observation，旧 DAG 因果方向相反；mixed-valid/rejected 双手测试证明失败 hand 曾在后续节点消失；missing 帧仍会改变 active tracker 的 missed-update 状态 | 只改变新 Trace 的 parent DAG、active-state lineage 与失败证据，不改变 FHP21 成功输出；旧 run 仍可读，新结果需重跑 | 修正为与实际数据流一致的因果链 |
 | 2026-08-14 | Trace UI / 本地工作树 | virtual crop 候选图像全部立即加载，run detail 每次重扫全部 blob | 候选证据改为一次只展开一个；内容寻址 artifact 使用 private immutable cache；封存 run 的完整 blob validation 使用 1 秒短缓存，artifact 访问仍实时校验，ACTIVE run 不缓存 | v2 每帧最多 8 份 crop/mask 证据，旧 eager/no-store 路径会重复下载并对数百 blob 逐次 stat，造成明显卡顿 | finalized run detail 的完整性状态最多延迟 1 秒反映未授权的磁盘篡改；直接 artifact 访问立即发现并失效缓存；算法输出与 trace schema 不变 | 接受短缓存折中；保留 fail-closed artifact 读取与测试时可注入时钟 |
 | 2026-08-14 | V8 / 本地工作树 | 三 pass 离线 Temporal MANO | 尚未实现；继续使用单遍 `causal_time_ema_v1` | runner 仍对 Raw/accepted MANO 的 XYZ 做 causal EMA，没有窗口参数优化或三层独立输出 | 当前 stable 只能声明 XYZ EMA；没有 Temporal MANO 指标、视频或能力标签，既有输出契约暂不变 | 不是设计替换，只是待实现；不得把 EMA 改名为 Temporal MANO |
+| 2026-08-14 | V2/V4 / H20 run `v2-0782688-h20-120` | RTMPose `keypoint_scores` 可直接作为 `[0,1]` confidence | 明确保留未归一化 `model_keypoint_scores`，另以 `CLIP_0_1_V1` 派生有界 operational quality；最终 probability 仍为空 | pinned SimCC codec `normalize=False`，真实 9,996 个 score 中 29 个 >1；直接作为 covariance 权重会制造过度自信并使严格 package validator 拒绝 | FHP21 bounded score contract 不放宽；Trace 增加 raw score 与 method/status；producer 改为逐条提前验证 | 现场证据驱动修正；clip 仅是兼容启发式，目标域 calibration/SimCC distribution covariance 仍属 V4 后续工作 |
 
 复制模板：
 
@@ -536,3 +562,4 @@ presence GT 冲突，以 GT 为准并在偏离记录中修改该回归门槛，�
 | 2026-08-14 | 接入 V7 frame-wise MANO v2：mean pose、full-45D robust fit、200 iter 上限、best-so-far/early-stop、accepted-state warm-start 与完整诊断；双向 pass 和 Temporal MANO 仍未实现。 |
 | 2026-08-14 | 加固 V4/V7 边界：covariance 跨进程校验对称/PSD；mixed-valid 双手保留逐手失败链；Trace 修正为 Raw→tracking；MANO 最后 optimizer step 纳入 best-state，并在 warm reject 后执行同侧 cold recovery，失败 attempt 不再成为状态前驱。 |
 | 2026-08-14 | React 增加 mixed-hand `PARTIAL`、untracked rejection 与 `hand_reason` 展示，并将 virtual crop/mask 改为单候选按需加载；Trace API 对内容寻址 artifact 启用 immutable 浏览器缓存及封存 run 的短时 validation 缓存。 |
+| 2026-08-14 | H20 首次 120-pair v2 worker 计算完成但因未归一化 SimCC score 超过 1 被 package validator 正确拒绝；记录 FAILED run、诊断指标与过程 blob 保留缺口，修正为 raw model response 与 bounded quality 双通道并将校验提前到逐条写出。 |

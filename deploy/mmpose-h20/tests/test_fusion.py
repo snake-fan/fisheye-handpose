@@ -276,6 +276,19 @@ def test_non_positive_definite_image_covariance_fails_closed() -> None:
     assert result.covariance_m2 is None
 
 
+def test_fusion_rejects_unbounded_quality_weight_before_covariance_scaling() -> None:
+    fusion = RobustStereoFusion(LEFT_PROJECTION, RIGHT_PROJECTION)
+
+    result = fusion.fuse_joint(
+        _observation(360.0, 220.0, score=1.0953675508499146),
+        _observation(260.0, 220.0),
+    )
+
+    assert result.validity == "INVALID"
+    assert result.reason == "INVALID_QUALITY_WEIGHT"
+    assert result.covariance_m2 is None
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

@@ -99,7 +99,10 @@ Every line of `trace.jsonl` is one `fisheye-handpose/trace-record/v1` JSON objec
     "view_id": "left",
     "track_id": "hand-0",
     "keypoints_uv": [[123.4, 98.7]],
-    "keypoint_scores": [0.96]
+    "keypoint_scores": [0.96],
+    "model_keypoint_scores": [1.03],
+    "keypoint_score_semantics": "RTMPOSE_SIMCC_MAX_RESPONSE_UNCALIBRATED",
+    "keypoint_quality_weight_method": "CLIP_0_1_V1"
   },
   "previous_hash": "...previous record hash or null...",
   "record_hash": "...hash of this record body..."
@@ -122,7 +125,8 @@ The viewer groups records by `payload.frame_id` and filters by `payload.track_id
 Producers should also use the following stable evidence keys:
 
 - detection: `view_id`, `detections[]`, each with `bbox_xyxy`, `score`, and `label`;
-- per-view pose: `view_id`, `keypoints_uv[21][2]`, and `keypoint_scores[21]`;
+- per-view pose: `view_id`, `keypoints_uv[21][2]`, bounded operational
+  `keypoint_scores[21]`, and raw `model_keypoint_scores[21]` when the backend exposes it;
 - raw/refined 3D: `landmarks_xyz_m[21][3]`, `validity[21]`, plus contract provenance;
 - ordering/time: stable `frame_id` association and integer hardware `timestamp_ns`;
 - invalid JSON values: `null`, never the non-standard tokens `NaN` or `Infinity`.
@@ -131,6 +135,14 @@ Use `contract_to_trace_payload()` for `SpatialObservation` and `PoseEstimate`. I
 the immutable raw-observation link, converts backend arrays to JSON values, maps
 non-finite sentinels to `null` only for explicitly invalid landmarks, and rejects a
 non-finite value on a valid landmark.
+
+For the pinned RTMPose Hand5 backend, `model_keypoint_scores` are raw SimCC peak
+responses from a codec configured with `normalize=False`; they are finite but uncalibrated
+and may exceed one. They are never visibility or confidence probabilities. The compatibility
+field `keypoint_scores` is a bounded operational quality weight derived by the versioned
+method in `keypoint_quality_weight_method`; it alone is used for thresholds and heuristic
+fusion weighting. Calibrated probability fields remain `null` until target-domain calibration
+exists.
 
 Blob roles are record-local semantics, not inferred from file names. Recommended roles
 include `source_left`, `source_right`, `rectified_left`, `rectified_right`, `crop`,

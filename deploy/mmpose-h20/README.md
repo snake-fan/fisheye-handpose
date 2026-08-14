@@ -338,7 +338,8 @@ worker-result/
   blobs/sha256/ab/...mp4      # optional raw-vs-stable rectified diagnostic video
 ```
 
-`events.jsonl` retains native and rectified 2D points, all 21 confidence values, matched
+`events.jsonl` retains native and rectified 2D points, all 21 bounded operational quality
+weights plus the raw RTMPose model responses, matched
 and unmatched candidate IDs, metric `landmarks_xyz_m`, per-joint validity, epipolar error,
 left/right reprojection error, ray angle, track decisions, MANO parameters and fit quality,
 temporal reset state, and export provenance. Viewer records use top-level `track_id`,
@@ -351,6 +352,13 @@ fisheye frame. Raw, framewise MANO, temporal, and export event payloads include
 `projected_keypoints_uv.left/right`; each side is always length 21, and an invalid,
 non-finite, null, or behind-camera landmark remains JSON `null` instead of acquiring an
 invented pixel coordinate.
+
+The pinned Hand5 codec uses unnormalized SimCC responses. Consequently,
+`model_keypoint_scores[21]` are raw, uncalibrated, and may exceed one; they are retained for
+diagnosis. `keypoint_scores[21]` are the separately derived bounded quality weights used by
+the current threshold/association/fusion path, with `keypoint_quality_weight_method` and
+`keypoint_quality_weight_status` recorded beside them. Neither field is exposed as a
+visibility or confidence probability; those final fields remain explicitly unestimated.
 
 The event DAG follows the real dependency order: association → Raw fusion evidence → track
 assignment → refinement/export. A hand rejected by the Raw hand-level gate still receives

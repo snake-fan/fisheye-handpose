@@ -315,10 +315,11 @@ class MissingMiddleFrameRuntime(FakeRuntime):
 
 
 class VirtualPoseRuntime(FakeRuntime):
-    def __init__(self) -> None:
+    def __init__(self, *, model_score: float = 0.9) -> None:
         super().__init__()
         self.detect_calls = 0
         self.pose_calls = 0
+        self.model_score = model_score
 
     def iter_video_frames(self, path: Path):
         import numpy as np
@@ -350,7 +351,12 @@ class VirtualPoseRuntime(FakeRuntime):
         self.pose_calls += 1
         self.assert_virtual_crop(frame, bboxes)
         center = [(frame.shape[1] - 1.0) / 2.0, (frame.shape[0] - 1.0) / 2.0]
-        return [{"keypoints_uv": [center] * 21, "keypoint_scores": [0.9] * 21}]
+        return [
+            {
+                "keypoints_uv": [center] * 21,
+                "keypoint_scores": [self.model_score] * 21,
+            }
+        ]
 
     @staticmethod
     def assert_virtual_crop(frame: Any, bboxes: list[list[float]]) -> None:
@@ -793,7 +799,8 @@ class WorkerContractTests(unittest.TestCase):
                 load_request(fixture["request"])
 
     def test_worker_virtual_pose_profile_records_crop_and_maps_pose_to_native(self) -> None:
-        runtime = VirtualPoseRuntime()
+        raw_model_score = 1.0953675508499146
+        runtime = VirtualPoseRuntime(model_score=raw_model_score)
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             fixture = _write_fixture(root, pair_count=1)
@@ -814,6 +821,10 @@ class WorkerContractTests(unittest.TestCase):
                 for line in (result_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
             ]
             manifest = json.loads((result_dir / "manifest.json").read_text(encoding="utf-8"))
+            exported = [
+                json.loads(line)
+                for line in (result_dir / "fhp21.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
 
         self.assertEqual(result["status"], "COMPLETED")
         self.assertEqual(runtime.infer_calls, 0)
@@ -838,6 +849,15 @@ class WorkerContractTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
+                event["payload"]["model_keypoint_scores"] == [raw_model_score] * 21
+                for event in crop_events
+            )
+        )
+        self.assertTrue(
+            all(event["payload"]["keypoint_scores"] == [1.0] * 21 for event in crop_events)
+        )
+        self.assertTrue(
+            all(
                 {blob["role"] for blob in event["blobs"]}
                 == {"virtual_crop", "virtual_crop_valid_mask"}
                 for event in crop_events
@@ -851,6 +871,26 @@ class WorkerContractTests(unittest.TestCase):
             self.assertEqual(len(instance["keypoints_uv"]), 21)
             self.assertEqual(len(instance["keypoints_uv_crop"]), 21)
             self.assertEqual(len(instance["keypoints_uv_rectified"]), 21)
+            self.assertEqual(instance["model_keypoint_scores"], [raw_model_score] * 21)
+            self.assertEqual(instance["keypoint_scores"], [1.0] * 21)
+        tracked = [event for event in events if event["event"] == "tracked_view_keypoints_recorded"]
+        self.assertTrue(
+            all(
+                event["payload"]["model_keypoint_scores"] == [raw_model_score] * 21
+                for event in tracked
+            )
+        )
+        self.assertTrue(all(event["payload"]["keypoint_scores"] == [1.0] * 21 for event in tracked))
+        self.assertTrue(
+            all(
+                metric["left_score"] == 1.0 and metric["right_score"] == 1.0
+                for metric in exported[0]["raw"]["metrics"]
+            )
+        )
+        self.assertEqual(
+            exported[0]["backend_provenance"]["model_keypoint_score_semantics"],
+            "RTMPOSE_SIMCC_MAX_RESPONSE_UNCALIBRATED",
+        )
 
     def test_native_pose_profile_traces_all_detector_decisions_and_poses_the_bounded_pool(
         self,

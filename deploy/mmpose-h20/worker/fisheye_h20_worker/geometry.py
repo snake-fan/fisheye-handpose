@@ -15,6 +15,12 @@ from .fusion import (
     RobustStereoFusion,
     StereoFusionConfig,
 )
+from .scores import (
+    MODEL_SCORE_SEMANTICS,
+    QUALITY_WEIGHT_METHOD,
+    QUALITY_WEIGHT_STATUS,
+    quality_weight,
+)
 
 
 def normalize_instances(
@@ -32,12 +38,15 @@ def normalize_instances(
         bbox = instance.get("bbox_xyxy")
         points = instance.get("keypoints_uv")
         scores = instance.get("keypoint_scores")
+        model_scores = instance.get("model_keypoint_scores", scores)
         if not isinstance(bbox, list) or len(bbox) != 4:
             raise WorkerError("runtime bbox_xyxy must contain four values")
         if not isinstance(points, list) or len(points) != 21:
             raise WorkerError("runtime keypoints_uv must contain 21 points")
         if not isinstance(scores, list) or len(scores) != 21:
             raise WorkerError("runtime keypoint_scores must contain 21 values")
+        if not isinstance(model_scores, list) or len(model_scores) != 21:
+            raise WorkerError("runtime model_keypoint_scores must contain 21 values")
         if any(not isinstance(point, list) or len(point) != 2 for point in points):
             raise WorkerError("each runtime keypoint must contain u and v")
         bbox_score = instance.get("bbox_score")
@@ -47,6 +56,7 @@ def normalize_instances(
         numeric = [
             *bbox,
             *scores,
+            *model_scores,
             bbox_score,
             *(value for point in points for value in point),
         ]
@@ -67,7 +77,11 @@ def normalize_instances(
             "label": label,
             "keypoints_uv": [[float(u), float(v)] for u, v in points],
             "keypoints_uv_rectified": rectification.rectify_points(side, points),
-            "keypoint_scores": [float(value) for value in scores],
+            "keypoint_scores": [quality_weight(value) for value in scores],
+            "model_keypoint_scores": [float(value) for value in model_scores],
+            "keypoint_score_semantics": MODEL_SCORE_SEMANTICS,
+            "keypoint_quality_weight_method": QUALITY_WEIGHT_METHOD,
+            "keypoint_quality_weight_status": QUALITY_WEIGHT_STATUS,
         }
         for optional in (
             "source_index",
@@ -76,7 +90,6 @@ def normalize_instances(
             "eligible_for_association",
             "final_selection",
             "keypoints_uv_crop",
-            "model_keypoint_scores",
             "keypoint_valid_mask",
             "model_input_space",
             "crop_policy_id",

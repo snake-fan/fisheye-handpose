@@ -11,6 +11,12 @@ import numpy as np
 from .calibration import RectifiedStereo
 from .contracts import WorkerError
 from .crop import PerspectiveCrop, VirtualPerspectiveCropper
+from .scores import (
+    MODEL_SCORE_SEMANTICS,
+    QUALITY_WEIGHT_METHOD,
+    QUALITY_WEIGHT_STATUS,
+    quality_weight,
+)
 
 
 def _detection(value: Any, *, side: str, index: int) -> dict[str, Any]:
@@ -106,6 +112,14 @@ class CropPoseResult:
                     "keypoints_uv_crop": self.instance["keypoints_uv_crop"],
                     "keypoints_uv_native": self.instance["keypoints_uv"],
                     "keypoint_scores": self.instance["keypoint_scores"],
+                    "model_keypoint_scores": self.instance["model_keypoint_scores"],
+                    "keypoint_score_semantics": self.instance["keypoint_score_semantics"],
+                    "keypoint_quality_weight_method": self.instance[
+                        "keypoint_quality_weight_method"
+                    ],
+                    "keypoint_quality_weight_status": self.instance[
+                        "keypoint_quality_weight_status"
+                    ],
                     "keypoint_valid_mask": self.instance["keypoint_valid_mask"],
                 }
             )
@@ -205,13 +219,20 @@ class VirtualCropPoseAdapter:
             source_points = crop.crop_uv_to_source_uv(crop_points)
             if source_points.shape != (21, 2) or not np.all(np.isfinite(source_points)):
                 raise WorkerError("virtual crop mapping produced non-finite native keypoints")
-            effective_scores = np.where(sampled_valid, model_scores, 0.0)
+            quality_scores = np.asarray(
+                [quality_weight(value) for value in model_scores],
+                dtype=np.float64,
+            )
+            effective_scores = np.where(sampled_valid, quality_scores, 0.0)
             instance = {
                 **detection,
                 "keypoints_uv": source_points.astype(float).tolist(),
                 "keypoint_scores": effective_scores.astype(float).tolist(),
                 "keypoints_uv_crop": crop_points.astype(float).tolist(),
                 "model_keypoint_scores": model_scores.astype(float).tolist(),
+                "keypoint_score_semantics": MODEL_SCORE_SEMANTICS,
+                "keypoint_quality_weight_method": QUALITY_WEIGHT_METHOD,
+                "keypoint_quality_weight_status": QUALITY_WEIGHT_STATUS,
                 "keypoint_valid_mask": sampled_valid.tolist(),
                 "model_input_space": "virtual_pinhole",
                 "crop_policy_id": crop.policy_id,

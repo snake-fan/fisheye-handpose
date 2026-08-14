@@ -143,6 +143,8 @@ class RobustStereoFusion:
     ) -> JointFusionResult:
         if not _observation_is_finite(left) or not _observation_is_finite(right):
             return _invalid_result("NON_FINITE_OBSERVATION")
+        if not _quality_weight_is_valid(left) or not _quality_weight_is_valid(right):
+            return _invalid_result("INVALID_QUALITY_WEIGHT")
         if not _observation_covariance_is_valid(left) or not _observation_covariance_is_valid(
             right
         ):
@@ -391,6 +393,10 @@ def _observation_covariance_is_valid(observation: JointObservation) -> bool:
         np.allclose(covariance, covariance.T, rtol=0.0, atol=1e-12)
         and np.linalg.eigvalsh(covariance).min() > 0.0
     )
+
+
+def _quality_weight_is_valid(observation: JointObservation) -> bool:
+    return 0.0 <= float(observation.score) <= 1.0
 
 
 def _optimize_point(

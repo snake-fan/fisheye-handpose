@@ -20,6 +20,7 @@ from .mano_fitting import ManoTrackFitter
 from .output_contract import build_pose_estimate
 from .pose_adapter import VirtualCropPoseAdapter
 from .runtime import OpenMMLabRuntime
+from .scores import MODEL_SCORE_SEMANTICS, QUALITY_WEIGHT_METHOD, QUALITY_WEIGHT_STATUS
 from .session import discover_parts, match_part, selected_frames
 from .temporal import CausalTemporalRefiner
 from .tracking import MOTION_METHOD_ID, PALM_ANCHOR_METHOD_ID, SequenceTracker
@@ -435,6 +436,9 @@ def run_worker(
             "input_space": request.perception.pose_input,
         },
         "fusion_method": FUSION_METHOD_ID,
+        "model_keypoint_score_semantics": MODEL_SCORE_SEMANTICS,
+        "keypoint_quality_weight_method": QUALITY_WEIGHT_METHOD,
+        "keypoint_quality_weight_status": QUALITY_WEIGHT_STATUS,
         "kinematic_method": (
             "mano_v1.2_full45_mean_warmstart_v2" if request.mano is not None else "NONE"
         ),
@@ -1128,6 +1132,14 @@ def run_worker(
                                 "keypoints_uv": instance["keypoints_uv"],
                                 "keypoints_uv_rectified": instance["keypoints_uv_rectified"],
                                 "keypoint_scores": instance["keypoint_scores"],
+                                "model_keypoint_scores": instance["model_keypoint_scores"],
+                                "keypoint_score_semantics": instance["keypoint_score_semantics"],
+                                "keypoint_quality_weight_method": instance[
+                                    "keypoint_quality_weight_method"
+                                ],
+                                "keypoint_quality_weight_status": instance[
+                                    "keypoint_quality_weight_status"
+                                ],
                                 "image_width": rectification.image_size[0],
                                 "image_height": rectification.image_size[1],
                             },

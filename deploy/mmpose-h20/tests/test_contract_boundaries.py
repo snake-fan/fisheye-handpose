@@ -10,6 +10,7 @@ DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 WORKER_ROOT = DEPLOY_ROOT / "worker"
 sys.path.insert(0, str(WORKER_ROOT))
 
+from fisheye_h20_worker.artifacts import ResultWriter  # noqa: E402
 from fisheye_h20_worker.contracts import WorkerError, load_request  # noqa: E402
 from fisheye_h20_worker.output_contract import (  # noqa: E402
     build_pose_estimate,
@@ -188,3 +189,22 @@ def test_selected_output_covariance_uses_the_same_matrix_validation() -> None:
 
     with pytest.raises(WorkerError, match="covariance.*symmetric"):
         validate_pose_estimate(record, line_number=1)
+
+
+def test_output_quality_weight_rejects_unbounded_model_response() -> None:
+    record = _robust_pose_estimate()
+    record["raw"]["metrics"][4]["left_score"] = 1.01
+
+    with pytest.raises(WorkerError, match="keypoint scores cannot exceed one"):
+        validate_pose_estimate(record, line_number=1)
+
+
+def test_result_writer_validates_pose_estimate_before_first_append(tmp_path: Path) -> None:
+    record = _robust_pose_estimate()
+    record["raw"]["metrics"][4]["left_score"] = 1.01
+    writer = ResultWriter(tmp_path / "result", {"test": True})
+
+    with pytest.raises(WorkerError, match="keypoint scores cannot exceed one"):
+        writer.append_fhp21(record)
+
+    assert not (tmp_path / "result" / "fhp21.jsonl").exists()

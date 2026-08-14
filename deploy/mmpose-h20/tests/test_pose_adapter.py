@@ -14,6 +14,7 @@ sys.path.insert(0, str(WORKER_ROOT))
 from fisheye_h20_worker.calibration import RectifiedStereo  # noqa: E402
 from fisheye_h20_worker.contracts import WorkerError  # noqa: E402
 from fisheye_h20_worker.crop import VirtualPerspectiveCropper  # noqa: E402
+from fisheye_h20_worker.geometry import normalize_instances  # noqa: E402
 from fisheye_h20_worker.pose_adapter import VirtualCropPoseAdapter  # noqa: E402
 
 
@@ -50,9 +51,10 @@ def _stereo() -> RectifiedStereo:
 
 
 class _PoseRuntime:
-    def __init__(self, *, cardinality: int = 21) -> None:
+    def __init__(self, *, cardinality: int = 21, score: float = 0.9) -> None:
         self.pose_calls: list[dict[str, Any]] = []
         self.cardinality = cardinality
+        self.score = score
 
     def infer_pose(
         self,
@@ -68,7 +70,7 @@ class _PoseRuntime:
         return [
             {
                 "keypoints_uv": points,
-                "keypoint_scores": [0.9] * self.cardinality,
+                "keypoint_scores": [self.score] * self.cardinality,
             }
         ]
 
@@ -216,3 +218,47 @@ def test_adapter_rejects_non_finite_pose_evidence_before_source_mapping() -> Non
             detections=_detections()[:1],
             rectification=_stereo(),
         )
+
+
+def test_unnormalized_simcc_response_is_preserved_but_not_used_as_overconfidence() -> None:
+    adapter = VirtualCropPoseAdapter(
+        cropper=VirtualPerspectiveCropper(output_size=(65, 65)),
+        min_valid_fraction=0.5,
+    )
+
+    batch = adapter.infer(
+        runtime=_PoseRuntime(score=1.0953675508499146),
+        models=object(),
+        frame=np.zeros((200, 200, 3), dtype=np.uint8),
+        side="left",
+        detections=_detections()[:1],
+        rectification=_stereo(),
+    )
+
+    instance = batch.produced_instances[0]
+    assert instance["model_keypoint_scores"] == pytest.approx([1.0953675508499146] * 21)
+    assert instance["keypoint_scores"] == [1.0] * 21
+    assert instance["keypoint_score_semantics"] == "RTMPOSE_SIMCC_MAX_RESPONSE_UNCALIBRATED"
+    assert instance["keypoint_quality_weight_method"] == "CLIP_0_1_V1"
+
+
+def test_native_pose_normalization_preserves_raw_simcc_response_and_bounds_quality() -> None:
+    raw_score = 1.0953675508499146
+    normalized = normalize_instances(
+        [
+            {
+                "bbox_xyxy": [60.0, 60.0, 140.0, 140.0],
+                "bbox_score": 0.91,
+                "label": 0,
+                "keypoints_uv": [[100.0, 100.0]] * 21,
+                "keypoint_scores": [raw_score] * 21,
+            }
+        ],
+        side="left",
+        rectification=_stereo(),
+    )[0]
+
+    assert normalized["model_keypoint_scores"] == pytest.approx([raw_score] * 21)
+    assert normalized["keypoint_scores"] == [1.0] * 21
+    assert normalized["keypoint_score_semantics"] == ("RTMPOSE_SIMCC_MAX_RESPONSE_UNCALIBRATED")
+    assert normalized["keypoint_quality_weight_method"] == "CLIP_0_1_V1"
