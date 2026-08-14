@@ -4,6 +4,7 @@ import { TraceApiError, traceApi } from "./api/client";
 import type { FrameDetail, FrameSummary, RunDetail, RunSummary } from "./api/types";
 import { FrameInspector } from "./components/FrameInspector";
 import { FrameTimeline } from "./components/FrameTimeline";
+import { OverlayVideoPlayer } from "./components/OverlayVideoPlayer";
 import { RunCatalog } from "./components/RunCatalog";
 import { RunHeader } from "./components/RunHeader";
 import { TraceFilters } from "./components/TraceFilters";
@@ -257,6 +258,7 @@ export function App() {
         {detail && (
           <div className="studio-content">
             <RunHeader detail={detail} />
+            <OverlayVideoPlayer runKey={detail.run.run_key} detail={detail} />
             <TraceFilters
               stages={detail.stages}
               tracks={detail.track_ids}

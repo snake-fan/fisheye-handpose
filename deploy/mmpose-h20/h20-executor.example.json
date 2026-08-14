@@ -24,7 +24,8 @@
     "artifacts": {
       "source_frames": "SAMPLED",
       "sample_every": 1,
-      "image_format": "jpg"
+      "image_format": "jpg",
+      "overlay_video": true
     },
     "tracking": {
       "max_root_distance_m": 0.15,

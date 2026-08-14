@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -175,6 +176,61 @@ def test_blobs_are_content_addressed_deduplicated_and_verified(tmp_path: Path) -
     (tmp_path / "run" / blob.relative_path).write_bytes(b"tampered")
     with pytest.raises(TraceValidationError, match="blob (size|hash) mismatch"):
         RunArtifactReader(tmp_path / "run").validate()
+
+
+def test_blob_file_is_streamed_into_the_content_addressed_store(tmp_path: Path) -> None:
+    source = tmp_path / "overlay.mp4"
+    source.write_bytes((b"video-frame\x00" * 1024 * 1024) + b"tail")
+    writer = RunArtifactWriter.create(
+        tmp_path / "run-file",
+        run_id="run-file",
+        pipeline_version="test-revision",
+    )
+
+    blob = writer.put_blob_file(
+        source,
+        role="overlay_video",
+        media_type="video/mp4",
+        suffix=".mp4",
+    )
+    duplicate = writer.put_blob_file(
+        source,
+        role="overlay_video_copy",
+        media_type="video/mp4",
+        suffix=".mp4",
+    )
+
+    expected = source.read_bytes()
+    assert blob.bytes == len(expected)
+    assert blob.sha256 == hashlib.sha256(expected).hexdigest()
+    assert duplicate.relative_path == blob.relative_path
+    assert duplicate.role == "overlay_video_copy"
+    assert (writer.root / blob.relative_path).read_bytes() == expected
+    writer.append(
+        record_id="export:video",
+        stage=TraceStage.EXPORT,
+        status=TraceStatus.SUCCEEDED,
+        event="overlay_video_exported",
+        blobs=(blob,),
+    )
+    writer.close()
+    assert RunArtifactReader(tmp_path / "run-file").validate().ok
+
+
+def test_blob_file_rejects_non_files_without_publishing_a_blob(tmp_path: Path) -> None:
+    writer = RunArtifactWriter.create(
+        tmp_path / "run-file-errors",
+        run_id="run-file-errors",
+        pipeline_version="test-revision",
+    )
+    with pytest.raises(FileNotFoundError, match="blob source is not a file"):
+        writer.put_blob_file(
+            tmp_path / "missing.mp4",
+            role="overlay_video",
+            media_type="video/mp4",
+            suffix=".mp4",
+        )
+    writer.close()
 
 
 def test_blob_suffix_cannot_escape_the_run(tmp_path: Path) -> None:

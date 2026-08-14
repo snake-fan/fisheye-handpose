@@ -72,10 +72,21 @@ arguments.
 
 - data-item/run catalog, including failed and invalid runs;
 - paginated frame timeline with stage, track, and status filters;
-- content-addressed left/right source artifacts and 2D landmark overlays;
+- a fixed ten-node pipeline rail with same-frame before/after evidence, explicit
+  `NOT_PRODUCED` reasons, and debug-only rectification labels;
+- content-addressed source/undistorted/rectified stereo artifacts, detection boxes,
+  candidate-to-track association, and all-hand 2D/3D overlays;
+- a run-level H.264 raw-versus-stable stereo player and downloadable hardware-timestamp
+  timeline when the worker exported those artifacts;
 - interactive FHP21 3D skeleton with missing-landmark handling;
 - QA failures, stage status, parent DAG, model/calibration provenance, final JSONL download,
   and raw trace records.
+
+With no track filter, every hand remains visible with a deterministic color. Selecting a
+track highlights it and dims the others rather than deleting evidence. Rectified panels
+only consume `projected_keypoints_space=rectified`; native RTMPose coordinates are never
+drawn on a rectified image. Older runs without the new image/video roles remain readable
+and show an explicit unavailable state.
 
 All artifact requests are scoped by the backend's opaque `run_key`; the browser cannot
 read arbitrary server paths.

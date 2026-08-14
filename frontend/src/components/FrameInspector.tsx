@@ -1,8 +1,11 @@
 import { Clock3, LoaderCircle } from "lucide-react";
+import { useState } from "react";
 
 import type { FrameDetail, RunDetail } from "../api/types";
 import { InspectorTabs } from "./InspectorTabs";
+import { PipelineNodeRail, type PipelineNodeId } from "./PipelineNodeRail";
 import { SkeletonCanvas } from "./SkeletonCanvas";
+import { StageComparison } from "./StageComparison";
 import { StereoEvidence } from "./StereoEvidence";
 
 interface FrameInspectorProps {
@@ -22,6 +25,7 @@ export function FrameInspector({
   loading,
   error,
 }: FrameInspectorProps) {
+  const [selectedNodeId, setSelectedNodeId] = useState<PipelineNodeId>("SOURCE_RGB");
   if (loading && !frameDetail) {
     return <section className="inspection-state"><LoaderCircle className="spin" /><span>正在组装帧证据</span></section>;
   }
@@ -65,6 +69,25 @@ export function FrameInspector({
           {frame.view_ids.map((view) => <span key={view}>{view}</span>)}
         </div>
       </div>
+      <section className="pipeline-comparison-card" aria-label="逐节点过程检查">
+        <header className="card-header">
+          <div>
+            <span className="section-index">FLOW</span>
+            <div><h2>逐节点前后对比</h2><p>同一帧 · 双目 · 所有手轨迹</p></div>
+          </div>
+        </header>
+        <PipelineNodeRail
+          records={records}
+          selectedNodeId={selectedNodeId}
+          onSelect={setSelectedNodeId}
+        />
+        <StageComparison
+          runKey={runKey}
+          records={records}
+          selectedNodeId={selectedNodeId}
+          selectedTrack={selectedTrack}
+        />
+      </section>
       <div className="evidence-grid">
         <StereoEvidence runKey={runKey} records={records} trackId={selectedTrack} />
         <SkeletonCanvas records={records} trackId={selectedTrack} />

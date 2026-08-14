@@ -9,7 +9,7 @@ from typing import Any
 
 from .artifacts import ResultWriter
 from .assets import EXPECTED_CONFIGS, MMPOSE_COMMIT, verify_assets, verify_source_report
-from .calibration import load_rectified_stereo
+from .calibration import load_rectified_stereo, project_rectified_keypoints
 from .contracts import WorkerError, load_request
 from .geometry import associate, normalize_instances, triangulate_match
 from .mano import MANO_FHP21_MAPPING_ID, verify_mano_assets
@@ -18,6 +18,7 @@ from .runtime import OpenMMLabRuntime
 from .session import discover_parts, match_part, selected_frames
 from .temporal import CausalTemporalRefiner
 from .tracking import SequenceTracker
+from .visualization import RawVsStableOverlayVideo
 
 
 def _serialized_assets(report: dict[str, Any]) -> dict[str, Any]:
@@ -73,6 +74,7 @@ def _resolved_configuration(request: Any) -> dict[str, Any]:
             "source_frames": request.artifacts.source_frames,
             "sample_every": request.artifacts.sample_every,
             "image_format": request.artifacts.image_format,
+            "overlay_video": request.artifacts.overlay_video,
         },
         "tracking": {
             "max_root_distance_m": request.tracking.max_root_distance_m,
@@ -118,6 +120,39 @@ def _json_blob(
         media_type="application/json",
         suffix=".json",
     )
+
+
+def _projection_fields(
+    rectification: Any,
+    landmarks_xyz_m: Any = None,
+    validity: Any = None,
+) -> dict[str, Any]:
+    projected = (
+        {"left": [None] * 21, "right": [None] * 21}
+        if landmarks_xyz_m is None or validity is None
+        else project_rectified_keypoints(rectification, landmarks_xyz_m, validity)
+    )
+    return {
+        "projected_keypoints_space": "rectified",
+        "projected_keypoints_uv": projected,
+    }
+
+
+def _selected_pair_timestamps(
+    *,
+    parts: list[Any],
+    pairs_by_part: dict[int, list[Any]],
+    max_pairs: int,
+) -> list[int]:
+    timestamps: list[int] = []
+    for part in parts:
+        remaining = max_pairs - len(timestamps)
+        if remaining <= 0:
+            break
+        timestamps.extend(
+            pair.pair_timestamp_ns for pair in pairs_by_part[part.part_number][:remaining]
+        )
+    return timestamps
 
 
 def _detection(instance: dict[str, Any]) -> dict[str, Any]:
@@ -309,6 +344,7 @@ def run_worker(
     mano_outputs = 0
     temporal_outputs = 0
     export_count = 0
+    overlay_video_output_count = 0
     tracker = SequenceTracker(
         max_root_distance_m=request.tracking.max_root_distance_m,
         max_gap_ms=request.tracking.max_gap_ms,
@@ -321,6 +357,8 @@ def run_worker(
     tracking_state_events: dict[str, tuple[str, int]] = {}
     mano_state_events: dict[str, str] = {}
     temporal_state_events: dict[str, str] = {}
+    overlay_parent_event_ids: list[str] = []
+    overlay_video: RawVsStableOverlayVideo | None = None
     backend_provenance = {
         "producer": "fisheye_h20_worker",
         "producer_version": "h20-worker/v1",
@@ -344,6 +382,17 @@ def run_worker(
     active_stage = "SYSTEM"
     active_frame_id: str | None = None
     try:
+        if request.artifacts.overlay_video:
+            overlay_video = RawVsStableOverlayVideo(
+                output_path=destination / ".raw-vs-stable-stereo-rectified.mp4",
+                image_size=rectification.output_size,
+                timestamps_ns=_selected_pair_timestamps(
+                    parts=parts,
+                    pairs_by_part=pairs_by_part,
+                    max_pairs=request.session.max_pairs,
+                ),
+                temporal_method=request.temporal.method,
+            )
         writer.append(
             event_id="system:verified",
             stage="SYSTEM",
@@ -429,7 +478,8 @@ def run_worker(
                 left_frame = left_frames[pair.left_index]
                 right_frame = right_frames[pair.right_index]
                 source_blobs: list[dict[str, Any]] = []
-                if _should_save_source(request.artifacts, global_index):
+                save_source = _should_save_source(request.artifacts, global_index)
+                if save_source:
                     suffix = f".{request.artifacts.image_format}"
                     media_type = (
                         "image/jpeg" if request.artifacts.image_format == "jpg" else "image/png"
@@ -456,6 +506,50 @@ def run_worker(
                     blobs=source_blobs,
                     parent_event_ids=("calibration:rectification",),
                 )
+                rendered_views: dict[str, dict[str, Any]] | None = None
+                if save_source or overlay_video is not None:
+                    active_stage = "RECTIFICATION"
+                    rendered_views = {
+                        side: runtime.render_rectification(rectification, side, frame)
+                        for side, frame in (("left", left_frame), ("right", right_frame))
+                    }
+                if save_source:
+                    assert rendered_views is not None
+                    rendered_blobs: list[dict[str, Any]] = []
+                    suffix = f".{request.artifacts.image_format}"
+                    media_type = (
+                        "image/jpeg" if request.artifacts.image_format == "jpg" else "image/png"
+                    )
+                    for side in ("left", "right"):
+                        for image_space in ("undistorted", "rectified"):
+                            rendered_blobs.append(
+                                writer.put_blob(
+                                    runtime.encode_frame(
+                                        rendered_views[side][image_space],
+                                        request.artifacts.image_format,
+                                    ),
+                                    role=f"{image_space}_{side}",
+                                    media_type=media_type,
+                                    suffix=suffix,
+                                )
+                            )
+                    writer.append(
+                        event_id=f"{event_prefix}:rectification",
+                        stage="RECTIFICATION",
+                        status="SUCCEEDED",
+                        event="stereo_pair_rectification_rendered",
+                        payload={
+                            "frame_id": frame_id,
+                            "frame_index": global_index,
+                            "timestamp_ns": pair.pair_timestamp_ns,
+                            "calibration_id": rectification.calibration_id,
+                            "output_status": "PRODUCED",
+                            "image_width": rectification.output_size[0],
+                            "image_height": rectification.output_size[1],
+                        },
+                        blobs=rendered_blobs,
+                        parent_event_ids=(f"{event_prefix}:sync",),
+                    )
                 views: dict[str, list[dict[str, Any]]] = {}
                 for side, frame in (("left", left_frame), ("right", right_frame)):
                     active_stage = "DETECTION"
@@ -581,6 +675,8 @@ def run_worker(
                         tracking_event_id,
                         pair.pair_timestamp_ns,
                     )
+                frame_export_event_ids: list[str] = []
+                frame_overlay_tracks: list[dict[str, Any]] = []
                 if not assignments:
                     empty_payload = {
                         "frame_id": frame_id,
@@ -589,6 +685,7 @@ def run_worker(
                         "track_id": None,
                         "output_status": "NOT_PRODUCED",
                         "reason": "NO_CROSS_VIEW_MATCH",
+                        **_projection_fields(rectification),
                     }
                     writer.append(
                         event_id=f"{event_prefix}:raw:none",
@@ -626,6 +723,7 @@ def run_worker(
                         },
                         parent_event_ids=(f"{event_prefix}:temporal:none",),
                     )
+                    frame_export_event_ids.append(f"{event_prefix}:export:none")
                 for observation, assignment in zip(observations, assignments, strict=True):
                     match = observation["match"]
                     track_id = assignment["track_id"]
@@ -668,6 +766,11 @@ def run_worker(
                     }
                     matched_hands += 1
                     valid_landmarks += raw["valid_landmark_count"]
+                    raw_projection = project_rectified_keypoints(
+                        rectification,
+                        raw["landmarks_xyz_m"],
+                        raw["validity"],
+                    )
                     raw_payload = {
                         "frame_id": frame_id,
                         "frame_index": global_index,
@@ -679,6 +782,8 @@ def run_worker(
                         "output_status": (
                             "PRODUCED" if raw["valid_landmark_count"] else "NOT_PRODUCED"
                         ),
+                        "projected_keypoints_space": "rectified",
+                        "projected_keypoints_uv": raw_projection,
                         **raw,
                     }
                     raw_event_id = f"{event_prefix}:raw:{match['match_id']}"
@@ -724,6 +829,7 @@ def run_worker(
                                 "output_status": "NOT_PRODUCED",
                                 "state_predecessor_event_id": mano_predecessor,
                                 "selection": selection,
+                                **_projection_fields(rectification),
                             }
                             writer.append(
                                 event_id=mano_event_id,
@@ -740,6 +846,11 @@ def run_worker(
                         else:
                             state = mano_track_states[track_id]
                             mano_outputs += 1
+                            mano_projection = project_rectified_keypoints(
+                                rectification,
+                                mano_fit["landmarks_xyz_m"],
+                                mano_fit["validity"],
+                            )
                             mano_payload = {
                                 "frame_id": frame_id,
                                 "frame_index": global_index,
@@ -766,6 +877,8 @@ def run_worker(
                                 },
                                 "landmarks_xyz_m": mano_fit["landmarks_xyz_m"],
                                 "validity": mano_fit["validity"],
+                                "projected_keypoints_space": "rectified",
+                                "projected_keypoints_uv": mano_projection,
                             }
                             writer.append(
                                 event_id=mano_event_id,
@@ -803,6 +916,7 @@ def run_worker(
                                 "output_status": "NOT_PRODUCED",
                                 "reason": "MANO_NOT_CONFIGURED",
                                 "mapping_id": MANO_FHP21_MAPPING_ID,
+                                **_projection_fields(rectification),
                             },
                             parent_event_ids=(raw_event_id,),
                         )
@@ -824,6 +938,11 @@ def run_worker(
                     if temporal_produced:
                         active_stage = "EXPORT"
                         temporal_outputs += 1
+                    temporal_projection = project_rectified_keypoints(
+                        rectification,
+                        temporal["landmarks_xyz_m"],
+                        temporal["validity"],
+                    )
                     temporal_payload = {
                         "frame_id": frame_id,
                         "frame_index": global_index,
@@ -835,6 +954,8 @@ def run_worker(
                         "coordinate_frame": "rectified_left_camera",
                         "length_unit": "m",
                         "landmark_schema": "fhp21/v1",
+                        "projected_keypoints_space": "rectified",
+                        "projected_keypoints_uv": temporal_projection,
                         **temporal,
                     }
                     temporal_event_id = f"{event_prefix}:temporal:{match['match_id']}"
@@ -898,8 +1019,9 @@ def run_worker(
                             backend_provenance=backend_provenance,
                         )
                         writer.append_fhp21(export_value)
+                        export_event_id = f"{event_prefix}:export:{match['match_id']}"
                         writer.append(
-                            event_id=f"{event_prefix}:export:{match['match_id']}",
+                            event_id=export_event_id,
                             stage="EXPORT",
                             status=(
                                 "SUCCEEDED" if temporal["valid_landmark_count"] == 21 else "WARNING"
@@ -908,14 +1030,18 @@ def run_worker(
                             payload={
                                 **export_value,
                                 "output_file": "fhp21.jsonl",
+                                "projected_keypoints_space": "rectified",
+                                "projected_keypoints_uv": temporal_projection,
                             },
                             parent_event_ids=(temporal_event_id,),
                         )
+                        frame_export_event_ids.append(export_event_id)
                         export_count += 1
                     else:
                         active_stage = "EXPORT"
+                        export_event_id = f"{event_prefix}:export:{match['match_id']}"
                         writer.append(
-                            event_id=f"{event_prefix}:export:{match['match_id']}",
+                            event_id=export_event_id,
                             stage="EXPORT",
                             status="SKIPPED",
                             event="fhp21_record_not_produced",
@@ -931,12 +1057,70 @@ def run_worker(
                                 "reason": "NO_VALID_TEMPORAL_LANDMARK",
                                 "landmarks_xyz_m": temporal["landmarks_xyz_m"],
                                 "validity": temporal["validity"],
+                                "projected_keypoints_space": "rectified",
+                                "projected_keypoints_uv": temporal_projection,
                             },
                             parent_event_ids=(temporal_event_id,),
                         )
+                        frame_export_event_ids.append(export_event_id)
+                    frame_overlay_tracks.append(
+                        {
+                            "track_id": track_id,
+                            "raw": raw_projection,
+                            "stable": temporal_projection,
+                            "stable_input_stage": temporal_input_stage,
+                        }
+                    )
+                if overlay_video is not None:
+                    assert rendered_views is not None
+                    overlay_video.append_frame(
+                        left_frame=rendered_views["left"]["rectified"],
+                        right_frame=rendered_views["right"]["rectified"],
+                        frame_id=frame_id,
+                        frame_index=global_index,
+                        timestamp_ns=pair.pair_timestamp_ns,
+                        tracks=frame_overlay_tracks,
+                    )
+                    overlay_parent_event_ids.extend(frame_export_event_ids)
                 processed_pairs += 1
         if processed_pairs == 0:
             raise WorkerError("worker processed no synchronized pairs")
+        if overlay_video is not None:
+            active_stage = "EXPORT"
+            overlay_result = overlay_video.close()
+            overlay_path = Path(overlay_result["path"])
+            try:
+                overlay_blob = writer.put_blob_file(
+                    overlay_path,
+                    role="overlay_video_raw_vs_stable_stereo_rectified",
+                    media_type="video/mp4",
+                    suffix=".mp4",
+                )
+            finally:
+                overlay_path.unlink(missing_ok=True)
+            timeline_blob = _json_blob(
+                writer,
+                overlay_result["timeline"],
+                role="overlay_video_timeline",
+            )
+            metadata = overlay_result["metadata"]
+            if not isinstance(metadata, dict):
+                raise WorkerError("overlay video metadata is invalid")
+            writer.append(
+                event_id="overlay:raw-vs-stable:export",
+                stage="EXPORT",
+                status="SUCCEEDED",
+                event="raw_vs_stable_overlay_video_exported",
+                payload={
+                    **metadata,
+                    "output_status": "PRODUCED",
+                    "calibration_id": rectification.calibration_id,
+                    "temporal_method": request.temporal.method,
+                },
+                blobs=[overlay_blob, timeline_blob],
+                parent_event_ids=tuple(overlay_parent_event_ids),
+            )
+            overlay_video_output_count = 1
         summary = writer.finalize(
             status="COMPLETED",
             summary={
@@ -945,12 +1129,18 @@ def run_worker(
                 "valid_landmark_count": valid_landmarks,
                 "mano_output_count": mano_outputs,
                 "temporal_output_count": temporal_outputs,
+                "overlay_video_output_count": overlay_video_output_count,
                 "export_count": export_count,
                 "output_status": "PRODUCED" if export_count else "NOT_PRODUCED",
                 "output_file": "fhp21.jsonl" if export_count else None,
             },
         )
     except BaseException as exc:
+        if overlay_video is not None:
+            try:
+                overlay_video.abort()
+            except BaseException:
+                pass
         try:
             writer.append(
                 event_id="system:failure",
@@ -977,6 +1167,7 @@ def run_worker(
                     "valid_landmark_count": valid_landmarks,
                     "mano_output_count": mano_outputs,
                     "temporal_output_count": temporal_outputs,
+                    "overlay_video_output_count": overlay_video_output_count,
                     "export_count": export_count,
                     "output_status": "NOT_PRODUCED",
                     "output_file": None,

@@ -15,6 +15,7 @@ from fisheye_handpose.h20_executor import (
 )
 from fisheye_handpose.pipeline import PipelineExecutionContext, PipelineRunRequest
 from fisheye_handpose.trace import (
+    BlobRef,
     RunArtifactReader,
     RunArtifactWriter,
     RunStatus,
@@ -178,6 +179,7 @@ def _worker_result(result_dir: Path) -> None:
 def test_h20_executor_builds_runtime_request_and_imports_verified_worker_bundle(
     tmp_path: Path,
     clock_offset_ns: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = tmp_path / "capture"
     session.mkdir()
@@ -242,6 +244,27 @@ def test_h20_executor_builds_runtime_request_and_imports_verified_worker_bundle(
         }
     )
     captured: dict[str, object] = {}
+    streamed_roles: list[str] = []
+    original_put_blob_file = RunArtifactWriter.put_blob_file
+
+    def recording_put_blob_file(
+        self: RunArtifactWriter,
+        source_path: str | Path,
+        *,
+        role: str,
+        media_type: str,
+        suffix: str = "",
+    ) -> BlobRef:
+        streamed_roles.append(role)
+        return original_put_blob_file(
+            self,
+            source_path,
+            role=role,
+            media_type=media_type,
+            suffix=suffix,
+        )
+
+    monkeypatch.setattr(RunArtifactWriter, "put_blob_file", recording_put_blob_file)
 
     def fake_process(command: list[str], *, env: dict[str, str]) -> tuple[int, bytes, bytes]:
         request_path = Path(command[-2])
@@ -321,6 +344,12 @@ def test_h20_executor_builds_runtime_request_and_imports_verified_worker_bundle(
         "worker_summary",
         "worker_fhp21_output",
     } <= roles
+    assert {
+        "worker_manifest",
+        "worker_events",
+        "worker_summary",
+        "worker_fhp21_output",
+    } <= set(streamed_roles)
     assert "result_dir" not in export[0].payload["worker_provenance"]
     assert {"worker_request", "worker_stdout", "worker_stderr"} <= roles
 

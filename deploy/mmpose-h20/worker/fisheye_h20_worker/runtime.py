@@ -209,6 +209,27 @@ class OpenMMLabRuntime:
             raise WorkerError(f"cannot encode source frame as {image_format}")
         return bytes(encoded)
 
+    def render_rectification(
+        self,
+        rectification: Any,
+        side: str,
+        frame: Any,
+    ) -> dict[str, Any]:
+        """Render diagnostic still/video spaces without changing model inference input."""
+
+        return {
+            "undistorted": rectification.render_frame(
+                side,
+                frame,
+                image_space="undistorted",
+            ),
+            "rectified": rectification.render_frame(
+                side,
+                frame,
+                image_space="rectified",
+            ),
+        }
+
     def load_mano_models(self, *, model_root: Path, device: str) -> dict[str, Any]:
         """Load each already-hash-verified MANO pickle exactly once."""
         import smplx

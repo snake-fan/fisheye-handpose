@@ -198,6 +198,12 @@ by the OpenMMLab stack. PyYAML is likewise already present in `uv.lock`; the wor
 new runtime dependency. Do **not** run `uv sync` on the configured H20 host because that
 would replace the locally compiled SM90 MMCV wheel. Keep using its Python directly:
 
+When `artifacts.overlay_video` is enabled, the worker additionally requires
+`/usr/bin/ffmpeg` with the `libx264` encoder. The configured H20 provides FFmpeg 6.1.1.
+OpenCV performs fisheye remapping and drawing; FFmpeg receives raw BGR frames through a
+pipe and writes H.264/yuv420p MP4 with a short GOP and `faststart` metadata. Encoding stays
+on CPU and does not consume the H20 CUDA device.
+
 ```bash
 cd /mnt/workspace/zyf/fisheye/fisheye-handpose/deploy/mmpose-h20
 PYTHONPATH=worker .venv/bin/python -m fisheye_h20_worker \
@@ -248,7 +254,8 @@ The request uses the strict `fisheye-handpose/h20-worker-request/v1` schema:
   "artifacts": {
     "source_frames": "SAMPLED",
     "sample_every": 1,
-    "image_format": "jpg"
+    "image_format": "jpg",
+    "overlay_video": true
   },
   "tracking": {
     "max_root_distance_m": 0.15,
@@ -270,7 +277,8 @@ The request uses the strict `fisheye-handpose/h20-worker-request/v1` schema:
 }
 ```
 
-`tracking` and `temporal` may be omitted to use the shown defaults. `mano` is optional;
+`tracking` and `temporal` may be omitted to use the shown defaults. The backward-compatible
+`artifacts.overlay_video` field defaults to `false` when absent. `mano` is optional;
 set it to `null` or omit it to run a raw-geometry temporal baseline. That path always emits
 `KINEMATIC_REFINEMENT / SKIPPED / output_status=NOT_PRODUCED` instead of claiming a MANO
 result. When configured, both MANO files are checked against the private manifest before
@@ -307,6 +315,7 @@ worker-result/
   fhp21.jsonl                # one final FHP21 record per produced track/frame
   blobs/sha256/ab/...json     # raw, MANO and temporal stage payloads
   blobs/sha256/ab/...jpg      # optional content-addressed source frames
+  blobs/sha256/ab/...mp4      # optional raw-vs-stable rectified diagnostic video
 ```
 
 `events.jsonl` retains native and rectified 2D points, all 21 confidence values, matched
@@ -315,7 +324,22 @@ left/right reprojection error, ray angle, track decisions, MANO parameters and f
 temporal reset state, and export provenance. Viewer records use top-level `track_id`,
 `detections[]`, `keypoints_uv`, `keypoint_scores`, `landmarks_xyz_m`, and `validity`; the
 aggregate pose evidence is retained separately. `NONE`, `ALL`, and `SAMPLED` source-frame
-policies control source image storage without changing inference. An existing result
+policies control source image storage without changing inference. Every saved source pair
+also gets one per-frame `RECTIFICATION` event with `undistorted_left/right` and
+`rectified_left/right` image roles. Model inference intentionally remains on the original
+fisheye frame. Raw, framewise MANO, temporal, and export event payloads include
+`projected_keypoints_uv.left/right`; each side is always length 21, and an invalid,
+non-finite, null, or behind-camera landmark remains JSON `null` instead of acquiring an
+invented pixel coordinate.
+
+When enabled, the overlay is one seekable 2x2 rectified video per run: raw-left/raw-right
+on the top row and temporal-left/temporal-right on the bottom row. Every synchronized pair
+contributes exactly one frame, including zero-hand frames, and every track in that pair is
+drawn with a deterministic color. A JSON timeline blob preserves `frame_id`, global
+`frame_index`, source `timestamp_ns`, video PTS, duration, and track IDs. The final global
+`EXPORT` event has no `frame_id` and references blob roles
+`overlay_video_raw_vs_stable_stereo_rectified` and `overlay_video_timeline`.
+An existing result
 directory is never overwritten. A stage with no actual output uses `NOT_PRODUCED` and is
 never summarized as produced. If a late failure occurs after earlier frames were written,
 the summary hashes that file as `partial_fhp21_output`; the bridge imports it only as a
@@ -339,8 +363,8 @@ bundle = load_import_bundle(worker_result_dir)
 record_ids = []
 for record in bundle.core_records(external_parent_id=audit_record_id):
     blobs = tuple(
-        writer.put_blob(
-            blob.source_path.read_bytes(),
+        writer.put_blob_file(
+            blob.source_path,
             role=blob.role,
             media_type=blob.media_type,
             suffix=blob.suffix,
@@ -364,7 +388,8 @@ blob paths, sizes, and SHA-256 digests. It attaches the complete worker manifest
 `events.jsonl`, summary, and (when produced) `fhp21.jsonl` to the first imported record,
 then copies every referenced source/raw/MANO/temporal blob through the core writer.
 Therefore the canonical `runs/<item>/<run>/` directory still has exactly one writer and one
-hash chain.
+hash chain. Both the worker and core file-backed blob paths hash and copy in bounded chunks,
+so a long MP4 is never materialized as one Python `bytes` value.
 
 `payload.frame_index` is a globally increasing integer across all video parts for backend
 routing. `payload.frame_id` retains the lossless source identity such as
@@ -411,7 +436,9 @@ python3 -m unittest discover -s tests -v
 ```
 
 The worker tests use a fake model/video runtime but real KB4 rectification and stereo
-geometry, so they do not initialize CUDA or deserialize checkpoints:
+geometry, so they do not initialize CUDA or deserialize checkpoints. The video encoder
+unit test replaces the FFmpeg process with an in-memory fake while asserting the exact
+libx264/yuv420p/faststart command and timeline contract; it does not require system FFmpeg:
 
 ```bash
 python3 -m unittest tests/test_worker.py -v

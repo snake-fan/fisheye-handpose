@@ -171,3 +171,34 @@ The normal catalog UI is split into `backend/` (read-only FastAPI, recursive mul
 catalog) and `frontend/` (React/TypeScript). It uses opaque `run_key` and `frame_key`
 identities, paginates long sequences, and can download the content-addressed final JSONL.
 The legacy `trace-serve` remains useful for one-run, dependency-free inspection.
+
+## Per-frame stage comparison and diagnostic video
+
+The React inspector reconstructs stage comparisons from immutable records rather than
+storing a rendered PNG for every logical node. A saved synchronized pair may attach these
+image roles:
+
+- `source_left` / `source_right` in native fisheye pixels;
+- `undistorted_left` / `undistorted_right` as a debug-only OpenCV QA branch;
+- `rectified_left` / `rectified_right` in the calibrated stereo pixel space.
+
+Detection and RTMPose continue to consume the native fisheye frame in the current worker;
+the full-frame undistortion and rectification images are inspection evidence, not a false
+claim about model input. Detection, pose, association, raw fusion, MANO, temporal, and
+export comparisons are drawn from their structured payloads. Three-dimensional stages use
+`projected_keypoints_uv.left/right`, each exactly 21 entries in rectified pixels. Invalid or
+behind-camera landmarks are JSON `null`, never fabricated coordinates. A
+`projected_keypoints_space` value identifies that pixel space.
+
+With `artifacts.overlay_video=true`, one global `EXPORT` record named
+`raw_vs_stable_overlay_video_exported` references:
+
+- `overlay_video_raw_vs_stable_stereo_rectified`, a browser-seekable H.264/yuv420p MP4;
+- `overlay_video_timeline`, a JSON mapping from each video PTS to the original `frame_id`,
+  global `frame_index`, hardware `timestamp_ns`, and track IDs.
+
+Every synchronized pair contributes exactly one video frame, including pairs with no hand.
+All tracks are drawn simultaneously with stable colors. The video metadata records
+`stable_input_stages` and `temporal_method`, so consumers can distinguish a real MANO input
+from a raw-fusion fallback. Both worker and core writers import the MP4 in bounded chunks;
+large videos are not materialized as one Python bytes object.

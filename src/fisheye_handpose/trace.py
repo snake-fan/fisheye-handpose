@@ -497,6 +497,63 @@ class RunArtifactWriter:
             self._verify_blob(reference)
         return reference
 
+    def put_blob_file(
+        self,
+        source_path: str | Path,
+        *,
+        role: str,
+        media_type: str,
+        suffix: str = "",
+    ) -> BlobRef:
+        """Stream a file into the content-addressed store without loading it in memory."""
+
+        self._require_active()
+        _require_text(role, "role")
+        _require_text(media_type, "media_type")
+        _validate_suffix(suffix)
+        source = Path(source_path)
+        if not source.is_file():
+            raise FileNotFoundError(f"blob source is not a file: {source}")
+
+        incoming_root = self.root / "blobs" / "sha256"
+        incoming_root.mkdir(parents=True, exist_ok=True)
+        temporary: Path | None = None
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with (
+                source.open("rb") as source_file,
+                tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=".incoming-",
+                    suffix=".tmp",
+                    dir=incoming_root,
+                    delete=False,
+                ) as destination,
+            ):
+                temporary = Path(destination.name)
+                for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                    destination.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
+
+            sha256 = digest.hexdigest()
+            relative_path = f"blobs/sha256/{sha256[:2]}/{sha256}{suffix}"
+            path = _safe_artifact_path(self.root, relative_path)
+            reference = BlobRef(sha256, size, role, media_type, relative_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(temporary, path)
+                _fsync_directory(path.parent)
+            except FileExistsError:
+                self._verify_blob(reference)
+            return reference
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
     def _verify_blob(self, blob: BlobRef) -> None:
         path = _safe_artifact_path(self.root, blob.relative_path)
         if not path.is_file():

@@ -30,6 +30,10 @@ class RectifiedStereo:
     p1: Any
     p2: Any
     q: Any
+    left_undistort_maps: tuple[Any, Any]
+    right_undistort_maps: tuple[Any, Any]
+    left_rectify_maps: tuple[Any, Any]
+    right_rectify_maps: tuple[Any, Any]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -68,6 +72,80 @@ class RectifiedStereo:
         else:
             raise WorkerError(f"unknown camera side: {side}")
         return [[float(u), float(v)] for u, v in output.reshape(-1, 2)]
+
+    def render_frame(self, side: str, frame: Any, *, image_space: str) -> Any:
+        import cv2
+
+        if side == "left":
+            maps = (
+                self.left_undistort_maps if image_space == "undistorted" else self.left_rectify_maps
+            )
+        elif side == "right":
+            maps = (
+                self.right_undistort_maps
+                if image_space == "undistorted"
+                else self.right_rectify_maps
+            )
+        else:
+            raise WorkerError(f"unknown camera side: {side}")
+        if image_space not in {"undistorted", "rectified"}:
+            raise WorkerError(f"unknown rendered image space: {image_space}")
+        try:
+            output = cv2.remap(
+                frame,
+                maps[0],
+                maps[1],
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+        except cv2.error as exc:
+            raise WorkerError(f"cannot render {image_space} {side} frame: {exc}") from exc
+        if output is None or output.shape[1::-1] != self.output_size:
+            raise WorkerError(f"rendered {image_space} {side} frame has an invalid size")
+        return output
+
+
+def project_rectified_keypoints(
+    rectification: RectifiedStereo,
+    landmarks_xyz_m: Any,
+    validity: Any,
+) -> dict[str, list[list[float] | None]]:
+    """Project a strict 21-landmark value without inventing invalid observations."""
+
+    import numpy as np
+
+    if (
+        not isinstance(landmarks_xyz_m, list)
+        or not isinstance(validity, list)
+        or len(landmarks_xyz_m) != 21
+        or len(validity) != 21
+    ):
+        raise WorkerError("rectified projection requires 21 landmarks and validity values")
+    result: dict[str, list[list[float] | None]] = {"left": [], "right": []}
+    for side, projection in (("left", rectification.p1), ("right", rectification.p2)):
+        projected_side = result[side]
+        for point, state in zip(landmarks_xyz_m, validity, strict=True):
+            if state != "VALID" or not isinstance(point, list) or len(point) != 3:
+                projected_side.append(None)
+                continue
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in point
+            ):
+                projected_side.append(None)
+                continue
+            homogeneous = projection @ np.asarray([*point, 1.0], dtype=np.float64)
+            if not np.all(np.isfinite(homogeneous)) or float(homogeneous[2]) <= 0.0:
+                projected_side.append(None)
+                continue
+            uv = homogeneous[:2] / homogeneous[2]
+            if not np.all(np.isfinite(uv)):
+                projected_side.append(None)
+                continue
+            projected_side.append([float(uv[0]), float(uv[1])])
+    return result
 
 
 def _matrix(value: Any, label: str) -> Any:
@@ -214,8 +292,48 @@ def load_rectified_stereo(config: CalibrationRequest) -> RectifiedStereo:
         (
             f"\0{config.left_camera_id}\0{config.right_camera_id}"
             f"\0{config.translation_unit}\0{config.extrinsics_convention}"
+            f"\0output_width={config.output_size[0]}"
+            f"\0output_height={config.output_size[1]}"
+            f"\0balance={config.balance.hex()}"
+            f"\0fov_scale={config.fov_scale.hex()}"
         ).encode()
     )
+    identity = np.eye(3, dtype=np.float64)
+    try:
+        left_undistort_maps = cv2.fisheye.initUndistortRectifyMap(
+            left_k,
+            left_d,
+            identity,
+            p1[:, :3],
+            config.output_size,
+            cv2.CV_16SC2,
+        )
+        right_undistort_maps = cv2.fisheye.initUndistortRectifyMap(
+            right_k,
+            right_d,
+            identity,
+            p2[:, :3],
+            config.output_size,
+            cv2.CV_16SC2,
+        )
+        left_rectify_maps = cv2.fisheye.initUndistortRectifyMap(
+            left_k,
+            left_d,
+            r1,
+            p1[:, :3],
+            config.output_size,
+            cv2.CV_16SC2,
+        )
+        right_rectify_maps = cv2.fisheye.initUndistortRectifyMap(
+            right_k,
+            right_d,
+            r2,
+            p2[:, :3],
+            config.output_size,
+            cv2.CV_16SC2,
+        )
+    except cv2.error as exc:
+        raise WorkerError(f"OpenCV KB4 image map construction failed: {exc}") from exc
     return RectifiedStereo(
         calibration_id=f"sha256:{digest.hexdigest()}",
         image_size=left_size,
@@ -231,7 +349,11 @@ def load_rectified_stereo(config: CalibrationRequest) -> RectifiedStereo:
         p1=p1,
         p2=p2,
         q=q,
+        left_undistort_maps=left_undistort_maps,
+        right_undistort_maps=right_undistort_maps,
+        left_rectify_maps=left_rectify_maps,
+        right_rectify_maps=right_rectify_maps,
     )
 
 
-__all__ = ["RectifiedStereo", "load_rectified_stereo"]
+__all__ = ["RectifiedStereo", "load_rectified_stereo", "project_rectified_keypoints"]

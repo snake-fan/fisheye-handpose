@@ -93,6 +93,7 @@ class ArtifactRequest:
     source_frames: str
     sample_every: int
     image_format: str
+    overlay_video: bool
 
 
 @dataclass(frozen=True)
@@ -258,10 +259,14 @@ def load_request(path: str | Path) -> WorkerRequest:
     image_format = str(artifacts.get("image_format", "jpg")).lower()
     if image_format not in {"jpg", "png"}:
         raise WorkerError("artifacts.image_format must be jpg or png")
+    overlay_video = artifacts.get("overlay_video", False)
+    if not isinstance(overlay_video, bool):
+        raise WorkerError("artifacts.overlay_video must be boolean")
     artifact_request = ArtifactRequest(
         source_frames=source_frames,
         sample_every=_positive_int(artifacts.get("sample_every"), "artifacts.sample_every"),
         image_format=image_format,
+        overlay_video=overlay_video,
     )
 
     raw_tracking = root.get("tracking")

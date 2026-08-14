@@ -286,6 +286,7 @@ test("operator can inspect stereo overlays, FHP21, QA, provenance, and raw recor
 
   render(<App />);
 
+  expect(await screen.findByText("此运行没有叠加视频")).toBeVisible();
   expect(await screen.findByRole("img", { name: "左目 source_left" })).toBeVisible();
   expect(screen.getByRole("img", { name: "右目 source_right" })).toBeVisible();
   expect(screen.getAllByText("21 / 21 visible")).toHaveLength(2);

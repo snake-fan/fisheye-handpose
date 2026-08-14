@@ -233,8 +233,8 @@ def _diagnostic_package_blobs(
         path = result_dir / name
         if path.is_file():
             blobs.append(
-                writer.put_blob(
-                    path.read_bytes(),
+                writer.put_blob_file(
+                    path,
                     role=f"invalid_worker_{path.stem}",
                     media_type=media_type,
                     suffix=path.suffix,
@@ -280,8 +280,8 @@ class H20WorkerExecutor:
                 json.dumps(request, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n",
                 encoding="utf-8",
             )
-            request_blob = writer.put_blob(
-                request_path.read_bytes(),
+            request_blob = writer.put_blob_file(
+                request_path,
                 role="worker_request",
                 media_type="application/json",
                 suffix=".json",
@@ -350,8 +350,8 @@ class H20WorkerExecutor:
                 blobs: list[BlobRef] = []
                 for value in record.blobs:
                     blobs.append(
-                        writer.put_blob(
-                            value.source_path.read_bytes(),
+                        writer.put_blob_file(
+                            value.source_path,
                             role=value.role,
                             media_type=value.media_type,
                             suffix=value.suffix,

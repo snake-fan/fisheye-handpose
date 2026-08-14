@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,19 +40,24 @@ def _write_new(path: Path, value: Any) -> None:
 
 
 def _file_identity(path: Path, *, role: str) -> dict[str, Any]:
+    byte_count, digest = _file_digest(path)
+    return {
+        "role": role,
+        "media_type": "application/x-ndjson",
+        "bytes": byte_count,
+        "sha256": digest,
+        "relative_path": path.name,
+    }
+
+
+def _file_digest(path: Path) -> tuple[int, str]:
     digest = hashlib.sha256()
     byte_count = 0
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             byte_count += len(chunk)
             digest.update(chunk)
-    return {
-        "role": role,
-        "media_type": "application/x-ndjson",
-        "bytes": byte_count,
-        "sha256": digest.hexdigest(),
-        "relative_path": path.name,
-    }
+    return byte_count, digest.hexdigest()
 
 
 class ResultWriter:
@@ -105,6 +111,57 @@ class ResultWriter:
             "role": role,
             "media_type": media_type,
             "bytes": len(data),
+            "sha256": digest,
+            "relative_path": relative.as_posix(),
+        }
+
+    def put_blob_file(
+        self,
+        source: str | Path,
+        *,
+        role: str,
+        media_type: str,
+        suffix: str,
+    ) -> dict[str, Any]:
+        """Publish a file-backed blob without materializing it in process memory."""
+
+        source_path = Path(source).expanduser().resolve()
+        if not source_path.is_file():
+            raise WorkerError(f"blob source is not a file: {source_path}")
+        byte_count, digest = _file_digest(source_path)
+        relative = Path("blobs") / "sha256" / digest[:2] / f"{digest}{suffix}"
+        destination = self.root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.exists():
+            temporary: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    prefix=f".{digest}.",
+                    suffix=".tmp",
+                    dir=destination.parent,
+                    delete=False,
+                ) as output:
+                    temporary = Path(output.name)
+                    with source_path.open("rb") as input_file:
+                        for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+                            output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+                try:
+                    os.link(temporary, destination)
+                except FileExistsError:
+                    pass
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        actual_bytes, actual_digest = _file_digest(destination)
+        if actual_bytes != byte_count or actual_digest != digest:
+            raise WorkerError("content-addressed blob collision or corruption")
+        return {
+            "role": role,
+            "media_type": media_type,
+            "bytes": byte_count,
             "sha256": digest,
             "relative_path": relative.as_posix(),
         }

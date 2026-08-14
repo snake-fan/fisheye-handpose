@@ -15,8 +15,16 @@ DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 WORKER_ROOT = DEPLOY_ROOT / "worker"
 sys.path.insert(0, str(WORKER_ROOT))
 
+import fisheye_h20_worker.runner as worker_runner  # noqa: E402
+import fisheye_h20_worker.visualization as visualization  # noqa: E402
+from fisheye_h20_worker.artifacts import ResultWriter  # noqa: E402
 from fisheye_h20_worker.bridge import load_import_bundle  # noqa: E402
+from fisheye_h20_worker.calibration import (  # noqa: E402
+    load_rectified_stereo,
+    project_rectified_keypoints,
+)
 from fisheye_h20_worker.cli import main as worker_main  # noqa: E402
+from fisheye_h20_worker.contracts import WorkerError, load_request  # noqa: E402
 from fisheye_h20_worker.mano import MANO_FHP21_MAPPING_ID, map_mano_to_fhp21  # noqa: E402
 from fisheye_h20_worker.runner import run_worker  # noqa: E402
 from fisheye_h20_worker.runtime import OpenMMLabRuntime  # noqa: E402
@@ -233,7 +241,7 @@ class FakeRuntime:
         self.infer_calls = 0
         self.source_calls = 0
         self.seen_frames: list[tuple[str, int]] = []
-        self.encoded_frames: list[tuple[str, int, str]] = []
+        self.encoded_frames: list[tuple[str, int, str, str]] = []
 
     def verify_source(self, **kwargs: Any) -> dict[str, Any]:
         self.source_calls += 1
@@ -267,8 +275,22 @@ class FakeRuntime:
         ]
 
     def encode_frame(self, frame: dict[str, Any], image_format: str) -> bytes:
-        self.encoded_frames.append((frame["side"], frame["index"], image_format))
+        self.encoded_frames.append(
+            (frame["side"], frame["index"], frame.get("rendering", "source"), image_format)
+        )
         return f"{frame}:{image_format}".encode()
+
+    def render_rectification(
+        self,
+        rectification: object,
+        side: str,
+        frame: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        del rectification
+        return {
+            "undistorted": {**frame, "side": side, "rendering": "undistorted"},
+            "rectified": {**frame, "side": side, "rendering": "rectified"},
+        }
 
 
 class MovingHandRuntime(FakeRuntime):
@@ -391,6 +413,224 @@ class FakeManoRuntime(FakeRuntime):
 
 
 class WorkerContractTests(unittest.TestCase):
+    def test_overlay_track_colors_match_stage_comparison_rgb_contract(self) -> None:
+        self.assertEqual(visualization.track_color_rgb("track-0000"), (117, 246, 196))
+        self.assertEqual(visualization.track_color_rgb("track-0001"), (255, 180, 84))
+
+    def test_overlay_renderer_uses_seekable_h264_contract_and_exact_cfr_timeline(self) -> None:
+        import numpy as np
+
+        commands: list[list[str]] = []
+
+        class FakeInput:
+            def __init__(self) -> None:
+                self.payload = bytearray()
+
+            def write(self, value: bytes) -> int:
+                self.payload.extend(value)
+                return len(value)
+
+            def close(self) -> None:
+                return None
+
+        class FakeError:
+            def read(self) -> bytes:
+                return b""
+
+        class FakeProcess:
+            def __init__(self, command: list[str]) -> None:
+                commands.append(command)
+                self.stdin = FakeInput()
+                self.stderr = FakeError()
+                self.returncode: int | None = None
+
+            def wait(self, timeout: int | None = None) -> int:
+                del timeout
+                Path(commands[-1][-1]).write_bytes(b"synthetic seekable mp4")
+                self.returncode = 0
+                return 0
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.returncode = -15
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+        timestamps = [1_000_000_000, 1_033_333_333, 1_066_666_666]
+        projected = {
+            "left": [[32.0, 24.0], *([None] * 20)],
+            "right": [[30.0, 24.0], *([None] * 20)],
+        }
+        with TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "overlay.mp4"
+            with (
+                patch.object(
+                    visualization,
+                    "_ffmpeg_details",
+                    return_value={
+                        "executable": "/usr/bin/ffmpeg",
+                        "version": "ffmpeg version test",
+                        "encoder": "libx264",
+                    },
+                ),
+                patch.object(
+                    visualization.subprocess,
+                    "Popen",
+                    side_effect=lambda command, **kwargs: FakeProcess(command),
+                ),
+            ):
+                renderer = visualization.RawVsStableOverlayVideo(
+                    output_path=output,
+                    image_size=(64, 48),
+                    timestamps_ns=timestamps,
+                    temporal_method="causal_time_ema_v1",
+                )
+                for index, timestamp_ns in enumerate(timestamps):
+                    renderer.append_frame(
+                        left_frame=np.zeros((48, 64, 3), dtype=np.uint8),
+                        right_frame=np.zeros((48, 64, 3), dtype=np.uint8),
+                        frame_id=f"frame/{index:06d}",
+                        frame_index=index,
+                        timestamp_ns=timestamp_ns,
+                        tracks=[
+                            {
+                                "track_id": "track-0000",
+                                "raw": projected,
+                                "stable": projected,
+                                "stable_input_stage": "RAW_FUSION",
+                            }
+                        ],
+                    )
+                result = renderer.close()
+
+        command = commands[0]
+        self.assertIn("libx264", command)
+        self.assertIn("yuv420p", command)
+        self.assertIn("+faststart", command)
+        self.assertEqual(command[command.index("-framerate") + 1], "30/1")
+        self.assertEqual(command[command.index("-video_track_timescale") + 1], "30")
+        self.assertEqual(result["timeline"]["time_base"], {"numerator": 1, "denominator": 30})
+        self.assertEqual(
+            [frame["video_pts"] for frame in result["timeline"]["frames"]],
+            [0, 1, 2],
+        )
+        self.assertEqual(result["metadata"]["frame_count"], 3)
+        self.assertEqual(result["metadata"]["stable_input_stages"], ["RAW_FUSION"])
+        self.assertEqual(result["metadata"]["temporal_method"], "causal_time_ema_v1")
+        self.assertEqual(
+            result["metadata"]["comparison_stages"],
+            ["RAW_FUSION", "TEMPORAL_REFINEMENT"],
+        )
+
+    def test_result_writer_and_bridge_stream_a_large_blob_without_path_read_bytes(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "large.mp4"
+            with source.open("wb") as handle:
+                handle.write(b"0123456789abcdef" * 327_680)
+            expected_size = source.stat().st_size
+            result_dir = root / "result"
+            writer = ResultWriter(result_dir, {"test": True})
+            reference = writer.put_blob_file(
+                source,
+                role="overlay_video_raw_vs_stable_stereo_rectified",
+                media_type="video/mp4",
+                suffix=".mp4",
+            )
+            writer.append(
+                event_id="overlay:export",
+                stage="EXPORT",
+                status="SUCCEEDED",
+                event="raw_vs_stable_overlay_video_exported",
+                payload={"output_status": "PRODUCED"},
+                blobs=[reference],
+            )
+            writer.finalize(
+                status="COMPLETED",
+                summary={"output_status": "NOT_PRODUCED", "output_file": None},
+            )
+            blob_path = result_dir / reference["relative_path"]
+            original_read_bytes = Path.read_bytes
+
+            def guarded_read_bytes(path: Path) -> bytes:
+                if path == blob_path:
+                    raise AssertionError("large blob must be verified through streaming reads")
+                return original_read_bytes(path)
+
+            with patch.object(Path, "read_bytes", guarded_read_bytes):
+                bundle = load_import_bundle(result_dir)
+
+        self.assertEqual(bundle.blobs_by_event[0][0].bytes, expected_size)
+        self.assertEqual(bundle.blobs_by_event[0][0].source_path, blob_path.resolve())
+
+    def test_overlay_video_request_is_backward_compatible_and_strictly_boolean(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+
+            self.assertFalse(load_request(fixture["request"]).artifacts.overlay_video)
+
+            request = json.loads(fixture["request"].read_text(encoding="utf-8"))
+            request["artifacts"]["overlay_video"] = True
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+            self.assertTrue(load_request(fixture["request"]).artifacts.overlay_video)
+
+            request["artifacts"]["overlay_video"] = 1
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+            with self.assertRaisesRegex(WorkerError, "artifacts.overlay_video must be boolean"):
+                load_request(fixture["request"])
+
+    def test_rectified_projection_preserves_landmark_cardinality_and_nulls_invalid_points(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+            request = load_request(fixture["request"])
+            stereo = load_rectified_stereo(request.calibration)
+
+            landmarks: list[list[float] | None] = [[0.0, 0.0, 1.0]] + [None] * 20
+            validity = ["VALID", "LOW_KEYPOINT_SCORE"] + ["VALID"] * 19
+            projected = project_rectified_keypoints(stereo, landmarks, validity)
+
+        self.assertEqual(set(projected), {"left", "right"})
+        self.assertEqual(len(projected["left"]), 21)
+        self.assertEqual(len(projected["right"]), 21)
+        self.assertIsNotNone(projected["left"][0])
+        self.assertIsNotNone(projected["right"][0])
+        self.assertEqual(projected["left"][1:], [None] * 20)
+        self.assertEqual(projected["right"][1:], [None] * 20)
+
+        with self.assertRaisesRegex(WorkerError, "21 landmarks"):
+            project_rectified_keypoints(stereo, landmarks[:-1], validity[:-1])
+
+    def test_calibration_id_binds_rectified_output_geometry_parameters(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+            request_document = json.loads(fixture["request"].read_text(encoding="utf-8"))
+
+            baseline = load_rectified_stereo(load_request(fixture["request"]).calibration)
+            identifiers = {baseline.calibration_id}
+            for update in (
+                {"output_size": [320, 240]},
+                {"balance": 0.5},
+                {"fov_scale": 1.25},
+            ):
+                candidate = json.loads(json.dumps(request_document))
+                candidate["calibration"].update(update)
+                fixture["request"].write_text(json.dumps(candidate), encoding="utf-8")
+                identifiers.add(
+                    load_rectified_stereo(
+                        load_request(fixture["request"]).calibration
+                    ).calibration_id
+                )
+
+        self.assertEqual(len(identifiers), 4)
+
     def test_sequence_tracker_is_one_to_one_stable_and_resets_after_a_real_time_gap(
         self,
     ) -> None:
@@ -529,6 +769,18 @@ class WorkerContractTests(unittest.TestCase):
         )
         self.assertEqual(raw["payload"]["track_assignment"]["decision"], "NEW")
         self.assertEqual(raw["payload"]["track_id"], "track-0000")
+        for event in (raw, temporal, export_event):
+            projected = event["payload"]["projected_keypoints_uv"]
+            self.assertEqual(set(projected), {"left", "right"})
+            self.assertEqual(len(projected["left"]), 21)
+            self.assertEqual(len(projected["right"]), 21)
+            self.assertTrue(all(point is not None for point in projected["left"]))
+            self.assertTrue(all(point is not None for point in projected["right"]))
+            self.assertEqual(event["payload"]["projected_keypoints_space"], "rectified")
+        self.assertEqual(
+            frame_kinematic["payload"]["projected_keypoints_uv"],
+            {"left": [None] * 21, "right": [None] * 21},
+        )
         self.assertIn("detections", detection["payload"])
         self.assertEqual(tracked_pose["payload"]["track_id"], "track-0000")
         self.assertEqual(len(tracked_pose["payload"]["keypoints_uv"]), 21)
@@ -682,6 +934,14 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(mano_events[0]["payload"]["selection"]["decision"], "SELECTED")
         self.assertEqual(mano_events[0]["payload"]["loss"]["metric"], "RMSE_M")
         self.assertEqual(mano_events[0]["payload"]["loss"]["value"], 0.005)
+        self.assertEqual(mano_events[0]["payload"]["projected_keypoints_space"], "rectified")
+        self.assertTrue(
+            all(
+                point is not None
+                for side in ("left", "right")
+                for point in mano_events[0]["payload"]["projected_keypoints_uv"][side]
+            )
+        )
         self.assertTrue(mano_events[1]["payload"]["beta_frozen"])
         self.assertEqual(exported[0]["mano"]["mapping_id"], MANO_FHP21_MAPPING_ID)
         self.assertEqual(exported[0]["kind"], ["REFINED"] * 21)
@@ -1143,6 +1403,12 @@ class WorkerContractTests(unittest.TestCase):
         self.assertTrue(
             all(event["payload"]["output_status"] == "NOT_PRODUCED" for event in empty_frame)
         )
+        for event in empty_frame:
+            self.assertEqual(
+                event["payload"]["projected_keypoints_uv"],
+                {"left": [None] * 21, "right": [None] * 21},
+            )
+            self.assertEqual(event["payload"]["projected_keypoints_space"], "rectified")
         empty_tracking = next(
             event for event in events if event["event_id"] == "part0001:pair000001:tracking"
         )
@@ -1220,6 +1486,31 @@ class WorkerContractTests(unittest.TestCase):
             sync_events = [event for event in events if event["stage"] == "SYNCHRONIZATION"]
             refs = sync_events[0]["blobs"]
             self.assertEqual(sync_events[1]["blobs"], [])
+            rectification_events = [
+                event for event in events if event["event"] == "stereo_pair_rectification_rendered"
+            ]
+            self.assertEqual(len(rectification_events), 1)
+            self.assertEqual(
+                rectification_events[0]["parent_event_ids"],
+                [sync_events[0]["event_id"]],
+            )
+            self.assertEqual(
+                {reference["role"] for reference in rectification_events[0]["blobs"]},
+                {
+                    "undistorted_left",
+                    "undistorted_right",
+                    "rectified_left",
+                    "rectified_right",
+                },
+            )
+            self.assertEqual(
+                rectification_events[0]["payload"]["calibration_id"],
+                next(
+                    event["payload"]["calibration_id"]
+                    for event in events
+                    if event["event"] == "worker_rectification_loaded"
+                ),
+            )
             for reference in refs:
                 data = (result_dir / reference["relative_path"]).read_bytes()
                 self.assertEqual(hashlib.sha256(data).hexdigest(), reference["sha256"])
@@ -1227,9 +1518,190 @@ class WorkerContractTests(unittest.TestCase):
 
         self.assertEqual(
             runtime.encoded_frames,
-            [("left", 0, "png"), ("right", 0, "png")],
+            [
+                ("left", 0, "source", "png"),
+                ("right", 0, "source", "png"),
+                ("left", 0, "undistorted", "png"),
+                ("left", 0, "rectified", "png"),
+                ("right", 0, "undistorted", "png"),
+                ("right", 0, "rectified", "png"),
+            ],
         )
         self.assertEqual({reference["role"] for reference in refs}, {"source_left", "source_right"})
+
+    def test_optional_overlay_video_writes_one_all_track_frame_per_pair_and_global_artifacts(
+        self,
+    ) -> None:
+        instances: list[Any] = []
+
+        class FakeOverlayVideo:
+            def __init__(
+                self,
+                *,
+                output_path: Path,
+                image_size: tuple[int, int],
+                timestamps_ns: list[int],
+                temporal_method: str,
+            ) -> None:
+                self.output_path = output_path
+                self.image_size = image_size
+                self.timestamps_ns = timestamps_ns
+                self.temporal_method = temporal_method
+                self.frames: list[dict[str, Any]] = []
+                self.aborted = False
+                instances.append(self)
+
+            def append_frame(self, **value: Any) -> None:
+                self.frames.append(value)
+
+            def close(self) -> dict[str, Any]:
+                self.output_path.write_bytes(b"test h264 mp4 bytes")
+                timeline = {
+                    "schema_version": "fisheye-handpose/overlay-video-timeline/v1",
+                    "frame_rate": {"numerator": 30, "denominator": 1},
+                    "time_base": {"numerator": 1, "denominator": 30},
+                    "frames": [
+                        {
+                            "video_frame_index": index,
+                            "video_pts": index,
+                            "duration_pts": 1,
+                            "frame_id": frame["frame_id"],
+                            "frame_index": frame["frame_index"],
+                            "timestamp_ns": frame["timestamp_ns"],
+                            "track_ids": sorted(track["track_id"] for track in frame["tracks"]),
+                        }
+                        for index, frame in enumerate(self.frames)
+                    ],
+                }
+                return {
+                    "path": self.output_path,
+                    "timeline": timeline,
+                    "metadata": {
+                        "schema_version": "fisheye-handpose/overlay-video/v1",
+                        "layout": "RAW_LEFT_RAW_RIGHT_STABLE_LEFT_STABLE_RIGHT",
+                        "image_space": "rectified",
+                        "comparison_stages": ["RAW_FUSION", "TEMPORAL_REFINEMENT"],
+                        "frame_count": len(self.frames),
+                        "width": self.image_size[0],
+                        "height": self.image_size[1],
+                        "codec": "h264",
+                        "pixel_format": "yuv420p",
+                        "tracks": ["track-0000", "track-0001"],
+                        "ffmpeg": {"executable": "/usr/bin/ffmpeg", "encoder": "libx264"},
+                    },
+                }
+
+            def abort(self) -> None:
+                self.aborted = True
+
+        runtime = AssociationScenarioRuntime()
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=2)
+            request = json.loads(fixture["request"].read_text(encoding="utf-8"))
+            request["artifacts"]["overlay_video"] = True
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+            result_dir = root / "result"
+
+            with patch.object(
+                worker_runner,
+                "RawVsStableOverlayVideo",
+                FakeOverlayVideo,
+                create=True,
+            ):
+                run_worker(fixture["request"], result_dir, runtime=runtime)
+            events = [
+                json.loads(line)
+                for line in (result_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            bundle = load_import_bundle(result_dir)
+
+        self.assertEqual(len(instances), 1)
+        overlay = instances[0]
+        self.assertEqual(overlay.temporal_method, "causal_time_ema_v1")
+        self.assertEqual(len(overlay.frames), 2)
+        self.assertEqual([len(frame["tracks"]) for frame in overlay.frames], [2, 0])
+        self.assertEqual(
+            sorted(track["track_id"] for track in overlay.frames[0]["tracks"]),
+            ["track-0000", "track-0001"],
+        )
+        global_event = next(
+            event for event in events if event["event"] == "raw_vs_stable_overlay_video_exported"
+        )
+        self.assertNotIn("frame_id", global_event["payload"])
+        self.assertEqual(global_event["payload"]["frame_count"], 2)
+        self.assertEqual(global_event["payload"]["temporal_method"], "causal_time_ema_v1")
+        self.assertEqual(
+            global_event["payload"]["comparison_stages"],
+            ["RAW_FUSION", "TEMPORAL_REFINEMENT"],
+        )
+        self.assertEqual(
+            {blob["role"] for blob in global_event["blobs"]},
+            {
+                "overlay_video_raw_vs_stable_stereo_rectified",
+                "overlay_video_timeline",
+            },
+        )
+        imported = next(
+            record
+            for record in bundle.core_records(external_parent_id="audit:report")
+            if record.event == "raw_vs_stable_overlay_video_exported"
+        )
+        self.assertEqual(
+            {blob.role for blob in imported.blobs},
+            {
+                "overlay_video_raw_vs_stable_stereo_rectified",
+                "overlay_video_timeline",
+            },
+        )
+
+    def test_overlay_ffmpeg_is_aborted_when_a_later_pipeline_stage_fails(self) -> None:
+        instances: list[Any] = []
+
+        class FailingRunOverlay:
+            def __init__(self, **kwargs: Any) -> None:
+                self.output_path = kwargs["output_path"]
+                self.aborted = False
+                self.frame_count = 0
+                instances.append(self)
+
+            def append_frame(self, **kwargs: Any) -> None:
+                del kwargs
+                self.frame_count += 1
+
+            def close(self) -> dict[str, Any]:
+                raise AssertionError("failed worker must not close/export the overlay")
+
+            def abort(self) -> None:
+                self.aborted = True
+                self.output_path.unlink(missing_ok=True)
+
+        runtime = LateInferenceFailureRuntime()
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=2)
+            request = json.loads(fixture["request"].read_text(encoding="utf-8"))
+            request["artifacts"]["overlay_video"] = True
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+            result_dir = root / "result"
+            with (
+                patch.object(
+                    worker_runner,
+                    "RawVsStableOverlayVideo",
+                    FailingRunOverlay,
+                    create=True,
+                ),
+                self.assertRaisesRegex(RuntimeError, "simulated late inference failure"),
+            ):
+                run_worker(fixture["request"], result_dir, runtime=runtime)
+
+            summary = json.loads((result_dir / "summary.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(instances[0].frame_count, 1)
+        self.assertTrue(instances[0].aborted)
+        self.assertEqual(summary["status"], "FAILED")
+        self.assertEqual(summary["overlay_video_output_count"], 0)
 
     def test_existing_result_is_never_overwritten(self) -> None:
         runtime = FakeRuntime()

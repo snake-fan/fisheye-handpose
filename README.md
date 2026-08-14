@@ -105,10 +105,12 @@ cd /mnt/workspace/zyf/fisheye/fisheye-handpose
   --h20-executor-config deploy/mmpose-h20/h20-executor.example.json
 ```
 
-The checked-in debugging template processes at most 120 synchronized pairs, saves source
-evidence for every processed pair, and uses the reviewed H20 asset locations. Once a run
-has been visually accepted, increase `artifacts.sample_every` to reduce storage. The
-orchestrator replaces its session/calibration fields with audited values.
+The checked-in debugging template processes at most 120 synchronized pairs, saves source,
+undistorted, and stereo-rectified evidence for every processed pair, and exports a 2x2
+H.264 raw-versus-stable skeleton video plus its hardware-timestamp timeline. Once a run has
+been visually accepted, increase `artifacts.sample_every` to reduce still-image storage or
+disable `artifacts.overlay_video`. The orchestrator replaces its session/calibration fields
+with audited values.
 The final `fhp21.jsonl` is imported as a verified content-addressed blob with role
 `worker_fhp21_output`, not copied to a mutable top-level run file. Download it through the
 React/API artifact link or locate it from the EXPORT provenance.
@@ -155,6 +157,15 @@ npm run dev
 
 Open `http://127.0.0.1:5173`. Remote H20 inspection uses an SSH tunnel; see
 [backend/README.md](backend/README.md) and [frontend/README.md](frontend/README.md).
+
+For each selected frame, the React inspector exposes the ten logical nodes from source RGB
+through stable FHP21 export. Every node has a before/after view; missing evidence remains
+visible as `NOT_PRODUCED` with its recorded reason. When no track filter is selected, all
+hands are drawn together with deterministic colors. The run-level player uses the global
+`overlay_video_raw_vs_stable_stereo_rectified` artifact to compare raw triangulation (top)
+with the actual temporal output (bottom) in both cameras. Its label is provenance-driven:
+if MANO was rejected, it says `RAW_FUSION -> causal_time_ema_v1` rather than claiming a
+temporal MANO result.
 
 For the configured remote workflow, the Mac helper keeps both the SSH tunnel and local
 React development server alive, verifies the API health contract before declaring success,
