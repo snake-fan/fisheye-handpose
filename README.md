@@ -223,7 +223,9 @@ The H20 worker, process bridge, multi-run API, and React project have separate t
 See [docs/architecture.md](docs/architecture.md) for the planned model-facing APIs and
 the next implementation milestone. The attached engineering proposal has been evaluated
 in [docs/design-review.md](docs/design-review.md); that review is the implementation
-decision record for which parts are retained, revised, or rejected.
+decision record for which parts are retained, revised, or rejected. The evidence-backed
+stage-by-stage diagnosis of the current H20 baseline is in
+[docs/current-pipeline-problem-analysis.md](docs/current-pipeline-problem-analysis.md).
 
 ## H20 perception environment
 
