@@ -6,8 +6,8 @@
 
 适用范围：本仓库本地开发、H20 兼容 worker、Trace API 与 React 检查前端
 基线代码：`5eacb7a` 及其 H20 实跑 `h20-stage-video-5eacb7a`
-当前候选代码：`8e49061`；H20 package smoke `v2-8e49061-h20-smoke1`；
-120-pair canonical run `v2-8e49061-h20-120`
+当前候选代码：`bda6fa1`；H20 V7.1 smoke `v71-1579ebc-h20-smoke1`；
+120-pair canonical run `v71-bda6fa1-h20-120`
 
 本文是后续算法迭代的实施依据。代码实现若因真实数据、依赖能力或性能约束而改变本文
 方案，必须在同一个提交中更新“决策与偏离记录”和文末变更日志；不得只修改代码、不
@@ -320,8 +320,9 @@ L = L_2d_left + L_2d_right
 ```
 
 接受条件不只看 aggregate 3D RMSE，还要检查：有效支持数、左右 2D P95 residual、wrist/tip
-分组 residual、关节角合法性、有限 mesh 和优化收敛状态。20 mm 继续作为 3D 上限，不因
-产出率低而放宽。
+分组 residual、关节角合法性、有限 mesh 和优化收敛状态。20 mm 继续作为 V7.1 的 inlier
+质量门禁，不因产出率低而放宽；40 mm 只是不让局部降权掩盖灾难性全量偏差的 fail-safe
+ceiling，不能据此宣称 ordinary full RMSE 已通过 20 mm 门槛。
 
 #### 6.3.1 V7.1：实证触发的二阶段鲁棒拟合与一致门禁
 
@@ -371,7 +372,9 @@ track-shared beta/scale、mapping ID、输入 Raw observation ID 和初始化 pr
 - PCA → 45D 转换前后 MANO joints/vertices 在容差内一致；
 - 锚点不是首帧、遮挡后恢复、左右传播和不规则时间戳均有确定性测试；
 - beta/scale 每 track 共享，pose/root/trans 每帧独立，左右手模型不会串用；
-- 冻结目标域上 frame-wise MANO 产出率 ≥ 95%，median RMSE ≤ 10 mm、P95 ≤ 20 mm；
+- 冻结目标域上 frame-wise MANO 产出率 ≥ 95%，ordinary full RMSE median ≤ 10 mm、P95 ≤
+  20 mm；V7.1 还必须单列 inlier RMSE P95 ≤ 20 mm 和 full RMSE max ≤ 40 mm，不能用其中
+  一项替换另一项；
 - wrist/tip residual 单独达标，不能由大量易拟合 MCP/PIP 掩盖；
 - H20 实跑无 NaN、无 OOM，且必须报告每 hand-frame 耗时和 peak GPU memory。
 
@@ -482,11 +485,12 @@ fusion/hand gate 虽均已进入此真实主链，各自完整 phase gate 仍未
 每个算法 profile 都记录完整配置和 method/version ID。旧 profile 至少保留到相邻 phase
 通过冻结 gate，以便同 run 或同输入 ablation；不得靠切换未记录的默认值比较结果。
 
-### 8.3 V0–V7 `8e49061` 代码与 H20 状态快照
+### 8.3 V0–V7 `8e49061` 基线与 V7.1 `bda6fa1` follow-up
 
-本表固定描述提交 `8e49061`，并以 `v2-8e49061-h20-smoke1` 和
-`v2-8e49061-h20-120` 为真实环境证据。“已接主链”或“H20 可运行”都不代表
-已通过需要 GT、ablation 或尚未实现能力的 phase gate。
+V0–V7 行固定描述提交 `8e49061`，并以 `v2-8e49061-h20-smoke1` 和
+`v2-8e49061-h20-120` 为真实环境证据；V7.1 行使用 `bda6fa1` 与
+`v71-bda6fa1-h20-120`。 “已接主链”或“H20 可运行”都不代表已通过需要 GT、
+ablation 或尚未实现能力的 phase gate。
 
 | 切片 | 独立 seam | 主链接入 | 本地验证边界 | H20/真实模型状态 | 当前结论 |
 |---|---|---|---|---|---|
@@ -498,13 +502,15 @@ fusion/hand gate 虽均已进入此真实主链，各自完整 phase gate 仍未
 | V5 tracking | `tracking.py` 已实现固定掌心 median、constant velocity、TTL recovery 与 one-to-one assignment | 已替换 runner 主 tracker；missing 帧仍推进 active-state lineage，last-seen 不变 | 本地确定性测试覆盖 palm 缺点、交叉、gap、乱序时间和 recovery | H20 只产生 2 tracks：118/120 hand-frames，NEW=2、MATCHED=236、recovered=2 | 无第三条 split 的回归通过；无身份 GT，不宣称 ID switch=0；covariance gate/cost matrix/reset 仍缺 |
 | V6 MANO anchor/coarse | `mano_anchor.py` 已实现 pose-agnostic、按 track、top-K 且时间去冗余的质量锚点选择 | **未接 runner**；PCA model 与 PCA→45D 转换仍未实现 | 仅独立 evidence/排序/fail-closed 测试；不会奖励首帧或平手 | 未 H20 实测 | anchor seam 已实现，coarse-to-fine 尚未实现，不能记作 V6 完成 |
 | V7 MANO bidirectional | `mano_fitting.py` 已实现 track-local accepted-state 控制器；runtime 支持完整参数 warm-start、Huber、best-so-far、early-stop 与诊断 | 已接 runner；`flat_hand_mean=False,use_pca=False`，mean-pose cold start，只有 accepted fit 更新状态，warm 失败后可 cold recovery，上限 200 iter | controller/runtime 契约覆盖 reject/error 不污染状态；仍只有按时间向前传播 | 真实 H20/MANO：213/238=89.496%；accepted RMSE median=9.008 mm、P95=16.960 mm、max=19.997 mm | 误差分布 gate 通过，产出率 95% gate 失败；双向 pass、anchor 驱动、PCA coarse 和共享 shape 全轨复估仍未实现 |
-| V7.1 robust MANO gate | 本地候选已实现 full-Huber→10% residual-trim weighted refit、15 点支持、inlier gate 与 2×full ceiling | 已接 `runtime.fit_mano(joint_weights=...)`、accepted-state controller、runner Trace 和 v3 provenance；Raw 与 `fhp21/v1` 顶层不变 | deploy 187 passed/2 environment skips；另以本机真实 Torch 验证 weighted objective 与 full/weighted RMSE 分离 | H20 1-pair smoke `COMPLETED`，2/2 MANO；该帧未触发二阶段，完整 120-pair gate 仍待运行 | smoke contract PASS；必须以新 immutable 120-pair run 决定 production gate |
+| V7.1 robust MANO gate | 已实现 full-Huber→10% residual-trim weighted refit、15 点支持、inlier gate 与 2×full ceiling | 已接 `runtime.fit_mano(joint_weights=...)`、accepted-state controller、runner Trace 和 v3 provenance；Raw 与 `fhp21/v1` 顶层不变 | deploy 187 passed/2 environment skips；另以本机和 H20 真实 Torch 验证 weighted objective 与 full/weighted RMSE 分离 | `v71-bda6fa1-h20-120`：234/238=98.319%；30 个 selected hand-frame 进入鲁棒门禁，26 个挽救、4 个最终拒绝；旧有 213 次成功零回退 | production、inlier P95 和 full ceiling PASS；ordinary full P95=25.327 mm，原总体验收门槛仍 FAIL，V7.1 仅 PARTIAL |
 
 V8/V9 尚未开始。当前 `runner.py` 仍是单遍 frame-major 调度，Temporal 仍为 Raw 或已接受
 frame-wise MANO 关节 XYZ 上的 `causal_time_ema_v1`；没有 Temporal MANO、三 pass spool 或
 离线前后向传播。V7 的本地接入只解决冷启动、欠迭代和失败状态污染的一部分问题，必须先
 通过 H20 MANO 产出率/RMSE gate，才允许把它当成后续 Temporal MANO 的可靠输入。
-`8e49061` 的 accepted RMSE 门禁通过，但产出率只有 89.496%，所以 V7 依然未通过。
+`8e49061` 的产出率只有 89.496%；`bda6fa1` 将其提高到 98.319%，但 ordinary full RMSE
+P95 为 25.327 mm，仍高于原 20 mm 总体验收门槛。因此 V7.1 的 production/inlier gate
+通过，整体质量 gate 仍为 PARTIAL，而不是完成 V7/V8。
 
 ### 8.4 已接入部分的当前语义与限制
 
@@ -649,6 +655,55 @@ H20 runtime doctor 全通过，真实 Torch 的 weighted objective 与 ordinary/
 视频链可执行；因为本帧没有触发二阶段，它不能证明 10% trim 能提升 120 帧产出率，后者
 必须由新的 full run 验收。
 
+### 8.9 `bda6fa1` V7.1 120-pair canonical run
+
+immutable run `v71-bda6fa1-h20-120` 在同一真实 session、标定、RTMDet/RTMPose、MANO
+资产与 120-pair profile 上以 `COMPLETED / PRODUCED` 封存。worker return code 为 0，
+输出 238 行 FHP21；canonical `trace-validate` 为 2,911 records、1,943 blobs、0 error、
+0 warning，last hash 为
+`51528bac3909978842449f6f01a8d299fa3678c3babb680562bd5c4d4f4e74b7`。
+这里的 0 warning 指 validator 没有发现完整性问题；业务 record 状态仍诚实包含 10 个
+`WARNING` 和 6 个 `SKIPPED`（另有 2,895 个 `SUCCEEDED`、0 个 `FAILED`）。
+
+本轮没有通过改变上游证据换取 MANO 产出率。旧、新 run 的 240 条 `RAW_FUSION` record
+在排除外层 hash-chain ordinal/时间字段后，record ID、parent、status、event、payload 和
+blob SHA 逐字段完全相同，语义摘要均为
+`7427ee1f5870202c121c4ac5c551ab7872bb8ee09a114d4c9fa7559ab3897013`。因此 association
+240 matches、Raw 238 produced/2 rejected、4,764/4,998 produced Raw valid joints 和两条
+track 均保持不变。
+
+| 指标 | `v2-8e49061-h20-120` | `v71-bda6fa1-h20-120` | 结论 |
+|---|---:|---:|---|
+| MANO produced / eligible | 213/238（89.496%） | 234/238（98.319%） | ≥95% production gate PASS |
+| MANO rejected | 25 | 4 | 减少 21；旧有 213 次成功零回退 |
+| selected hand-frame gate triggered / produced / final rejected | 不适用 | 30 / 26 / 4 | hand-frame 口径；不是 optimizer attempt 数 |
+| weighted-refit attempts accepted / rejected / error | 不适用 | 26 / 8 / 0 | 4 个最终拒绝帧各含 warm + cold-recovery 两次 rejected attempt |
+| accepted ordinary full RMSE median / P95 / max | 9.008 / 16.960 / 19.997 mm | 9.174 / 25.327 / 33.140 mm | median PASS；原 full-P95 20 mm gate FAIL；40 mm ceiling PASS |
+| accepted inlier RMSE median / P95 / max | 不适用 | 9.174 / 17.897 / 19.947 mm | V7.1 inlier gate PASS |
+| Temporal 输入 | MANO 213 + Raw 25 | MANO 234 + Raw 4 | fallback 显著减少，仍不冒充 Temporal MANO |
+| end-to-end wall time | 497.425 s | 486.711 s | 本样本未观察到整体变慢；每 hand 与 peak GPU memory 未埋点 |
+
+30 个 selected hand-frame 进入二阶段门禁，其中 26 个通过；实际 weighted-refit 共 34 个
+attempt（26 accepted、8 rejected、0 error），因为 4 个最终拒绝帧各执行 warm 与
+cold-recovery 两个 hypothesis。显式 trim 频次为 joint 17:30、18:9、16:4、5:2、20:2、
+13:1。所有 accepted case 均满足 effective support ≥15、inlier ≤20 mm、full ≤40 mm，
+mask/weight 与最终 residual 重算一致。剩余四个拒绝全部是 track-0001 的 frame 50–53，
+原因均为 `INLIER_RMSE_GATE_EXCEEDED`，inlier RMSE 分别为 20.644、21.591、28.228、
+20.615 mm；没有为了凑 production 数量放宽门槛。
+
+最终 FHP21 SHA-256 为
+`43266c6c1ac238cce99ce7ec60f54e967f065834de5270379ec9806b4ec12cf8`，238 行严格
+validator 全过。叠加视频 SHA-256 为
+`f4bf7171d91f00cd67bd5ba4cac819295d82323a7c6afe9b79a06e1898c831c1`，H.264 High、
+`yuv420p`、1600×1300、30 fps，ffprobe 与完整解码均为 120/120 帧；timeline 连续且与旧
+run 相同。
+
+当前源码启动的临时 Trace API 对该 run 的 warm detail 为 93–95 ms、warm all-runs list 为
+13–17 ms、frames/record/Range 为 2–7 ms；cold detail 与 cold 36-run catalog 分别为
+9.328 s 与 9.291 s，这是首次完整 SHA 校验成本。持久 18080 随后已按原命令安全重启；
+filtered list 首次/预热后为 5.212 s/34 ms，detail 首次/预热后为 4.258 s/98 ms。当前前端
+已使用新缓存路径，该运行操作不改变 run 或算法；首次 cold latency 仍需在 UI 中明确反馈。
+
 ## 9. 总体验收矩阵
 
 | 层级 | 验收 |
@@ -687,6 +742,23 @@ ablation、性能埋点或目标 Temporal MANO 实现。
 “当前 120 帧回归”只能防止这个已知样本退化，不能代替目标域标注集。若 238/240 与人工
 presence GT 冲突，以 GT 为准并在偏离记录中修改该回归门槛，不能为了凑数制造手。
 
+### 9.2 `v71-bda6fa1-h20-120` V7.1 验收观察
+
+| 层级 | 当前证据 | 状态 |
+|---|---|---|
+| 上游不变性 | 全部 240 条 Raw record 逐字段一致；Raw/association/track 数量与 baseline 相同 | PASS |
+| MANO production | 234/238=98.319%；旧有 213 次成功零回退 | ≥95% gate PASS |
+| MANO ordinary full RMSE | median 9.174 mm、P95 25.327 mm、max 33.140 mm | median PASS；原 P95≤20 mm gate FAIL；40 mm safety ceiling PASS |
+| MANO robust inlier RMSE | median 9.174 mm、P95 17.897 mm、max 19.947 mm；支持数均 ≥15 | V7.1 gate PASS；仍为未校准启发式门禁 |
+| Temporal | MANO 234 + Raw fallback 4，方法仍为 `causal_time_ema_v1` | 输入覆盖改善；Temporal MANO 与 jitter gate `NOT_EVALUATED` |
+| 可追溯性 | 2,911 records/1,943 blobs，0 校验错误/警告；238 FHP21 与 120 帧视频全过 | PASS |
+| Trace API | 当前源码 warm detail/list <100 ms，frame/record/Range <10 ms；cold 完整校验约 9.3 s | warm 路径 PASS；首次 cold latency 仍需 UI 明示 |
+
+V7.1 证明了局部离群点降权能在保持 Raw 和门槛不变的前提下恢复 production，但并未证明
+这些被恢复的 MANO 对真实 3D GT 更准确。ordinary full P95 的退化仍需由 robust
+association/anatomy gate、分组 residual 和 GT 评测继续解决；不得仅以 98.319% 宣布整体
+MANO phase 完成。
+
 ## 10. 失败与回退策略
 
 - crop 无效：candidate 记录 `NOT_PRODUCED`，不得静默回退全图 pose；只有显式 ablation
@@ -720,6 +792,7 @@ presence GT 冲突，以 GT 为准并在偏离记录中修改该回归门槛，�
 | 2026-08-14 | V7.1 / implementation plan | 继续增加迭代、放宽 20 mm 门槛或优先实现 PCA/双向传播 | 先实现二阶段 residual-trim refit，并用与鲁棒 loss 一致的 inlier gate；保留 ordinary RMSE 和 40 mm 全局安全上限 | 25/25 拒绝帧最大异常骨段均为 wrist→little MCP；失败/通过帧最大骨长中位数 155.7/105.6 mm，covariance std 48.9/21.6 mm，而失败帧重投影误差反而更低。反事实 trim-worst-1/10% 的预计产出率为 97.90%/99.16%；增加 seed、反向初始化和单纯增加 iteration 均未解决 | Raw observation 与 20 mm inlier 门槛不变；MANO Trace/attempt schema 增加权重、mask、两类 RMSE 和 gate reason；需要新 run ID 完整重跑，旧 run 不改写 | 方案先行，按 TDD 实现 `RESIDUAL_TRIM_10PCT_V1`；真实 H20 数据决定是否保留或修订该策略 |
 | 2026-08-14 | V7.1 / local implementation | 固定写死 20/40 mm，并用 inlier RMSE 同时做 gate 与跨 hypothesis 排序 | trigger/residual threshold 从现有 `max_fit_rmse_m` 派生，full ceiling 固定为其 2 倍；gate 仍用 inlier，但 handedness/seed 统一按 final full RMSE 排序 | 独立审查发现硬编码会与合法非 20 mm 配置分叉，且不同 mask 的 inlier RMSE 不可横向比较；14 点低 RMSE、左右不同 gate、weighted reject/error accepted-state 防污染均有回归 | 默认 profile 的数值仍是 20/40 mm；配置兼容性和 handedness 选择语义更明确；Trace 新增 first/full/inlier、21 点 weights/mask、支持数与阶段迭代，FHP21 v1 不变 | 属于实现阶段必要修正，已同步正文；H20 前本地 contract PASS，真实策略效果仍待 smoke/full run |
 | 2026-08-14 | V7.1 / `v71-1579ebc-h20-smoke1` | 零权重 joint 在前端统一显示为 trimmed | 根据 `trimmed_joint_indices` 区分显式 residual trim；其余 mask=false/weight=0 显示 `NO RAW SUPPORT` | 首帧 track-0000 wrist 的 Raw validity 无效、weight=0、trimmed list 为空；将其显示为裁剪会错误解释算法行为 | 只改变前端诊断标签与样式；Trace、算法和旧 run 不变；新增 produced/rejected/legacy UI tests | 现场语义修正；smoke 系统/契约 PASS，二阶段效果仍需 full run |
+| 2026-08-14 | V7.1 / `v71-bda6fa1-h20-120` | 以 production≥95%、inlier≤20 mm 和 full≤40 mm 验证二阶段策略，同时保留原 ordinary full-P95≤20 mm 总体验收口径 | 保留 `RESIDUAL_TRIM_10PCT_V1` 参数与 20/40 mm 门槛，不因 4 个残余失败继续放宽；将 production/inlier PASS 与 ordinary full-P95 FAIL 分开记录 | Raw 240 records 精确不变；MANO 213→234、21 个新增成功且零回退；inlier P95 17.897 mm、full max 33.140 mm，但 full P95 25.327 mm；frame 50–53 仍按门禁拒绝 | V7.1 继续作为可追溯局部鲁棒门禁；Trace/UI/FHP21 契约保持，后续优先修上游 association/anatomy 与做 GT 评测，不把 full outlier 隐藏为整体质量 PASS | production 与 V7.1 gate PASS，MANO 总体 phase 仍 PARTIAL；不修改历史 run |
 
 复制模板：
 
@@ -749,3 +822,4 @@ presence GT 冲突，以 GT 为准并在偏离记录中修改该回归门槛，�
 | 2026-08-14 | 在实现前冻结 V7.1 二阶段鲁棒 MANO 方案：第一阶段全有效点 Huber，失败后最多裁剪 10% 的高残差点并从最佳参数重拟合；使用 20 mm inlier RMSE、至少 15 点支持和 40 mm full-RMSE 安全上限，Raw 与失败证据保持不可变。 |
 | 2026-08-14 | 完成本地 V7.1 TDD 切片：weighted runtime、accepted-state robust gate、runner Trace 与 v3 provenance 接通；修正为配置派生 gate/2×ceiling、跨 hypothesis 按 full RMSE 排序，严格 `fhp21/v1` 顶层不变。deploy 187 项通过，真实 Torch weighted objective 通过；H20 smoke/full 仍待执行。 |
 | 2026-08-14 | `v71-1579ebc-h20-smoke1` 在 H20 完成 1-pair smoke：2/2 MANO、39 records/27 blobs、strict Trace 与 1 帧 H.264 overlay 全通过；本帧未触发 weighted refit。前端据此把无 Raw 支持的零权重点与 residual-trim 点分开显示。 |
+| 2026-08-14 | `v71-bda6fa1-h20-120` 完成 V7.1 全量验收：Raw 240 records 精确不变；MANO production 从 213/238 提升到 234/238，30 个 selected hand-frame 进入鲁棒门禁，26 个通过、4 个保留拒绝；实际 weighted-refit attempts 为 26 accepted/8 rejected/0 error。inlier P95 与 40 mm ceiling 通过，但 ordinary full P95 25.327 mm 仍未通过原 20 mm 总体门槛。Trace、238 行 FHP21、1,943 blobs 与 120 帧 H.264 overlay 全部验证通过。 |
