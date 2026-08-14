@@ -34,9 +34,9 @@ def build_pose_estimate(
 ) -> dict[str, Any]:
     """Create one complete pose estimate without inventing uncertainty.
 
-    The current triangulator and temporal baseline do not estimate metric covariance,
-    calibrated visibility, or calibrated confidence. Those dimensions are therefore
-    present but explicitly null, paired with ``covariance_status=NOT_ESTIMATED``.
+    Robust Raw fusion carries heuristic metric covariance, but the current temporal
+    baseline does not propagate it. Final covariance, calibrated visibility, and
+    calibrated confidence therefore remain explicitly unestimated.
     """
 
     points = temporal["landmarks_xyz_m"]
@@ -178,10 +178,65 @@ def _finite_tree(value: Any, label: str = "fhp21 record") -> None:
             _finite_tree(item, f"{label}[{index}]")
 
 
+def _minimum_symmetric_eigenvalue_3x3(matrix: list[list[float]]) -> float:
+    """Return the smallest eigenvalue of a finite symmetric 3x3 matrix."""
+
+    diagonal = (matrix[0][0], matrix[1][1], matrix[2][2])
+    off_diagonal_square = matrix[0][1] ** 2 + matrix[0][2] ** 2 + matrix[1][2] ** 2
+    if off_diagonal_square == 0.0:
+        return min(diagonal)
+    mean = sum(diagonal) / 3.0
+    spread_square = sum((value - mean) ** 2 for value in diagonal) + 2.0 * off_diagonal_square
+    spread = math.sqrt(spread_square / 6.0)
+    normalized = [
+        [(matrix[row][column] - (mean if row == column else 0.0)) / spread for column in range(3)]
+        for row in range(3)
+    ]
+    determinant = (
+        normalized[0][0]
+        * (normalized[1][1] * normalized[2][2] - normalized[1][2] * normalized[2][1])
+        - normalized[0][1]
+        * (normalized[1][0] * normalized[2][2] - normalized[1][2] * normalized[2][0])
+        + normalized[0][2]
+        * (normalized[1][0] * normalized[2][1] - normalized[1][1] * normalized[2][0])
+    )
+    angle = math.acos(max(-1.0, min(1.0, determinant / 2.0))) / 3.0
+    largest = mean + 2.0 * spread * math.cos(angle)
+    smallest = mean + 2.0 * spread * math.cos(angle + 2.0 * math.pi / 3.0)
+    middle = 3.0 * mean - largest - smallest
+    return min(smallest, middle, largest)
+
+
+def _validate_covariance_matrix_3x3(value: Any, label: str) -> None:
+    if not isinstance(value, list) or len(value) != 3:
+        raise WorkerError(f"{label} covariance must be 3x3")
+    covariance: list[list[float]] = []
+    for row in value:
+        if not isinstance(row, list) or len(row) != 3:
+            raise WorkerError(f"{label} covariance must be 3x3")
+        covariance.append([_finite_number(number, f"{label}.covariance_m2") for number in row])
+    scale = max(abs(number) for row in covariance for number in row)
+    symmetry_tolerance = scale * 1e-9
+    if any(
+        abs(covariance[row][column] - covariance[column][row]) > symmetry_tolerance
+        for row in range(3)
+        for column in range(row + 1, 3)
+    ):
+        raise WorkerError(f"{label} covariance must be symmetric")
+    if scale == 0.0:
+        return
+    normalized = [
+        [(covariance[row][column] + covariance[column][row]) / (2.0 * scale) for column in range(3)]
+        for row in range(3)
+    ]
+    if _minimum_symmetric_eigenvalue_3x3(normalized) < -1e-9:
+        raise WorkerError(f"{label} covariance must be positive semidefinite")
+
+
 def _validate_raw_observation(raw: Any, label: str) -> None:
     if not isinstance(raw, dict):
         raise WorkerError(f"{label} raw source observation is invalid")
-    required = {
+    legacy_required = {
         "coordinate_frame",
         "length_unit",
         "landmark_schema",
@@ -190,8 +245,23 @@ def _validate_raw_observation(raw: Any, label: str) -> None:
         "metrics",
         "valid_landmark_count",
     }
-    if set(raw) != required:
+    robust_fields = {
+        "fusion_method",
+        "covariance_m2",
+        "covariance_status",
+        "hand_validity",
+        "hand_reason",
+        "palm_support_count",
+        "minimum_palm_support",
+    }
+    fields = set(raw)
+    frozen_fields = frozenset(fields)
+    if frozen_fields not in {
+        frozenset(legacy_required),
+        frozenset(legacy_required | robust_fields),
+    }:
         raise WorkerError(f"{label} raw source observation fields are invalid")
+    robust = robust_fields.issubset(fields)
     if (
         raw["coordinate_frame"] != "rectified_left_camera"
         or raw["length_unit"] != "m"
@@ -202,7 +272,7 @@ def _validate_raw_observation(raw: Any, label: str) -> None:
     validity = _array21(raw["validity"], f"{label}.raw.validity")
     metrics = _array21(raw["metrics"], f"{label}.raw.metrics")
     valid_count = 0
-    metric_fields = {
+    legacy_metric_fields = {
         "joint_index",
         "epipolar_error_px",
         "left_score",
@@ -211,6 +281,16 @@ def _validate_raw_observation(raw: Any, label: str) -> None:
         "right_reprojection_error_px",
         "ray_angle_deg",
     }
+    robust_metric_fields = legacy_metric_fields | {
+        "left_depth_m",
+        "right_depth_m",
+        "support_view_count",
+        "covariance_status",
+    }
+    covariance = _array21(raw["covariance_m2"], f"{label}.raw.covariance_m2") if robust else None
+    covariance_status = (
+        _array21(raw["covariance_status"], f"{label}.raw.covariance_status") if robust else None
+    )
     for index, (point, flag, metric) in enumerate(zip(points, validity, metrics, strict=True)):
         item_label = f"{label}.raw.landmark[{index}]"
         if flag == "VALID":
@@ -221,13 +301,17 @@ def _validate_raw_observation(raw: Any, label: str) -> None:
             valid_count += 1
         elif point is not None or not isinstance(flag, str) or not flag:
             raise WorkerError(f"{item_label} invalid coordinate/reason is malformed")
-        if not isinstance(metric, dict) or set(metric) != metric_fields:
+        expected_metric_fields = robust_metric_fields if robust else legacy_metric_fields
+        if not isinstance(metric, dict) or set(metric) != expected_metric_fields:
             raise WorkerError(f"{item_label} metric fields are invalid")
         if metric["joint_index"] != index:
             raise WorkerError(f"{item_label} metric joint_index is invalid")
-        for field in ("epipolar_error_px", "left_score", "right_score"):
+        for field in ("left_score", "right_score"):
             if _finite_number(metric[field], f"{item_label}.{field}") < 0.0:
                 raise WorkerError(f"{item_label}.{field} cannot be negative")
+        epipolar = metric["epipolar_error_px"]
+        if epipolar is not None and _finite_number(epipolar, f"{item_label}.epipolar") < 0.0:
+            raise WorkerError(f"{item_label}.epipolar_error_px cannot be negative")
         if metric["left_score"] > 1.0 or metric["right_score"] > 1.0:
             raise WorkerError(f"{item_label} keypoint scores cannot exceed one")
         for field in (
@@ -238,9 +322,54 @@ def _validate_raw_observation(raw: Any, label: str) -> None:
             number = metric[field]
             if number is not None and _finite_number(number, f"{item_label}.{field}") < 0.0:
                 raise WorkerError(f"{item_label}.{field} cannot be negative")
+        if robust:
+            for field in ("left_depth_m", "right_depth_m"):
+                number = metric[field]
+                if number is not None:
+                    _finite_number(number, f"{item_label}.{field}")
+            support = _integer(
+                metric["support_view_count"],
+                f"{item_label}.support_view_count",
+            )
+            if support > 2:
+                raise WorkerError(f"{item_label}.support_view_count cannot exceed two")
+            if metric["covariance_status"] not in {
+                "HEURISTIC_UNCALIBRATED",
+                "NOT_AVAILABLE",
+            }:
+                raise WorkerError(f"{item_label}.metric covariance_status is invalid")
+            assert covariance is not None and covariance_status is not None
+            matrix = covariance[index]
+            status = covariance_status[index]
+            if flag == "VALID":
+                if status != "HEURISTIC_UNCALIBRATED":
+                    raise WorkerError(f"{item_label} valid covariance status is invalid")
+                _validate_covariance_matrix_3x3(matrix, item_label)
+            elif matrix is not None or status != "NOT_ESTIMATED":
+                raise WorkerError(f"{item_label} invalid point cannot claim covariance")
     _integer(raw["valid_landmark_count"], f"{label}.raw.valid_landmark_count")
     if raw["valid_landmark_count"] != valid_count:
         raise WorkerError(f"{label}.raw.valid_landmark_count is inconsistent")
+    if robust:
+        _text(raw["fusion_method"], f"{label}.raw.fusion_method")
+        if raw["hand_validity"] not in {"VALID", "INVALID"}:
+            raise WorkerError(f"{label}.raw.hand_validity is invalid")
+        hand_reason = raw["hand_reason"]
+        if raw["hand_validity"] == "VALID":
+            if hand_reason is not None:
+                raise WorkerError(f"{label}.raw valid hand cannot have a reason")
+        elif not isinstance(hand_reason, str) or not hand_reason:
+            raise WorkerError(f"{label}.raw invalid hand must have a reason")
+        palm_support = _integer(raw["palm_support_count"], f"{label}.raw.palm_support_count")
+        minimum_support = _integer(
+            raw["minimum_palm_support"],
+            f"{label}.raw.minimum_palm_support",
+            minimum=1,
+        )
+        if palm_support > 5 or minimum_support > 5:
+            raise WorkerError(f"{label}.raw palm support is invalid")
+        if (palm_support >= minimum_support) != (raw["hand_validity"] == "VALID"):
+            raise WorkerError(f"{label}.raw hand gate is inconsistent")
 
 
 def _validate_temporal_payload(temporal: Any, label: str) -> None:
@@ -494,13 +623,9 @@ def validate_pose_estimate(value: Any, *, line_number: int) -> dict[str, Any]:
             if status != "NOT_ESTIMATED":
                 raise WorkerError(f"{item_label} null covariance must be NOT_ESTIMATED")
         else:
-            if status != "ESTIMATED" or not isinstance(matrix, list) or len(matrix) != 3:
+            if status != "ESTIMATED":
                 raise WorkerError(f"{item_label}.covariance_m2 is invalid")
-            for row in matrix:
-                if not isinstance(row, list) or len(row) != 3:
-                    raise WorkerError(f"{item_label}.covariance_m2 must be 3x3")
-                for number in row:
-                    _finite_number(number, f"{item_label}.covariance_m2")
+            _validate_covariance_matrix_3x3(matrix, item_label)
         for field_name, probability in (
             ("visibility_probability", visibility[index]),
             ("confidence_probability", confidence[index]),

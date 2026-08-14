@@ -855,7 +855,7 @@ def test_active_run_is_never_frozen_in_the_completed_index(tmp_path: Path) -> No
     assert catalog.list_frames(run_key)["total"] == 2
 
 
-def test_completed_canonical_run_performs_full_validation_once_per_fingerprint(
+def test_completed_canonical_run_performs_full_validation_once_within_ttl(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -892,6 +892,62 @@ def test_completed_canonical_run_performs_full_validation_once_per_fingerprint(
     assert catalog.get_run(run_key)["validation"]["ok"] is True
 
     assert validation_modes == [False, True]
+
+
+def test_completed_run_detail_reuses_blob_validation_only_within_the_short_ttl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "validated-blob-snapshot"
+    writer = RunArtifactWriter.create(
+        run,
+        run_id="validated-blob-snapshot",
+        pipeline_version="test",
+    )
+    blob = writer.put_blob(
+        b"immutable artifact",
+        role="source_left",
+        media_type="application/octet-stream",
+        suffix=".bin",
+    )
+    writer.append(
+        record_id="decode:0",
+        stage=TraceStage.DECODE,
+        status=TraceStatus.SUCCEEDED,
+        event="decoded",
+        payload={"frame_id": "frame/000000", "frame_index": 0},
+        blobs=(blob,),
+    )
+    writer.finalize(status=RunStatus.COMPLETED)
+    artifact_path = (run / blob.relative_path).resolve()
+    artifact_stats = 0
+    original_stat = Path.stat
+
+    def counted_stat(path: Path, *args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        nonlocal artifact_stats
+        if path == artifact_path:
+            artifact_stats += 1
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", counted_stat)
+    current_time = 100.0
+
+    def clock() -> float:
+        return current_time
+
+    catalog = TraceCatalog(tmp_path, validation_cache_ttl_seconds=1.0, clock=clock)
+    run_key = catalog.list_runs()["items"][0]["run_key"]
+
+    assert catalog.get_run(run_key)["validation"]["ok"] is True
+    first_request_stats = artifact_stats
+    assert first_request_stats > 0
+
+    assert catalog.get_run(run_key)["validation"]["ok"] is True
+    assert artifact_stats == first_request_stats
+
+    current_time = 101.0
+    assert catalog.get_run(run_key)["validation"]["ok"] is True
+    assert artifact_stats > first_request_stats
 
 
 def test_artifact_hash_result_is_reused_until_the_file_stat_changes(
@@ -941,7 +997,7 @@ def test_artifact_hash_result_is_reused_until_the_file_stat_changes(
         catalog.resolve_artifact(run_key, relative_path)
 
 
-def test_full_validation_cache_is_invalidated_when_a_referenced_blob_changes(
+def test_completed_run_detects_unrequested_blob_tamper_after_validation_ttl(
     tmp_path: Path,
 ) -> None:
     run = tmp_path / "validated-blob"
@@ -965,7 +1021,96 @@ def test_full_validation_cache_is_invalidated_when_a_referenced_blob_changes(
         blobs=(blob,),
     )
     writer.finalize(status=RunStatus.COMPLETED)
-    catalog = TraceCatalog(tmp_path)
+    current_time = 100.0
+
+    def clock() -> float:
+        return current_time
+
+    catalog = TraceCatalog(tmp_path, validation_cache_ttl_seconds=1.0, clock=clock)
+    run_key = catalog.list_runs()["items"][0]["run_key"]
+
+    assert catalog.get_run(run_key)["validation"]["ok"] is True
+
+    (run / blob.relative_path).write_bytes(b"tampered artifact")
+
+    assert catalog.get_run(run_key)["validation"]["ok"] is True
+
+    current_time = 101.0
+    validation = catalog.get_run(run_key)["validation"]
+    assert validation["ok"] is False
+    assert validation["mode"] == "CANONICAL_V1"
+
+
+def test_artifact_integrity_failure_invalidates_completed_run_validation_within_ttl(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "artifact-read-invalidates"
+    writer = RunArtifactWriter.create(
+        run,
+        run_id="artifact-read-invalidates",
+        pipeline_version="test",
+    )
+    blob = writer.put_blob(
+        b"trusted artifact",
+        role="source_left",
+        media_type="application/octet-stream",
+        suffix=".bin",
+    )
+    writer.append(
+        record_id="decode:0",
+        stage=TraceStage.DECODE,
+        status=TraceStatus.SUCCEEDED,
+        event="decoded",
+        payload={"frame_id": "frame/000000", "frame_index": 0},
+        blobs=(blob,),
+    )
+    writer.finalize(status=RunStatus.COMPLETED)
+    catalog = TraceCatalog(
+        tmp_path,
+        validation_cache_ttl_seconds=1.0,
+        clock=lambda: 100.0,
+    )
+    run_key = catalog.list_runs()["items"][0]["run_key"]
+
+    assert catalog.get_run(run_key)["validation"]["ok"] is True
+
+    (run / blob.relative_path).write_bytes(b"tampered artifact")
+
+    with pytest.raises(ArtifactIntegrityError):
+        catalog.resolve_artifact(run_key, blob.relative_path)
+    validation = catalog.get_run(run_key)["validation"]
+    assert validation["ok"] is False
+    assert validation["mode"] == "CANONICAL_V1"
+
+
+def test_active_run_revalidates_referenced_blobs_without_waiting_for_the_ttl(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "active-blob"
+    writer = RunArtifactWriter.create(
+        run,
+        run_id="active-blob",
+        pipeline_version="test",
+    )
+    blob = writer.put_blob(
+        b"trusted artifact",
+        role="source_left",
+        media_type="application/octet-stream",
+        suffix=".bin",
+    )
+    writer.append(
+        record_id="decode:0",
+        stage=TraceStage.DECODE,
+        status=TraceStatus.SUCCEEDED,
+        event="decoded",
+        payload={"frame_id": "frame/000000", "frame_index": 0},
+        blobs=(blob,),
+    )
+    catalog = TraceCatalog(
+        tmp_path,
+        validation_cache_ttl_seconds=1.0,
+        clock=lambda: 100.0,
+    )
     run_key = catalog.list_runs()["items"][0]["run_key"]
 
     assert catalog.get_run(run_key)["validation"]["ok"] is True

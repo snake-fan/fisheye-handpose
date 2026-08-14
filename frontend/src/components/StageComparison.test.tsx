@@ -1,4 +1,5 @@
 import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { expect, test } from "vitest";
 
 import type { TraceRecord } from "../api/types";
@@ -152,6 +153,7 @@ test("RTMPose comparison keeps every hand visible and only highlights the select
   );
 
   const left = screen.getByRole("region", { name: "左目 HAND_POSE_2D" });
+  expect(screen.queryByRole("region", { name: "Virtual crop RTMPose diagnostics" })).not.toBeInTheDocument();
   expect(within(left).getByRole("img", { name: "左目 RTMPose 全手叠加" })).toBeVisible();
   expect(within(left).getByText("track-0000")).toHaveAttribute("aria-current", "false");
   expect(within(left).getByText("track-0001")).toHaveAttribute("aria-current", "false");
@@ -169,6 +171,152 @@ test("RTMPose comparison keeps every hand visible and only highlights the select
   expect(within(left).getByText("track-0000")).toHaveAttribute("aria-current", "false");
   expect(within(left).getByLabelText("track-0000 2D 骨架")).toHaveAttribute("stroke", "#75f6c4");
   expect(within(left).getByLabelText("track-0001 2D 骨架")).toHaveAttribute("stroke", "#ffb454");
+});
+
+test("virtual-crop RTMPose diagnostics lazily load only the selected candidate evidence", async () => {
+  const user = userEvent.setup();
+  const cropPoints = (offset: number) => Array.from(
+    { length: 21 },
+    (_, index) => [offset + index, 20 + index],
+  );
+  const nativePoints = (offset: number) => Array.from(
+    { length: 21 },
+    (_, index) => [offset + index, 120 + index],
+  );
+  const virtualCamera = {
+    virtual_camera_id: "sha256:camera-left-0",
+    crop_policy_id: "virtual-perspective-kb4/v1",
+    side: "left",
+    source_bbox_xyxy: [90, 100, 210, 240],
+    output_size: [256, 256],
+    K_virtual: [[256, 0, 127.5], [0, 256, 127.5], [0, 0, 1]],
+    valid_fraction: 0.9375,
+  };
+  const records: TraceRecord[] = [
+    {
+      record_id: "sync",
+      stage: "SYNCHRONIZATION",
+      blobs: [
+        { role: "source_left", relative_path: "source-left.jpg" },
+        { role: "source_right", relative_path: "source-right.jpg" },
+      ],
+      payload: { frame_id: "frame/1" },
+    },
+    {
+      record_id: "crop-left-0",
+      stage: "POSE_2D",
+      event: "virtual_crop_pose_inferred",
+      status: "SUCCEEDED",
+      blobs: [
+        { role: "virtual_crop", relative_path: "left-0-crop.jpg" },
+        { role: "virtual_crop_valid_mask", relative_path: "left-0-mask.png" },
+      ],
+      payload: {
+        view_id: "left",
+        image_width: 640,
+        image_height: 480,
+        candidate_id: "left-0",
+        output_status: "PRODUCED",
+        reason: null,
+        model_input_space: "virtual_pinhole",
+        virtual_camera: virtualCamera,
+        keypoints_uv_crop: cropPoints(10),
+        keypoints_uv_native: nativePoints(110),
+      },
+    },
+    {
+      record_id: "crop-left-1",
+      stage: "POSE_2D",
+      event: "virtual_crop_pose_not_produced",
+      status: "WARNING",
+      blobs: [
+        { role: "virtual_crop", relative_path: "left-1-crop.jpg" },
+        { role: "virtual_crop_valid_mask", relative_path: "left-1-mask.png" },
+      ],
+      payload: {
+        view_id: "left",
+        image_width: 640,
+        image_height: 480,
+        candidate_id: "left-1",
+        output_status: "NOT_PRODUCED",
+        reason: "CROP_VALID_FRACTION_BELOW_THRESHOLD",
+        model_input_space: "virtual_pinhole",
+        virtual_camera: { ...virtualCamera, virtual_camera_id: "sha256:camera-left-1", valid_fraction: 0.42 },
+      },
+    },
+    {
+      record_id: "crop-right-0",
+      stage: "POSE_2D",
+      event: "virtual_crop_pose_inferred",
+      status: "SUCCEEDED",
+      blobs: [{ role: "virtual_crop", relative_path: "right-0-crop.jpg" }],
+      payload: {
+        view_id: "right",
+        image_width: 640,
+        image_height: 480,
+        candidate_id: "right-0",
+        output_status: "PRODUCED",
+        reason: null,
+        model_input_space: "virtual_pinhole",
+        virtual_camera: { ...virtualCamera, virtual_camera_id: "sha256:camera-right-0", side: "right" },
+        keypoints_uv_crop: cropPoints(30),
+        keypoints_uv_native: nativePoints(330),
+      },
+    },
+  ];
+
+  const { container } = render(
+    <StageComparison
+      runKey="virtual-run"
+      records={records}
+      selectedNodeId="HAND_POSE_2D"
+      selectedTrack=""
+    />,
+  );
+
+  expect(screen.getByText("VIRTUAL PERSPECTIVE CROP DIAGNOSTICS")).toBeVisible();
+  const left0 = screen.getByRole("article", { name: "left-0 virtual crop diagnostic" });
+  const left1 = screen.getByRole("article", { name: "left-1 virtual crop diagnostic" });
+  expect(left0).toBeVisible();
+  expect(left1).toBeVisible();
+  expect(screen.getByRole("article", { name: "right-0 virtual crop diagnostic" })).toBeVisible();
+
+  expect(screen.queryByRole("img", { name: "left-0 virtual crop" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("img", { name: "left-1 virtual crop" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("img", { name: "right-0 virtual crop" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("img", { name: /valid mask/ })).not.toBeInTheDocument();
+
+  await user.click(within(left0).getByRole("button", { name: "展开 left-0 图像证据" }));
+  expect(screen.getByRole("img", { name: "left-0 virtual crop" })).toHaveAttribute(
+    "src",
+    expect.stringContaining("/api/v1/runs/virtual-run/artifacts/left-0-crop.jpg"),
+  );
+  expect(screen.getByRole("img", { name: "left-0 native fisheye source" })).toHaveAttribute(
+    "src",
+    expect.stringContaining("/api/v1/runs/virtual-run/artifacts/source-left.jpg"),
+  );
+  expect(screen.getByRole("img", { name: "left-0 valid mask" })).toBeVisible();
+  expect(screen.queryByRole("img", { name: "left-1 virtual crop" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("img", { name: "right-0 virtual crop" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("img", { name: "right-0 valid mask" })).not.toBeInTheDocument();
+  expect(screen.getByRole("img", { name: "left-0 crop-space keypoints" })).toHaveAttribute("viewBox", "0 0 256 256");
+  expect(screen.getByRole("img", { name: "left-0 native-space keypoints" })).toHaveAttribute("viewBox", "0 0 640 480");
+  expect(container.querySelector('[aria-label="left-0 crop-space keypoints"] circle[cx="10"]')).toBeInTheDocument();
+  expect(container.querySelector('[aria-label="left-0 native-space keypoints"] circle[cx="110"]')).toBeInTheDocument();
+  expect(screen.getAllByText("virtual-perspective-kb4/v1")).toHaveLength(3);
+  expect(screen.getAllByText("FOV 53.1° × 53.1°")).toHaveLength(3);
+  expect(within(left0).getByText("VALID 93.8%")).toBeVisible();
+  expect(within(left1).getByText("CROP_VALID_FRACTION_BELOW_THRESHOLD")).toBeVisible();
+
+  await user.click(screen.getByRole("button", { name: "展开 right-0 图像证据" }));
+  expect(screen.queryByRole("img", { name: "left-0 virtual crop" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("img", { name: "left-0 native fisheye source" })).not.toBeInTheDocument();
+  expect(screen.getByRole("img", { name: "right-0 virtual crop" })).toBeVisible();
+  expect(screen.getByRole("img", { name: "right-0 native fisheye source" })).toHaveAttribute(
+    "src",
+    expect.stringContaining("/api/v1/runs/virtual-run/artifacts/source-right.jpg"),
+  );
+  expect(screen.queryByRole("img", { name: /valid mask/ })).not.toBeInTheDocument();
 });
 
 test("raw 3D projection on a rectified background never falls back to native keypoints", () => {
@@ -264,6 +412,123 @@ test("hand detection compares the source image with every detected bounding box"
   expect(within(left).getByLabelText("left-0 detection")).toBeInTheDocument();
   expect(within(left).getByLabelText("left-1 detection")).toBeInTheDocument();
   expect(within(left).getByText("2 HAND CANDIDATES")).toBeVisible();
+  expect(screen.queryByText("RAW DETECTOR PROPOSALS → BOUNDED ASSOCIATION POOL")).not.toBeInTheDocument();
+});
+
+test("candidate-aware detection audits every raw proposal before the bounded association pool", () => {
+  const decision = (
+    candidateId: string,
+    sourceIndex: number,
+    score: number,
+    classification: "SEED" | "RECOVERY" | "REJECTED",
+    reason: string,
+    eligible: boolean,
+  ) => ({
+    candidate_id: candidateId,
+    source_index: sourceIndex,
+    bbox_xyxy: [10 + sourceIndex * 40, 20, 42 + sourceIndex * 40, 100],
+    score,
+    bbox_score: score,
+    label: sourceIndex === 3 ? 1 : 0,
+    classification,
+    reason,
+    eligible_for_association: eligible,
+    final_selection: null,
+  });
+  const seed = decision(
+    "left-det-0000",
+    0,
+    0.91,
+    "SEED",
+    "SCORE_MEETS_SEED_THRESHOLD",
+    true,
+  );
+  const recovery = decision(
+    "left-det-0001",
+    1,
+    0.24,
+    "RECOVERY",
+    "SCORE_MEETS_RECOVERY_THRESHOLD",
+    true,
+  );
+  const belowThreshold = decision(
+    "left-det-0002",
+    2,
+    0.12,
+    "REJECTED",
+    "SCORE_BELOW_RECOVERY_THRESHOLD",
+    false,
+  );
+  const wrongCategory = decision(
+    "left-det-0003",
+    3,
+    0.83,
+    "REJECTED",
+    "CATEGORY_MISMATCH",
+    false,
+  );
+  const records: TraceRecord[] = [
+    {
+      record_id: "sync",
+      stage: "SYNCHRONIZATION",
+      blobs: [
+        { role: "source_left", relative_path: "source-left.jpg" },
+        { role: "source_right", relative_path: "source-right.jpg" },
+      ],
+      payload: { frame_id: "frame/1" },
+    },
+    {
+      record_id: "detection-left",
+      stage: "DETECTION",
+      event: "hand_candidates_detected",
+      status: "SUCCEEDED",
+      payload: {
+        frame_id: "frame/1",
+        view_id: "left",
+        image_width: 320,
+        image_height: 240,
+        output_status: "PRODUCED",
+        candidate_decisions: [seed, recovery, belowThreshold, wrongCategory],
+        candidate_pool: [seed, recovery],
+        detections: [seed, recovery],
+      },
+    },
+  ];
+
+  render(
+    <StageComparison
+      runKey="candidate-run"
+      records={records}
+      selectedNodeId="HAND_DETECTION"
+      selectedTrack=""
+    />,
+  );
+
+  expect(screen.getByText("RAW DETECTOR PROPOSALS → BOUNDED ASSOCIATION POOL")).toBeVisible();
+  const left = screen.getByRole("region", { name: "左目 HAND_DETECTION" });
+  expect(within(left).getByText("4 RAW → 2 POOL")).toBeVisible();
+  expect(within(left).getByRole("img", { name: "左目 raw detector proposals" })).toBeVisible();
+  expect(within(left).getByRole("img", { name: "左目 bounded association pool" })).toBeVisible();
+  expect(within(left).getByLabelText("left-det-0002 REJECTED raw proposal")).toBeInTheDocument();
+  expect(within(left).queryByLabelText("left-det-0002 REJECTED pool candidate")).not.toBeInTheDocument();
+
+  const seedRow = within(left).getByRole("listitem", { name: "left-det-0000 candidate decision" });
+  const recoveryRow = within(left).getByRole("listitem", { name: "left-det-0001 candidate decision" });
+  const belowRow = within(left).getByRole("listitem", { name: "left-det-0002 candidate decision" });
+  const categoryRow = within(left).getByRole("listitem", { name: "left-det-0003 candidate decision" });
+  expect(seedRow).toHaveAttribute("data-classification", "SEED");
+  expect(seedRow).toHaveAttribute("data-in-pool", "true");
+  expect(within(seedRow).getByText("SCORE 91.0%")).toBeVisible();
+  expect(within(seedRow).getByText("SOURCE #0")).toBeVisible();
+  expect(within(seedRow).getByText("ELIGIBLE YES")).toBeVisible();
+  expect(within(seedRow).getByText("SCORE_MEETS_SEED_THRESHOLD")).toBeVisible();
+  expect(recoveryRow).toHaveAttribute("data-classification", "RECOVERY");
+  expect(within(recoveryRow).getByText("SCORE 24.0%")).toBeVisible();
+  expect(belowRow).toHaveAttribute("data-classification", "REJECTED");
+  expect(belowRow).toHaveAttribute("data-in-pool", "false");
+  expect(within(belowRow).getByText("ELIGIBLE NO")).toBeVisible();
+  expect(within(belowRow).getByText("SCORE_BELOW_RECOVERY_THRESHOLD")).toBeVisible();
+  expect(within(categoryRow).getByText("CATEGORY_MISMATCH")).toBeVisible();
 });
 
 test("association uses rectified candidate coordinates and exposes matches and tracks", () => {
@@ -399,6 +664,144 @@ test("association keeps candidate identity when tracked pose records coexist wit
   expect(screen.getByLabelText("right-0 candidate keypoints")).toBeInTheDocument();
   expect(screen.getAllByLabelText(/track-0000 association/)).toHaveLength(2);
   expect(screen.queryByText("track-0000 · UNMATCHED")).not.toBeInTheDocument();
+});
+
+test("mixed-hand raw-gate rejection stays untracked and exposes its downstream failure chain", () => {
+  const rectified = (offset: number) => Array.from(
+    { length: 21 },
+    (_, index) => [offset + index, 50 + index],
+  );
+  const projected = (offset: number) => ({
+    left: rectified(offset),
+    right: rectified(offset - 8),
+  });
+  const records: TraceRecord[] = [
+    {
+      record_id: "rectification",
+      stage: "RECTIFICATION",
+      blobs: [
+        { role: "rectified_left", relative_path: "rectified-left.jpg" },
+        { role: "rectified_right", relative_path: "rectified-right.jpg" },
+      ],
+      payload: { output_width: 320, output_height: 240 },
+    },
+    ...(["left", "right"] as const).map((view) => ({
+      record_id: `pose-${view}`,
+      stage: "POSE_2D",
+      payload: {
+        view_id: view,
+        instances: [
+          { candidate_id: `${view}-0`, keypoints_uv_rectified: rectified(20) },
+          { candidate_id: `${view}-1`, keypoints_uv_rectified: rectified(140) },
+        ],
+      },
+    })),
+    {
+      record_id: "association",
+      stage: "CROSS_VIEW_ASSOCIATION",
+      payload: {
+        matches: [
+          { match_id: "match-0", left_candidate_id: "left-0", right_candidate_id: "right-0" },
+          { match_id: "match-1", left_candidate_id: "left-1", right_candidate_id: "right-1" },
+        ],
+      },
+    },
+    {
+      record_id: "tracking",
+      stage: "CROSS_VIEW_ASSOCIATION",
+      payload: { assignments: [{ observation_id: "frame:match-0", track_id: "track-0000" }] },
+    },
+    {
+      record_id: "raw-produced",
+      stage: "RAW_FUSION",
+      status: "SUCCEEDED",
+      payload: {
+        track_id: "track-0000",
+        output_status: "PRODUCED",
+        projected_keypoints_space: "rectified",
+        projected_keypoints_uv: projected(24),
+      },
+    },
+    {
+      record_id: "raw-rejected",
+      stage: "RAW_FUSION",
+      event: "raw_hand_gate_not_produced",
+      status: "WARNING",
+      payload: {
+        track_id: null,
+        observation_id: "frame:match-1",
+        output_status: "NOT_PRODUCED",
+        hand_validity: "INVALID",
+        hand_reason: "INSUFFICIENT_PALM_SUPPORT",
+        match: { match_id: "match-1", left_candidate_id: "left-1", right_candidate_id: "right-1" },
+      },
+    },
+    {
+      record_id: "mano-rejected",
+      stage: "KINEMATIC_REFINEMENT",
+      status: "WARNING",
+      payload: { track_id: null, output_status: "NOT_PRODUCED", reason: "RAW_HAND_GATE_REJECTED" },
+    },
+    {
+      record_id: "temporal-produced",
+      stage: "TEMPORAL_REFINEMENT",
+      status: "SUCCEEDED",
+      payload: {
+        track_id: "track-0000",
+        input_stage: "RAW_FUSION",
+        output_status: "PRODUCED",
+        projected_keypoints_space: "rectified",
+        projected_keypoints_uv: projected(30),
+      },
+    },
+    {
+      record_id: "temporal-rejected",
+      stage: "TEMPORAL_REFINEMENT",
+      status: "WARNING",
+      payload: { track_id: null, output_status: "NOT_PRODUCED", reason: "RAW_HAND_GATE_REJECTED" },
+    },
+  ];
+
+  const { rerender } = render(
+    <StageComparison
+      runKey="mixed-gate-run"
+      records={records}
+      selectedNodeId="CROSS_VIEW_ASSOCIATION"
+      selectedTrack=""
+    />,
+  );
+
+  expect(screen.getByText("match-0 → track-0000")).toBeVisible();
+  expect(screen.getByText("match-1 · MATCHED · UNTRACKED")).toBeVisible();
+  expect(screen.queryByText("match-1 → match-1")).not.toBeInTheDocument();
+  expect(screen.getAllByLabelText(/match-1 · UNTRACKED association/)).toHaveLength(2);
+
+  rerender(
+    <StageComparison
+      runKey="mixed-gate-run"
+      records={records}
+      selectedNodeId="STEREO_TRIANGULATION_RAW_3D"
+      selectedTrack=""
+    />,
+  );
+
+  expect(screen.getAllByLabelText(/track-0000 ASSOCIATION/)).toHaveLength(2);
+  expect(screen.queryByLabelText(/match-1.*ASSOCIATION/)).not.toBeInTheDocument();
+  expect(screen.getByText("NO_TRACK · NOT_PRODUCED · INSUFFICIENT_PALM_SUPPORT")).toBeVisible();
+  expect(screen.getByText("DOWNSTREAM · NOT_PRODUCED · RAW_HAND_GATE_REJECTED")).toBeVisible();
+
+  rerender(
+    <StageComparison
+      runKey="mixed-gate-run"
+      records={records}
+      selectedNodeId="TEMPORAL_REFINEMENT"
+      selectedTrack=""
+    />,
+  );
+
+  expect(screen.getByText("track-0000 · RAW_FUSION → TEMPORAL_REFINEMENT · RAW → EMA")).toBeVisible();
+  expect(screen.queryByText(/NO_TRACK · UNKNOWN_INPUT/)).not.toBeInTheDocument();
+  expect(screen.getByText("NO_TRACK · NOT_PRODUCED · RAW_HAND_GATE_REJECTED")).toBeVisible();
 });
 
 test("MANO compares raw projections and reports a per-track fitting failure without inventing output", () => {

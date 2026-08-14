@@ -124,6 +124,52 @@ def test_artifact_endpoint_supports_single_byte_ranges(tmp_path: Path) -> None:
     assert unsatisfiable.headers["content-range"] == "bytes */10"
 
 
+def test_verified_content_addressed_artifacts_are_immutable_for_get_head_and_ranges(
+    tmp_path: Path,
+) -> None:
+    _, relative_path, _ = _catalog_fixture(tmp_path)
+    client = TestClient(create_app(tmp_path))
+    run_key = client.get("/api/v1/runs").json()["items"][0]["run_key"]
+    url = f"/api/v1/runs/{run_key}/artifacts/{relative_path}"
+    expected = "private, max-age=31536000, immutable"
+
+    responses = (
+        client.get(url),
+        client.head(url),
+        client.get(url, headers={"Range": "bytes=2-5"}),
+        client.head(url, headers={"Range": "bytes=2-5"}),
+        client.get(url, headers={"Range": "bytes=90-99"}),
+    )
+
+    assert [response.status_code for response in responses] == [200, 200, 206, 206, 416]
+    assert all(response.headers["cache-control"] == expected for response in responses)
+
+
+def test_verified_non_content_addressed_artifacts_remain_no_store(tmp_path: Path) -> None:
+    run, old_relative_path, _ = _catalog_fixture(tmp_path)
+    relative_path = "previews/source-left.bin"
+    artifact = run / relative_path
+    artifact.parent.mkdir(parents=True)
+    (run / old_relative_path).rename(artifact)
+    record = json.loads((run / "trace.jsonl").read_text(encoding="utf-8"))
+    record["blobs"][0]["relative_path"] = relative_path
+    (run / "trace.jsonl").write_text(json.dumps(record) + "\n", encoding="utf-8")
+    client = TestClient(create_app(tmp_path))
+    run_key = client.get("/api/v1/runs").json()["items"][0]["run_key"]
+    url = f"/api/v1/runs/{run_key}/artifacts/{relative_path}"
+
+    responses = (
+        client.get(url),
+        client.head(url),
+        client.get(url, headers={"Range": "bytes=2-5"}),
+        client.head(url, headers={"Range": "bytes=2-5"}),
+        client.get(url, headers={"Range": "bytes=90-99"}),
+    )
+
+    assert [response.status_code for response in responses] == [200, 200, 206, 206, 416]
+    assert all(response.headers["cache-control"] == "no-store" for response in responses)
+
+
 def test_api_is_read_only_and_uses_structured_not_found_errors(tmp_path: Path) -> None:
     _catalog_fixture(tmp_path)
     client = TestClient(create_app(tmp_path))

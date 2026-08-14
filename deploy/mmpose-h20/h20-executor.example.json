@@ -13,6 +13,14 @@
       "max_reprojection_error_px": 3.0,
       "min_ray_angle_deg": 0.5
     },
+    "perception": {
+      "pose_input": "virtual_perspective_kb4_v1",
+      "crop_output_size": [256, 256],
+      "crop_bbox_scale": 1.5,
+      "crop_min_valid_fraction": 0.5,
+      "recovery_bbox_score": 0.2,
+      "max_candidates_per_view": 4
+    },
     "models": {
       "manifest": "/mnt/workspace/zyf/fisheye/fisheye-handpose/deploy/mmpose-h20/model-assets.json",
       "model_dir": "/mnt/workspace/zyf/fisheye/fisheye-handpose/models/openmmlab",
@@ -36,7 +44,7 @@
       "manifest": "/mnt/workspace/zyf/.private/fisheye-handpose/mano-assets.json",
       "min_valid_landmarks": 15,
       "max_fit_rmse_m": 0.02,
-      "iterations": 40,
+      "iterations": 200,
       "learning_rate": 0.03
     },
     "temporal": {

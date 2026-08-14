@@ -61,6 +61,23 @@ All write methods under `/api/v1` return `405`. Artifact paths must be reference
 remain within that run directory after symlink resolution, and match the recorded SHA-256 and
 byte count before any bytes are served.
 
+Verified content-addressed artifacts whose path is
+`blobs/sha256/<prefix>/<sha256>.<suffix>` are returned with
+`Cache-Control: private, max-age=31536000, immutable` for full, byte-range, and `HEAD`
+responses. Their URL identifies the verified bytes, so the browser can reuse frame, crop, mask,
+and video content without downloading it again when the viewer changes stages. Referenced files
+outside that content-addressed layout remain `no-store`.
+
+For a finalized canonical run, the detail endpoint reuses a completed integrity-validation
+snapshot for at most one second. This bounds repeated viewer requests to one blob scan per short
+interaction while retaining periodic tamper detection: once the TTL expires, the next detail
+request validates every referenced blob again. ACTIVE runs are never covered by this cache. The
+artifact endpoint independently stats the file before serving and verifies its SHA-256 whenever
+that fingerprint is new or changed. If it detects a missing or changed artifact, it rejects the
+request and immediately invalidates the run's validation snapshot. Consequently, `validation`
+describes a check performed no more than one second before the detail response, rather than a
+filesystem lock or an indefinite seal.
+
 `run_id` is only unique inside one data item, so it is display metadata rather than an API key.
 The catalog returns a stable opaque `run_key` (the first 16 hexadecimal characters of the
 SHA-256 of the run's catalog-relative path) together with `item_id` and `run_id`. Every scoped

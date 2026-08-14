@@ -40,16 +40,23 @@ interface PipelineNodeRailProps {
   onSelect: (nodeId: PipelineNodeId) => void;
 }
 
-function outputProduced(record: TraceRecord): boolean {
+type PipelineNodeStatus = "PRODUCED" | "PARTIAL" | "NOT_PRODUCED";
+
+function outputState(record: TraceRecord): Exclude<PipelineNodeStatus, "PARTIAL"> | null {
   const payload = payloadOf(record);
-  if (payload.output_status === "NOT_PRODUCED") return false;
-  if (payload.output_status === "PRODUCED") return true;
-  return record.status === "SUCCEEDED";
+  if (payload.output_status === "NOT_PRODUCED") return "NOT_PRODUCED";
+  if (payload.output_status === "PRODUCED") return "PRODUCED";
+  if (record.status === "SUCCEEDED") return "PRODUCED";
+  if (record.status === "FAILED" || record.status === "SKIPPED" || record.event?.includes("not_produced")) {
+    return "NOT_PRODUCED";
+  }
+  return null;
 }
 
 function recordReason(record: TraceRecord): string {
   const payload = payloadOf(record);
   if (typeof payload.reason === "string" && payload.reason) return payload.reason;
+  if (typeof payload.hand_reason === "string" && payload.hand_reason) return payload.hand_reason;
   const selection = payload.selection;
   if (selection && typeof selection === "object") {
     const decision = (selection as Record<string, unknown>).decision;
@@ -62,12 +69,20 @@ function nodeState(definition: PipelineNodeDefinition, records: TraceRecord[]) {
   if (definition.roles) {
     const roles = new Set(records.flatMap(artifactsOf).map((artifact) => String(artifact.role ?? "")));
     const produced = definition.roles.every((role) => roles.has(role));
-    return { produced, reason: produced ? "" : definition.missing };
+    return {
+      status: (produced ? "PRODUCED" : "NOT_PRODUCED") as PipelineNodeStatus,
+      reason: produced ? "" : definition.missing,
+    };
   }
   const matching = records.filter((record) => record.stage === definition.stage);
-  const produced = matching.some(outputProduced);
-  const reason = matching.map(recordReason).find(Boolean) ?? definition.missing;
-  return { produced, reason: produced ? "" : reason };
+  const produced = matching.filter((record) => outputState(record) === "PRODUCED");
+  const notProduced = matching.filter((record) => outputState(record) === "NOT_PRODUCED");
+  const status: PipelineNodeStatus = produced.length
+    ? notProduced.length ? "PARTIAL" : "PRODUCED"
+    : "NOT_PRODUCED";
+  const reason = notProduced.map(recordReason).find(Boolean)
+    ?? (status === "PARTIAL" ? "部分手未产出" : definition.missing);
+  return { status, reason: status === "PRODUCED" ? "" : reason };
 }
 
 export function PipelineNodeRail({ records, selectedNodeId, onSelect }: PipelineNodeRailProps) {
@@ -75,19 +90,20 @@ export function PipelineNodeRail({ records, selectedNodeId, onSelect }: Pipeline
     <nav className="pipeline-node-rail" aria-label="Pipeline 节点">
       {PIPELINE_NODES.map((definition, index) => {
         const state = nodeState(definition, records);
+        const statusClass = state.status.toLowerCase().replace("_", "-");
         return (
           <button
             key={definition.id}
             type="button"
             data-node-id={definition.id}
-            className={`${state.produced ? "produced" : "not-produced"} ${selectedNodeId === definition.id ? "selected" : ""}`}
+            className={`${statusClass} ${selectedNodeId === definition.id ? "selected" : ""}`}
             aria-pressed={selectedNodeId === definition.id}
             onClick={() => onSelect(definition.id)}
           >
             <span className="pipeline-node-index">{String(index + 1).padStart(2, "0")}</span>
             <strong>{definition.label}</strong>
-            <span className="pipeline-node-status">{state.produced ? "PRODUCED" : "NOT_PRODUCED"}</span>
-            {!state.produced && <small>{state.reason}</small>}
+            <span className="pipeline-node-status">{state.status}</span>
+            {state.status !== "PRODUCED" && <small>{state.reason}</small>}
           </button>
         );
       })}

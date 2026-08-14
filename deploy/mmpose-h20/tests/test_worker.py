@@ -23,8 +23,10 @@ from fisheye_h20_worker.calibration import (  # noqa: E402
     load_rectified_stereo,
     project_rectified_keypoints,
 )
+from fisheye_h20_worker.candidates import CandidatePolicy  # noqa: E402
 from fisheye_h20_worker.cli import main as worker_main  # noqa: E402
 from fisheye_h20_worker.contracts import WorkerError, load_request  # noqa: E402
+from fisheye_h20_worker.geometry import associate  # noqa: E402
 from fisheye_h20_worker.mano import MANO_FHP21_MAPPING_ID, map_mano_to_fhp21  # noqa: E402
 from fisheye_h20_worker.runner import run_worker  # noqa: E402
 from fisheye_h20_worker.runtime import OpenMMLabRuntime  # noqa: E402
@@ -305,6 +307,122 @@ class MovingHandRuntime(FakeRuntime):
         return instances
 
 
+class MissingMiddleFrameRuntime(FakeRuntime):
+    def infer(self, models: object, frame: dict[str, Any], **kwargs: Any):
+        if frame["index"] == 1:
+            return []
+        return super().infer(models, frame, **kwargs)
+
+
+class VirtualPoseRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.detect_calls = 0
+        self.pose_calls = 0
+
+    def iter_video_frames(self, path: Path):
+        import numpy as np
+
+        side_value = 40 if "_left_" in path.name else 80
+        for _ in range(4):
+            yield np.full((480, 640, 3), side_value, dtype=np.uint8)
+
+    def detect(self, models: object, frame: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        del models, kwargs
+        self.detect_calls += 1
+        shift = 0.0 if float(frame.mean()) < 60.0 else -20.0
+        return [
+            {
+                "bbox_xyxy": [260.0 + shift, 180.0, 380.0 + shift, 340.0],
+                "bbox_score": 0.95,
+                "label": 0,
+            }
+        ]
+
+    def infer_pose(
+        self,
+        models: object,
+        frame: Any,
+        *,
+        bboxes: list[list[float]],
+    ) -> list[dict[str, Any]]:
+        del models
+        self.pose_calls += 1
+        self.assert_virtual_crop(frame, bboxes)
+        center = [(frame.shape[1] - 1.0) / 2.0, (frame.shape[0] - 1.0) / 2.0]
+        return [{"keypoints_uv": [center] * 21, "keypoint_scores": [0.9] * 21}]
+
+    @staticmethod
+    def assert_virtual_crop(frame: Any, bboxes: list[list[float]]) -> None:
+        if frame.shape != (160, 192, 3):
+            raise AssertionError(f"pose did not receive configured virtual crop: {frame.shape}")
+        if bboxes != [[0.0, 0.0, 191.0, 159.0]]:
+            raise AssertionError(f"pose bbox is not the physical crop extent: {bboxes}")
+
+    def encode_frame(self, frame: Any, image_format: str) -> bytes:
+        return f"{frame.shape}:{image_format}".encode()
+
+    def render_rectification(
+        self,
+        rectification: object,
+        side: str,
+        frame: Any,
+    ) -> dict[str, Any]:
+        del rectification, side
+        return {"undistorted": frame.copy(), "rectified": frame.copy()}
+
+
+class CandidateAwareRuntime(VirtualPoseRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.detect_candidate_calls = 0
+
+    def detect_candidates(
+        self,
+        models: object,
+        frame: Any,
+        *,
+        policy: CandidatePolicy,
+        category_id: int,
+        view_id: str,
+    ) -> Any:
+        del models, frame
+        self.detect_candidate_calls += 1
+        shift = 0.0 if view_id == "left" else -20.0
+        return policy.classify(
+            bboxes=[
+                [260.0 + shift, 180.0, 380.0 + shift, 260.0],
+                [260.0 + shift, 260.0, 380.0 + shift, 340.0],
+                [100.0 + shift, 100.0, 180.0 + shift, 180.0],
+                [420.0 + shift, 100.0, 500.0 + shift, 180.0],
+            ],
+            scores=[0.90, 0.25, 0.19, 0.99],
+            labels=[category_id, category_id, category_id, category_id + 1],
+            category_id=category_id,
+            view_id=view_id,
+        )
+
+    def infer_pose(
+        self,
+        models: object,
+        frame: Any,
+        *,
+        bboxes: list[list[float]],
+    ) -> list[dict[str, Any]]:
+        del models
+        self.pose_calls += 1
+        results = []
+        for bbox in bboxes:
+            center = [(bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0]
+            results.append(
+                {
+                    "keypoints_uv": [center] * 21,
+                    "keypoint_scores": [0.9] * 21,
+                }
+            )
+        return results
+
+
 def _instance(*, side: str, y: float) -> dict[str, Any]:
     shift = 0.0 if side == "left" else -20.0
     return {
@@ -354,6 +472,26 @@ class DegenerateTriangulationRuntime(FakeRuntime):
         if frame["side"] == "right":
             for point in instances[0]["keypoints_uv"]:
                 point[0] += 20.0
+        return instances
+
+
+class InsufficientPalmRuntime(FakeRuntime):
+    def infer(self, models: object, frame: dict[str, Any], **kwargs: Any):
+        instances = super().infer(models, frame, **kwargs)
+        for index in (0, 5, 9):
+            instances[0]["keypoint_scores"][index] = 0.01
+        return instances
+
+
+class MixedPalmRuntime(FakeRuntime):
+    def infer(self, models: object, frame: dict[str, Any], **kwargs: Any):
+        del models, kwargs
+        instances = [
+            _instance(side=frame["side"], y=210.0),
+            _instance(side=frame["side"], y=310.0),
+        ]
+        for index in (0, 5, 9):
+            instances[1]["keypoint_scores"][index] = 0.01
         return instances
 
 
@@ -409,7 +547,21 @@ class FakeManoRuntime(FakeRuntime):
             "hand_pose": [0.0] * 45,
             "transl": [0.0, 0.0, 0.0],
             "beta": beta,
+            "iterations_run": 17,
+            "best_loss": 0.0001,
+            "final_loss": 0.0002,
+            "joint_residuals_m": [0.005 if side == "right" else 0.01] * 21,
+            "converged": True,
         }
+
+
+class IntermittentManoRuntime(FakeManoRuntime):
+    def fit_mano(self, models: object, **kwargs: Any) -> dict[str, Any]:
+        result = super().fit_mano(models, **kwargs)
+        if len(self.mano_fit_calls) in {3, 4}:
+            result["rmse_m"] = 0.03
+            result["joint_residuals_m"] = [0.03] * 21
+        return result
 
 
 class WorkerContractTests(unittest.TestCase):
@@ -582,6 +734,219 @@ class WorkerContractTests(unittest.TestCase):
             fixture["request"].write_text(json.dumps(request), encoding="utf-8")
             with self.assertRaisesRegex(WorkerError, "artifacts.overlay_video must be boolean"):
                 load_request(fixture["request"])
+
+    def test_virtual_pose_profile_is_optional_versioned_and_validated(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+
+            baseline = load_request(fixture["request"])
+            self.assertEqual(baseline.perception.pose_input, "baseline_native_v1")
+            self.assertEqual(baseline.perception.crop_output_size, (256, 256))
+            self.assertEqual(baseline.perception.recovery_bbox_score, 0.20)
+            self.assertEqual(baseline.perception.max_candidates_per_view, 4)
+            self.assertEqual(baseline.thresholds.min_depth_m, 0.1)
+            self.assertEqual(baseline.thresholds.max_depth_m, 2.0)
+
+            request = json.loads(fixture["request"].read_text(encoding="utf-8"))
+            request["perception"] = {
+                "pose_input": "virtual_perspective_kb4_v1",
+                "crop_output_size": [192, 160],
+                "crop_bbox_scale": 1.4,
+                "crop_min_valid_fraction": 0.75,
+                "recovery_bbox_score": 0.25,
+                "max_candidates_per_view": 3,
+            }
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+            virtual = load_request(fixture["request"])
+            self.assertEqual(virtual.perception.pose_input, "virtual_perspective_kb4_v1")
+            self.assertEqual(virtual.perception.crop_output_size, (192, 160))
+            self.assertEqual(virtual.perception.crop_bbox_scale, 1.4)
+            self.assertEqual(virtual.perception.crop_min_valid_fraction, 0.75)
+            self.assertEqual(virtual.perception.recovery_bbox_score, 0.25)
+            self.assertEqual(virtual.perception.max_candidates_per_view, 3)
+
+            request["perception"]["pose_input"] = "whole_rectified_frame"
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+            with self.assertRaisesRegex(WorkerError, "perception.pose_input"):
+                load_request(fixture["request"])
+
+            request["perception"]["pose_input"] = "baseline_native_v1"
+            request["thresholds"]["min_depth_m"] = 1.0
+            request["thresholds"]["max_depth_m"] = 0.5
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+            with self.assertRaisesRegex(WorkerError, "depth"):
+                load_request(fixture["request"])
+
+    def test_candidate_recovery_threshold_cannot_exceed_seed_threshold(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+            request = json.loads(fixture["request"].read_text(encoding="utf-8"))
+            request["perception"] = {
+                "recovery_bbox_score": 0.31,
+                "max_candidates_per_view": 4,
+            }
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+
+            with self.assertRaisesRegex(WorkerError, "recovery_bbox_score"):
+                load_request(fixture["request"])
+
+    def test_worker_virtual_pose_profile_records_crop_and_maps_pose_to_native(self) -> None:
+        runtime = VirtualPoseRuntime()
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+            request = json.loads(fixture["request"].read_text(encoding="utf-8"))
+            request["perception"] = {
+                "pose_input": "virtual_perspective_kb4_v1",
+                "crop_output_size": [192, 160],
+                "crop_bbox_scale": 1.3,
+                "crop_min_valid_fraction": 0.8,
+            }
+            request["artifacts"]["source_frames"] = "ALL"
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+            result_dir = root / "result"
+
+            result = run_worker(fixture["request"], result_dir, runtime=runtime)
+            events = [
+                json.loads(line)
+                for line in (result_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            manifest = json.loads((result_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(runtime.infer_calls, 0)
+        self.assertEqual(runtime.detect_calls, 2)
+        self.assertEqual(runtime.pose_calls, 2)
+        self.assertEqual(
+            manifest["configuration"]["perception"],
+            {
+                "pose_input": "virtual_perspective_kb4_v1",
+                "crop_output_size": [192, 160],
+                "crop_bbox_scale": 1.3,
+                "crop_min_valid_fraction": 0.8,
+                "crop_policy_id": "virtual-perspective-kb4/v1",
+                "recovery_bbox_score": 0.2,
+                "max_candidates_per_view": 4,
+            },
+        )
+        crop_events = [event for event in events if event["event"] == "virtual_crop_pose_inferred"]
+        self.assertEqual(len(crop_events), 2)
+        self.assertTrue(
+            all(event["payload"]["output_status"] == "PRODUCED" for event in crop_events)
+        )
+        self.assertTrue(
+            all(
+                {blob["role"] for blob in event["blobs"]}
+                == {"virtual_crop", "virtual_crop_valid_mask"}
+                for event in crop_events
+            )
+        )
+        poses = [event for event in events if event["event"] == "view_keypoints_inferred"]
+        self.assertEqual(len(poses), 2)
+        for pose in poses:
+            instance = pose["payload"]["instances"][0]
+            self.assertEqual(instance["model_input_space"], "virtual_pinhole")
+            self.assertEqual(len(instance["keypoints_uv"]), 21)
+            self.assertEqual(len(instance["keypoints_uv_crop"]), 21)
+            self.assertEqual(len(instance["keypoints_uv_rectified"]), 21)
+
+    def test_native_pose_profile_traces_all_detector_decisions_and_poses_the_bounded_pool(
+        self,
+    ) -> None:
+        runtime = CandidateAwareRuntime()
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+            result_dir = root / "result"
+
+            result = run_worker(fixture["request"], result_dir, runtime=runtime)
+            events = [
+                json.loads(line)
+                for line in (result_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(runtime.infer_calls, 0)
+        self.assertEqual(runtime.detect_candidate_calls, 2)
+        self.assertEqual(runtime.pose_calls, 2)
+        detections = [event for event in events if event["event"] == "hand_candidates_detected"]
+        self.assertEqual(len(detections), 2)
+        for detection in detections:
+            decisions = detection["payload"]["candidate_decisions"]
+            self.assertEqual(len(decisions), 4)
+            self.assertEqual(
+                [decision["source_index"] for decision in decisions],
+                [0, 1, 2, 3],
+            )
+            self.assertEqual(
+                [decision["classification"] for decision in decisions],
+                ["SEED", "RECOVERY", "REJECTED", "REJECTED"],
+            )
+            self.assertEqual(
+                [decision["reason"] for decision in decisions],
+                [
+                    "SCORE_MEETS_SEED_THRESHOLD",
+                    "SCORE_MEETS_RECOVERY_THRESHOLD",
+                    "SCORE_BELOW_RECOVERY_THRESHOLD",
+                    "CATEGORY_MISMATCH",
+                ],
+            )
+            self.assertEqual(len(detection["payload"]["candidate_pool"]), 2)
+        poses = [event for event in events if event["event"] == "view_keypoints_inferred"]
+        self.assertEqual(
+            [
+                [instance["classification"] for instance in event["payload"]["instances"]]
+                for event in poses
+            ],
+            [["SEED", "RECOVERY"], ["SEED", "RECOVERY"]],
+        )
+        association = next(
+            event for event in events if event["event"] == "cross_view_hands_associated"
+        )
+        self.assertEqual(len(association["payload"]["matches"]), 2)
+
+    def test_virtual_pose_profile_preserves_pool_candidate_ids_through_each_crop(self) -> None:
+        runtime = CandidateAwareRuntime()
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+            request = json.loads(fixture["request"].read_text(encoding="utf-8"))
+            request["perception"] = {
+                "pose_input": "virtual_perspective_kb4_v1",
+                "crop_output_size": [192, 160],
+                "crop_bbox_scale": 1.3,
+                "crop_min_valid_fraction": 0.8,
+                "recovery_bbox_score": 0.2,
+                "max_candidates_per_view": 4,
+            }
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+            result_dir = root / "result"
+
+            result = run_worker(fixture["request"], result_dir, runtime=runtime)
+            events = [
+                json.loads(line)
+                for line in (result_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(runtime.detect_candidate_calls, 2)
+        self.assertEqual(runtime.pose_calls, 4)
+        crop_events = [event for event in events if event["event"] == "virtual_crop_pose_inferred"]
+        self.assertEqual(
+            [event["payload"]["candidate_id"] for event in crop_events],
+            [
+                "left-det-0000",
+                "left-det-0001",
+                "right-det-0000",
+                "right-det-0001",
+            ],
+        )
+        self.assertEqual(
+            [event["payload"]["detection"]["classification"] for event in crop_events],
+            ["SEED", "RECOVERY", "SEED", "RECOVERY"],
+        )
 
     def test_rectified_projection_preserves_landmark_cardinality_and_nulls_invalid_points(
         self,
@@ -765,10 +1130,19 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(frame_kinematic["payload"]["track_id"], "track-0000")
         self.assertEqual(
             frame_kinematic["parent_event_ids"],
-            ["part0001:pair000000:raw:match-0"],
+            ["part0001:pair000000:tracking"],
         )
         self.assertEqual(raw["payload"]["track_assignment"]["decision"], "NEW")
         self.assertEqual(raw["payload"]["track_id"], "track-0000")
+        self.assertEqual(raw["payload"]["fusion_method"], "robust_stereo_huber_irls_v1")
+        self.assertEqual(raw["payload"]["hand_validity"], "VALID")
+        self.assertGreaterEqual(raw["payload"]["palm_support_count"], 3)
+        self.assertEqual(len(raw["payload"]["covariance_m2"]), 21)
+        self.assertEqual(
+            raw["payload"]["covariance_status"],
+            ["HEURISTIC_UNCALIBRATED"] * 21,
+        )
+        self.assertTrue(all(value is not None for value in raw["payload"]["covariance_m2"]))
         for event in (raw, temporal, export_event):
             projected = event["payload"]["projected_keypoints_uv"]
             self.assertEqual(set(projected), {"left", "right"})
@@ -786,6 +1160,10 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(len(tracked_pose["payload"]["keypoints_uv"]), 21)
         self.assertEqual(len(tracked_pose["payload"]["keypoint_scores"]), 21)
         self.assertEqual(len(tracked_pose["payload"]["detections"]), 1)
+        self.assertEqual(
+            exported[0]["raw"]["covariance_status"],
+            ["HEURISTIC_UNCALIBRATED"] * 21,
+        )
         self.assertEqual(temporal["payload"]["input_stage"], "RAW_FUSION")
         self.assertEqual(temporal["parent_event_ids"], [frame_kinematic["event_id"]])
         self.assertEqual(temporal["payload"]["output_status"], "PRODUCED")
@@ -925,15 +1303,32 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(
             [call["side"] for call in runtime.mano_fit_calls], ["left", "right", "right"]
         )
+        self.assertEqual(
+            [call["seed_id"] for call in runtime.mano_fit_calls],
+            ["mano_mean", "mano_mean", "accepted_state"],
+        )
         self.assertIsNone(runtime.mano_fit_calls[0]["fixed_beta"])
         self.assertIsNone(runtime.mano_fit_calls[1]["fixed_beta"])
         self.assertEqual(runtime.mano_fit_calls[2]["fixed_beta"], [0.2] * 10)
+        self.assertIsNone(runtime.mano_fit_calls[0]["initial_parameters"])
+        self.assertEqual(
+            runtime.mano_fit_calls[2]["initial_parameters"],
+            {
+                "global_orient": [0.0, 0.0, 0.0],
+                "hand_pose": [0.0] * 45,
+                "transl": [0.0, 0.0, 0.0],
+                "beta": [0.2] * 10,
+            },
+        )
         mano_events = [event for event in events if event["event"] == "mano_frame_fitted"]
         self.assertEqual(len(mano_events), 2)
         self.assertEqual(mano_events[0]["payload"]["handedness"], "right")
         self.assertEqual(mano_events[0]["payload"]["selection"]["decision"], "SELECTED")
         self.assertEqual(mano_events[0]["payload"]["loss"]["metric"], "RMSE_M")
         self.assertEqual(mano_events[0]["payload"]["loss"]["value"], 0.005)
+        self.assertEqual(mano_events[0]["payload"]["optimizer"]["iterations_run"], 17)
+        self.assertEqual(mano_events[0]["payload"]["selection"]["init_source"], "COLD_START")
+        self.assertEqual(mano_events[1]["payload"]["selection"]["init_source"], "ACCEPTED_STATE")
         self.assertEqual(mano_events[0]["payload"]["projected_keypoints_space"], "rectified")
         self.assertTrue(
             all(
@@ -979,6 +1374,7 @@ class WorkerContractTests(unittest.TestCase):
             [f"{prior_prefix}:tracking"],
         )
         self.assertIn(f"{prior_prefix}:mano:match-0", mano["parent_event_ids"])
+        self.assertIn(f"{current_prefix}:tracking", mano["parent_event_ids"])
         self.assertEqual(
             mano["payload"]["state_predecessor_event_id"],
             f"{prior_prefix}:mano:match-0",
@@ -988,6 +1384,70 @@ class WorkerContractTests(unittest.TestCase):
             temporal["payload"]["state_predecessor_event_id"],
             f"{prior_prefix}:temporal:match-0",
         )
+
+    def test_rejected_mano_attempt_is_not_used_as_the_next_accepted_state_predecessor(
+        self,
+    ) -> None:
+        runtime = IntermittentManoRuntime()
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=3)
+            _configure_mano(fixture, root)
+            result_dir = root / "result"
+
+            run_worker(fixture["request"], result_dir, runtime=runtime)
+            events = {
+                event["event_id"]: event
+                for event in (
+                    json.loads(line)
+                    for line in (result_dir / "events.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                )
+            }
+
+        first = events["part0001:pair000000:mano:match-0"]
+        rejected = events["part0001:pair000001:mano:match-0"]
+        recovered = events["part0001:pair000002:mano:match-0"]
+        self.assertEqual(first["event"], "mano_frame_fitted")
+        self.assertEqual(rejected["event"], "mano_frame_not_produced")
+        self.assertEqual(recovered["event"], "mano_frame_fitted")
+        self.assertEqual(
+            rejected["payload"]["state_predecessor_event_id"],
+            first["event_id"],
+        )
+        self.assertEqual(
+            recovered["payload"]["state_predecessor_event_id"],
+            first["event_id"],
+        )
+        self.assertIn(first["event_id"], recovered["parent_event_ids"])
+        self.assertNotIn(rejected["event_id"], recovered["parent_event_ids"])
+
+    def test_recovered_track_state_references_the_intervening_missing_frame(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=3)
+            result_dir = root / "result"
+
+            run_worker(fixture["request"], result_dir, runtime=MissingMiddleFrameRuntime())
+            events = {
+                event["event_id"]: event
+                for event in (
+                    json.loads(line)
+                    for line in (result_dir / "events.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                )
+            }
+
+        missing = events["part0001:pair000001:tracking"]
+        recovered = events["part0001:pair000002:tracking"]
+        self.assertIn(missing["event_id"], recovered["parent_event_ids"])
+        self.assertEqual(
+            recovered["payload"]["state_predecessor_event_ids"],
+            [missing["event_id"]],
+        )
+        self.assertTrue(recovered["payload"]["assignments"][0]["recovered"])
 
     def test_tampered_mano_fails_before_any_mano_deserialization(self) -> None:
         runtime = FakeManoRuntime()
@@ -1109,6 +1569,85 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(active_scope, ["mmpose"])
         self.assertEqual(len(instances), 1)
 
+    def test_real_runtime_classifies_every_raw_detector_instance_before_pooling(self) -> None:
+        from contextlib import contextmanager
+        from types import ModuleType, SimpleNamespace
+
+        import numpy as np
+
+        class FakeDefaultScope:
+            @classmethod
+            @contextmanager
+            def overwrite_default_scope(cls, scope_name: str):
+                self.assertEqual(scope_name, "mmdet")
+                yield
+
+        def inference_detector(model: object, frame: object) -> object:
+            del model, frame
+            return SimpleNamespace(
+                pred_instances=SimpleNamespace(
+                    bboxes=np.asarray(
+                        [
+                            [10.0, 20.0, 30.0, 40.0],
+                            [50.0, 20.0, 70.0, 40.0],
+                            [90.0, 20.0, 110.0, 40.0],
+                            [130.0, 20.0, 150.0, 40.0],
+                        ],
+                        dtype=np.float32,
+                    ),
+                    scores=np.asarray([0.9, 0.25, 0.19, 0.99], dtype=np.float32),
+                    labels=np.asarray([0, 0, 0, 1], dtype=np.int64),
+                )
+            )
+
+        mmengine = ModuleType("mmengine")
+        mmengine_registry = ModuleType("mmengine.registry")
+        mmengine_registry.DefaultScope = FakeDefaultScope
+        mmdet = ModuleType("mmdet")
+        mmdet_apis = ModuleType("mmdet.apis")
+        mmdet_apis.inference_detector = inference_detector
+
+        models = SimpleNamespace(detector=object())
+        with patch.dict(
+            sys.modules,
+            {
+                "mmengine": mmengine,
+                "mmengine.registry": mmengine_registry,
+                "mmdet": mmdet,
+                "mmdet.apis": mmdet_apis,
+            },
+        ):
+            batch = OpenMMLabRuntime().detect_candidates(
+                models,
+                object(),
+                policy=CandidatePolicy(
+                    seed_threshold=0.3,
+                    recovery_threshold=0.2,
+                    max_candidates=4,
+                ),
+                category_id=0,
+                view_id="left",
+            )
+
+        self.assertEqual(len(batch.decisions), 4)
+        self.assertEqual(
+            [decision.classification for decision in batch.decisions],
+            ["SEED", "RECOVERY", "REJECTED", "REJECTED"],
+        )
+        self.assertEqual(
+            [decision.reason for decision in batch.decisions],
+            [
+                "SCORE_MEETS_SEED_THRESHOLD",
+                "SCORE_MEETS_RECOVERY_THRESHOLD",
+                "SCORE_BELOW_RECOVERY_THRESHOLD",
+                "CATEGORY_MISMATCH",
+            ],
+        )
+        self.assertEqual(
+            [decision.candidate_id for decision in batch.candidate_pool],
+            ["left-det-0000", "left-det-0001"],
+        )
+
     def test_models_load_once_and_real_detection_pose_events_are_persisted(self) -> None:
         runtime = FakeRuntime()
         with TemporaryDirectory() as temporary_directory:
@@ -1195,6 +1734,39 @@ class WorkerContractTests(unittest.TestCase):
             )
         self.assertEqual(result["matched_hand_count"], 3)
         self.assertEqual(result["valid_landmark_count"], 63)
+
+    def test_association_accepts_four_candidates_per_view_but_selects_at_most_two_hands(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            fixture = _write_fixture(Path(temporary_directory), pair_count=1)
+            thresholds = load_request(fixture["request"]).thresholds
+
+        def instance(candidate_id: str, y: float) -> dict[str, Any]:
+            return {
+                "candidate_id": candidate_id,
+                "keypoints_uv_rectified": [[100.0, y]] * 21,
+                "keypoint_scores": [0.9] * 21,
+            }
+
+        left = [instance(f"left-det-{index:04d}", 100.0 + 20.0 * index) for index in range(4)]
+        right = [instance(f"right-det-{index:04d}", 100.0 + 20.0 * index) for index in range(4)]
+
+        result = associate(left, right, thresholds)
+
+        self.assertEqual(len(result["matches"]), 2)
+        self.assertEqual(
+            [
+                (match["left_candidate_id"], match["right_candidate_id"])
+                for match in result["matches"]
+            ],
+            [
+                ("left-det-0000", "right-det-0000"),
+                ("left-det-0001", "right-det-0001"),
+            ],
+        )
+        self.assertEqual(result["unmatched_left_indices"], [2, 3])
+        self.assertEqual(result["unmatched_right_indices"], [2, 3])
 
     def test_timestamp_matches_select_video_presentation_indices_after_a_drop(self) -> None:
         runtime = FakeRuntime()
@@ -1351,6 +1923,28 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(exported["evidence_source"][:2], ["MONOCULAR", "MULTIVIEW"])
         self.assertEqual(exported["covariance_m2"][:2], [None, None])
 
+    def test_insufficient_current_palm_support_keeps_raw_evidence_but_does_not_export(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+            result_dir = root / "result"
+
+            result = run_worker(fixture["request"], result_dir, runtime=InsufficientPalmRuntime())
+            events = [
+                json.loads(line)
+                for line in (result_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        rejected = next(event for event in events if event["event"] == "raw_hand_gate_not_produced")
+        self.assertEqual(rejected["payload"]["hand_validity"], "INVALID")
+        self.assertEqual(rejected["payload"]["hand_reason"], "INSUFFICIENT_PALM_SUPPORT")
+        self.assertEqual(rejected["payload"]["palm_support_count"], 2)
+        self.assertEqual(rejected["payload"]["valid_landmark_count"], 18)
+        self.assertTrue(any(point is not None for point in rejected["payload"]["landmarks_xyz_m"]))
+        self.assertEqual(result["output_status"], "NOT_PRODUCED")
+        self.assertEqual(result["export_count"], 0)
+        self.assertFalse((result_dir / "fhp21.jsonl").exists())
+
     def test_assignment_maximizes_valid_match_count_before_epipolar_cost(self) -> None:
         runtime = CardinalityRuntime()
         with TemporaryDirectory() as temporary_directory:
@@ -1422,9 +2016,14 @@ class WorkerContractTests(unittest.TestCase):
         )
         self.assertEqual(
             empty_frame[0]["parent_event_ids"],
+            ["part0001:pair000001:association"],
+        )
+        self.assertIn(empty_frame[0]["event_id"], empty_tracking["parent_event_ids"])
+        self.assertEqual(
+            empty_frame[1]["parent_event_ids"],
             ["part0001:pair000001:tracking"],
         )
-        for predecessor, event in zip(empty_frame[:-1], empty_frame[1:], strict=True):
+        for predecessor, event in zip(empty_frame[1:-1], empty_frame[2:], strict=True):
             self.assertEqual(event["parent_event_ids"], [predecessor["event_id"]])
 
     def test_zero_valid_triangulation_retains_an_explicit_not_produced_export_event(
@@ -1442,14 +2041,66 @@ class WorkerContractTests(unittest.TestCase):
                 for line in (result_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
             ]
 
+        rejected_raw = next(
+            event for event in events if event["event"] == "raw_hand_gate_not_produced"
+        )
         temporal = next(
-            event for event in events if event["event"] == "temporal_landmarks_not_produced"
+            event for event in events if event["event"] == "temporal_refinement_not_produced"
         )
         export = next(event for event in events if event["event"] == "fhp21_record_not_produced")
         self.assertEqual(result["output_status"], "NOT_PRODUCED")
+        self.assertEqual(rejected_raw["payload"]["output_status"], "NOT_PRODUCED")
+        self.assertEqual(rejected_raw["payload"]["valid_landmark_count"], 0)
+        self.assertEqual(rejected_raw["payload"]["hand_validity"], "INVALID")
         self.assertEqual(export["payload"]["output_status"], "NOT_PRODUCED")
-        self.assertEqual(export["payload"]["track_id"], "track-0000")
+        self.assertIsNone(temporal["payload"]["track_id"])
+        self.assertIsNone(export["payload"]["track_id"])
         self.assertEqual(export["parent_event_ids"], [temporal["event_id"]])
+
+    def test_mixed_valid_and_rejected_hands_keep_complete_causal_trace_chains(self) -> None:
+        runtime = MixedPalmRuntime()
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+            result_dir = root / "result"
+
+            result = run_worker(fixture["request"], result_dir, runtime=runtime)
+            events = [
+                json.loads(line)
+                for line in (result_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        association = next(
+            event for event in events if event["event"] == "cross_view_hands_associated"
+        )
+        accepted_raw = next(
+            event for event in events if event["event"] == "raw_landmarks_triangulated"
+        )
+        rejected_raw = next(
+            event for event in events if event["event"] == "raw_hand_gate_not_produced"
+        )
+        tracking = next(event for event in events if event["event"] == "sequence_tracks_assigned")
+        rejected_mano = next(
+            event for event in events if event["event"] == "kinematic_refinement_not_produced"
+        )
+        rejected_temporal = next(
+            event for event in events if event["event"] == "temporal_refinement_not_produced"
+        )
+        rejected_export = next(
+            event
+            for event in events
+            if event["event"] == "fhp21_record_not_produced"
+            and event["payload"]["reason"] == "RAW_HAND_GATE_REJECTED"
+        )
+
+        self.assertEqual(result["export_count"], 1)
+        self.assertEqual(accepted_raw["parent_event_ids"], [association["event_id"]])
+        self.assertIn(accepted_raw["event_id"], tracking["parent_event_ids"])
+        self.assertIn(rejected_raw["event_id"], tracking["parent_event_ids"])
+        self.assertEqual(rejected_mano["parent_event_ids"], [tracking["event_id"]])
+        self.assertEqual(rejected_temporal["parent_event_ids"], [rejected_mano["event_id"]])
+        self.assertEqual(rejected_export["parent_event_ids"], [rejected_temporal["event_id"]])
+        self.assertIsNone(rejected_export["payload"]["track_id"])
 
     def test_tampered_checkpoint_fails_before_source_verification_or_model_loading(self) -> None:
         runtime = FakeRuntime()
@@ -1830,9 +2481,8 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(left_detection.parent_ids, (sync.record_id,))
         self.assertEqual(left_pose.parent_ids, (left_detection.record_id,))
         self.assertEqual(len(association.parent_ids), 2)
-        self.assertEqual(tracking.parent_ids, (association.record_id,))
-        self.assertEqual(len(raw.parent_ids), 2)
-        self.assertTrue(all(parent.endswith((":left", ":right")) for parent in raw.parent_ids))
+        self.assertEqual(raw.parent_ids, (association.record_id,))
+        self.assertEqual(tracking.parent_ids, (raw.record_id,))
         self.assertEqual({blob.role for blob in sync.blobs}, {"source_left", "source_right"})
         self.assertTrue(imported_blob_sources_exist)
 

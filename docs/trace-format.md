@@ -182,10 +182,15 @@ image roles:
 - `undistorted_left` / `undistorted_right` as a debug-only OpenCV QA branch;
 - `rectified_left` / `rectified_right` in the calibrated stereo pixel space.
 
-Detection and RTMPose continue to consume the native fisheye frame in the current worker;
-the full-frame undistortion and rectification images are inspection evidence, not a false
-claim about model input. Detection, pose, association, raw fusion, MANO, temporal, and
-export comparisons are drawn from their structured payloads. Three-dimensional stages use
+RTMDet always consumes the native fisheye frame. With `baseline_native_v1`, RTMPose also
+uses that frame; with `virtual_perspective_kb4_v1`, each candidate instead records a
+`virtual_crop` and `virtual_crop_valid_mask`, a typed virtual camera, crop-space keypoints,
+and their inverse mapping to native pixels. Full-frame undistortion and rectification remain
+inspection evidence, not a false claim about model input. Detection records preserve every
+`candidate_decision` (`SEED`, `RECOVERY`, or `REJECTED`) and the bounded association pool;
+a recovery proposal is not a final hand until downstream geometry accepts it. Detection,
+pose, association, raw fusion, MANO, temporal, and export comparisons are drawn from their
+structured payloads. Three-dimensional stages use
 `projected_keypoints_uv.left/right`, each exactly 21 entries in rectified pixels. Invalid or
 behind-camera landmarks are JSON `null`, never fabricated coordinates. A
 `projected_keypoints_space` value identifies that pixel space.

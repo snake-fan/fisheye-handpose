@@ -76,6 +76,18 @@ class ThresholdRequest:
     association_epipolar_px: float
     max_reprojection_error_px: float
     min_ray_angle_deg: float
+    min_depth_m: float
+    max_depth_m: float
+
+
+@dataclass(frozen=True)
+class PerceptionRequest:
+    pose_input: str
+    crop_output_size: tuple[int, int]
+    crop_bbox_scale: float
+    crop_min_valid_fraction: float
+    recovery_bbox_score: float
+    max_candidates_per_view: int
 
 
 @dataclass(frozen=True)
@@ -126,6 +138,7 @@ class WorkerRequest:
     session: SessionRequest
     calibration: CalibrationRequest
     thresholds: ThresholdRequest
+    perception: PerceptionRequest
     models: ModelRequest
     artifacts: ArtifactRequest
     tracking: TrackingRequest
@@ -203,6 +216,20 @@ def load_request(path: str | Path) -> WorkerRequest:
         raise WorkerError("left and right camera IDs must differ")
 
     thresholds = _mapping(root.get("thresholds"), "thresholds")
+    min_depth_m = _number(
+        thresholds.get("min_depth_m", 0.1),
+        "thresholds.min_depth_m",
+        minimum=0.000001,
+        maximum=100.0,
+    )
+    max_depth_m = _number(
+        thresholds.get("max_depth_m", 2.0),
+        "thresholds.max_depth_m",
+        minimum=0.000001,
+        maximum=100.0,
+    )
+    if max_depth_m <= min_depth_m:
+        raise WorkerError("thresholds depth range must be increasing")
     threshold_request = ThresholdRequest(
         bbox_score=_number(
             thresholds.get("bbox_score"), "thresholds.bbox_score", minimum=0.0, maximum=1.0
@@ -231,6 +258,61 @@ def load_request(path: str | Path) -> WorkerRequest:
             minimum=0.0,
             maximum=90.0,
         ),
+        min_depth_m=min_depth_m,
+        max_depth_m=max_depth_m,
+    )
+
+    raw_perception = root.get("perception")
+    perception = {} if raw_perception is None else _mapping(raw_perception, "perception")
+    pose_input = _text(
+        perception.get("pose_input", "baseline_native_v1"),
+        "perception.pose_input",
+    )
+    if pose_input not in {"baseline_native_v1", "virtual_perspective_kb4_v1"}:
+        raise WorkerError(
+            "perception.pose_input must be baseline_native_v1 or virtual_perspective_kb4_v1"
+        )
+    crop_output_size = perception.get("crop_output_size", [256, 256])
+    if (
+        not isinstance(crop_output_size, list)
+        or len(crop_output_size) != 2
+        or any(
+            isinstance(item, bool) or not isinstance(item, int) or item < 2
+            for item in crop_output_size
+        )
+    ):
+        raise WorkerError("perception.crop_output_size must contain two integers >= 2")
+    recovery_bbox_score = _number(
+        perception.get("recovery_bbox_score", min(0.20, threshold_request.bbox_score)),
+        "perception.recovery_bbox_score",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if recovery_bbox_score > threshold_request.bbox_score:
+        raise WorkerError("perception.recovery_bbox_score must not exceed thresholds.bbox_score")
+    max_candidates_per_view = _positive_int(
+        perception.get("max_candidates_per_view", 4),
+        "perception.max_candidates_per_view",
+    )
+    if max_candidates_per_view > 4:
+        raise WorkerError("perception.max_candidates_per_view must be at most 4")
+    perception_request = PerceptionRequest(
+        pose_input=pose_input,
+        crop_output_size=(crop_output_size[0], crop_output_size[1]),
+        crop_bbox_scale=_number(
+            perception.get("crop_bbox_scale", 1.5),
+            "perception.crop_bbox_scale",
+            minimum=0.01,
+            maximum=100.0,
+        ),
+        crop_min_valid_fraction=_number(
+            perception.get("crop_min_valid_fraction", 0.5),
+            "perception.crop_min_valid_fraction",
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        recovery_bbox_score=recovery_bbox_score,
+        max_candidates_per_view=max_candidates_per_view,
     )
 
     models = _mapping(root.get("models"), "models")
@@ -345,6 +427,7 @@ def load_request(path: str | Path) -> WorkerRequest:
         session=session_request,
         calibration=calibration_request,
         thresholds=threshold_request,
+        perception=perception_request,
         models=model_request,
         artifacts=artifact_request,
         tracking=tracking_request,
@@ -358,6 +441,7 @@ __all__ = [
     "CalibrationRequest",
     "ModelRequest",
     "ManoRequest",
+    "PerceptionRequest",
     "REQUEST_SCHEMA",
     "SessionRequest",
     "ThresholdRequest",

@@ -581,6 +581,16 @@ def _command_trace_validate(args: argparse.Namespace) -> None:
         raise FisheyeHandposeError("trace validation failed")
 
 
+def _command_trace_baseline(args: argparse.Namespace) -> None:
+    from .baseline import extract_baseline_metrics
+
+    payload = extract_baseline_metrics(
+        Path(args.run_dir).expanduser().resolve(),
+        verify_blobs=not args.skip_blob_verification,
+    )
+    _write_json(payload, args.output)
+
+
 def _command_trace_serve(args: argparse.Namespace) -> None:
     from .trace import RunArtifactReader, TraceValidationError
     from .viewer import serve_trace
@@ -800,6 +810,15 @@ def build_parser() -> argparse.ArgumentParser:
     trace_validate.add_argument("run_dir")
     trace_validate.add_argument("--skip-blob-verification", action="store_true")
     trace_validate.set_defaults(func=_command_trace_validate)
+
+    trace_baseline = subparsers.add_parser(
+        "trace-baseline",
+        help="extract deterministic V0 metrics and configuration from a canonical run",
+    )
+    trace_baseline.add_argument("run_dir")
+    trace_baseline.add_argument("--output", help="write the versioned baseline JSON")
+    trace_baseline.add_argument("--skip-blob-verification", action="store_true")
+    trace_baseline.set_defaults(func=_command_trace_baseline)
 
     trace_serve = subparsers.add_parser(
         "trace-serve", help="serve the local read-only trace inspection UI"

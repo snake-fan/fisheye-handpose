@@ -9,6 +9,7 @@ import re
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -34,12 +35,12 @@ class ResolvedArtifact:
     media_type: str
     size: int
     sha256: str
+    content_addressed: bool
 
 
 _FileFingerprint = tuple[int, int, int, int, int]
 _RunFingerprint = tuple[tuple[str, _FileFingerprint] | None, ...]
-_BlobFingerprint = tuple[tuple[str, _FileFingerprint | None], ...]
-_ValidationFingerprint = _RunFingerprint | tuple[_RunFingerprint, _BlobFingerprint]
+_ValidationFingerprint = _RunFingerprint
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,17 +63,35 @@ class _VerifiedArtifact:
     size: int
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedValidation:
+    result: dict[str, Any]
+    expires_at: float
+
+
 class TraceCatalog:
     """Query trace folders under one configured catalog root."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        validation_cache_ttl_seconds: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if validation_cache_ttl_seconds < 0:
+            raise ValueError("validation_cache_ttl_seconds must be non-negative")
         self.root = Path(root).expanduser().resolve(strict=True)
         if not self.root.is_dir():
             raise NotADirectoryError(self.root)
+        self._validation_cache_ttl_seconds = validation_cache_ttl_seconds
+        self._clock = clock
         self._cache_lock = threading.RLock()
         self._run_indexes: dict[Path, _RunIndex] = {}
         self._run_index_locks: dict[Path, threading.Lock] = {}
-        self._validation_cache: dict[tuple[Path, _ValidationFingerprint, bool], dict[str, Any]] = {}
+        self._validation_cache: dict[
+            tuple[Path, _ValidationFingerprint, bool], _CachedValidation
+        ] = {}
         self._validation_locks: dict[tuple[Path, _ValidationFingerprint, bool], threading.Lock] = {}
         self._artifact_cache: dict[tuple[Path, str, int | None], _VerifiedArtifact] = {}
         self._artifact_locks: dict[tuple[Path, str, int | None], threading.Lock] = {}
@@ -285,8 +304,10 @@ class TraceCatalog:
         try:
             candidate = run.joinpath(*parts.parts).resolve(strict=True)
         except (OSError, RuntimeError):
+            self._invalidate_validation_cache(run)
             raise ArtifactNotFoundError(relative_path) from None
         if not candidate.is_relative_to(run) or not candidate.is_file():
+            self._invalidate_validation_cache(run)
             raise ArtifactNotFoundError(relative_path)
         expected_sha = reference.get("sha256")
         expected_size = reference.get("bytes", reference.get("size"))
@@ -304,6 +325,7 @@ class TraceCatalog:
             try:
                 fingerprint = _file_fingerprint(candidate)
             except OSError:
+                self._invalidate_validation_cache(run)
                 raise ArtifactNotFoundError(relative_path) from None
             with self._cache_lock:
                 cached_artifact = self._artifact_cache.get(cache_key)
@@ -319,8 +341,10 @@ class TraceCatalog:
                 try:
                     stable_fingerprint = _file_fingerprint(candidate)
                 except OSError:
+                    self._invalidate_validation_cache(run)
                     raise ArtifactNotFoundError(relative_path) from None
                 if fingerprint != stable_fingerprint:
+                    self._invalidate_validation_cache(run)
                     raise ArtifactIntegrityError(f"artifact changed while reading: {relative_path}")
                 if digest.hexdigest() != expected_sha.lower() or (
                     isinstance(expected_size, int)
@@ -329,13 +353,21 @@ class TraceCatalog:
                 ):
                     with self._cache_lock:
                         self._artifact_cache.pop(cache_key, None)
+                    self._invalidate_validation_cache(run)
                     raise ArtifactIntegrityError(f"artifact integrity mismatch: {relative_path}")
                 with self._cache_lock:
                     self._artifact_cache[cache_key] = _VerifiedArtifact(stable_fingerprint, size)
         media_type = reference.get("media_type", reference.get("mime_type"))
         if not isinstance(media_type, str) or not media_type:
             media_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
-        return ResolvedArtifact(candidate, media_type, size, expected_sha.lower())
+        normalized_sha = expected_sha.lower()
+        content_addressed = bool(
+            re.fullmatch(
+                rf"blobs/sha256/{normalized_sha[:2]}/{normalized_sha}(?:\.[A-Za-z0-9_-]+)*",
+                relative_path,
+            )
+        )
+        return ResolvedArtifact(candidate, media_type, size, normalized_sha, content_addressed)
 
     def _find_run(self, run_key: str) -> Path:
         with self._cache_lock:
@@ -545,27 +577,32 @@ class TraceCatalog:
             return _legacy_validation()
         if not index.finalized:
             return _validate_canonical(run, verify_blobs=verify_blobs)
-        validation_fingerprint: _ValidationFingerprint = index.fingerprint
-        if verify_blobs:
-            validation_fingerprint = (
-                index.fingerprint,
-                _blob_fingerprint(run, index.artifacts_by_path),
-            )
-        key = (run, validation_fingerprint, verify_blobs)
+        key = (run, index.fingerprint, verify_blobs)
+        now = self._clock()
         with self._cache_lock:
             cached = self._validation_cache.get(key)
-            if cached is not None:
-                return cached
+            if cached is not None and now < cached.expires_at:
+                return cached.result
             validation_lock = self._validation_locks.setdefault(key, threading.Lock())
         with validation_lock:
+            now = self._clock()
             with self._cache_lock:
                 cached = self._validation_cache.get(key)
-                if cached is not None:
-                    return cached
+                if cached is not None and now < cached.expires_at:
+                    return cached.result
             result = _validate_canonical(run, verify_blobs=verify_blobs)
             with self._cache_lock:
-                self._validation_cache[key] = result
+                self._validation_cache[key] = _CachedValidation(
+                    result=result,
+                    expires_at=self._clock() + self._validation_cache_ttl_seconds,
+                )
             return result
+
+    def _invalidate_validation_cache(self, run: Path) -> None:
+        with self._cache_lock:
+            stale = [key for key in self._validation_cache if key[0] == run]
+            for key in stale:
+                self._validation_cache.pop(key, None)
 
     def _artifact_lock(self, key: tuple[Path, str, int | None]) -> threading.Lock:
         with self._cache_lock:
@@ -612,26 +649,6 @@ def _run_fingerprint(run: Path) -> _RunFingerprint:
     return tuple(
         (path.name, _file_fingerprint(path)) if path is not None else None for path in paths
     )
-
-
-def _blob_fingerprint(
-    run: Path,
-    references: dict[str, dict[str, Any]],
-) -> _BlobFingerprint:
-    values: list[tuple[str, _FileFingerprint | None]] = []
-    for relative_path in sorted(references):
-        try:
-            parts = PurePosixPath(relative_path)
-            candidate = run.joinpath(*parts.parts).resolve(strict=True)
-            fingerprint = (
-                _file_fingerprint(candidate)
-                if candidate.is_relative_to(run) and candidate.is_file()
-                else None
-            )
-        except (OSError, RuntimeError):
-            fingerprint = None
-        values.append((relative_path, fingerprint))
-    return tuple(values)
 
 
 def _directory_marker(root: Path) -> tuple[tuple[str, int, int], ...]:

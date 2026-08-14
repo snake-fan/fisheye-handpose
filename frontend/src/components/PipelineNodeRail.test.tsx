@@ -66,3 +66,53 @@ test("operator sees every pipeline node in a fixed order with explicit missing o
   expect(within(nodes[1]).getByText("此帧未产生去畸变图像")).toBeVisible();
   expect(within(nodes[7]).getByText("NO_HIGH_QUALITY_FIT")).toBeVisible();
 });
+
+test("mixed produced and rejected hands mark each affected stage as partial with its failure reason", () => {
+  const records: TraceRecord[] = [
+    {
+      record_id: "raw-produced",
+      stage: "RAW_FUSION",
+      status: "SUCCEEDED",
+      payload: { track_id: "track-0000", output_status: "PRODUCED" },
+    },
+    {
+      record_id: "raw-rejected",
+      stage: "RAW_FUSION",
+      status: "WARNING",
+      payload: {
+        track_id: null,
+        output_status: "NOT_PRODUCED",
+        hand_reason: "INSUFFICIENT_PALM_SUPPORT",
+      },
+    },
+    {
+      record_id: "temporal-produced",
+      stage: "TEMPORAL_REFINEMENT",
+      status: "SUCCEEDED",
+      payload: { track_id: "track-0000", output_status: "PRODUCED" },
+    },
+    {
+      record_id: "temporal-rejected",
+      stage: "TEMPORAL_REFINEMENT",
+      status: "WARNING",
+      payload: { track_id: null, output_status: "NOT_PRODUCED", reason: "RAW_HAND_GATE_REJECTED" },
+    },
+  ];
+
+  render(
+    <PipelineNodeRail
+      records={records}
+      selectedNodeId="STEREO_TRIANGULATION_RAW_3D"
+      onSelect={vi.fn()}
+    />,
+  );
+
+  const raw = screen.getByRole("button", { name: /Stereo Triangulation · Raw 3D/ });
+  const temporal = screen.getByRole("button", { name: /Temporal Refinement/ });
+  expect(raw).toHaveClass("partial");
+  expect(within(raw).getByText("PARTIAL")).toBeVisible();
+  expect(within(raw).getByText("INSUFFICIENT_PALM_SUPPORT")).toBeVisible();
+  expect(temporal).toHaveClass("partial");
+  expect(within(temporal).getByText("PARTIAL")).toBeVisible();
+  expect(within(temporal).getByText("RAW_HAND_GATE_REJECTED")).toBeVisible();
+});

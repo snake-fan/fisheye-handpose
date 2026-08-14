@@ -13,9 +13,11 @@ The project is intentionally split into three independently deployable layers:
    tracking, optional MANO fitting, temporal refinement, and FHP21 export.
 3. A read-only FastAPI run catalog and an independent React/TypeScript inspector.
 
-The worker is a real compatibility baseline, but currently detects on full raw fisheye
-frames and relies on the top-down model crop. Explicit virtual-perspective crops remain
-future accuracy work. No weights, MANO files, or private manifests are embedded here.
+The worker keeps RTMDet on full native fisheye frames and supports two versioned RTMPose
+profiles: the compatible native path and an opt-in hand-centred virtual-perspective crop
+path. The active v2 accuracy work and its H20 gates are tracked in
+[docs/pipeline-v2-iteration-plan.md](docs/pipeline-v2-iteration-plan.md). No weights, MANO
+files, or private manifests are embedded here.
 
 ## Coordinate and unit conventions
 
@@ -114,6 +116,17 @@ with audited values.
 The final `fhp21.jsonl` is imported as a verified content-addressed blob with role
 `worker_fhp21_output`, not copied to a mutable top-level run file. Download it through the
 React/API artifact link or locate it from the EXPORT provenance.
+
+Freeze reproducible stage/quality metrics for any completed canonical run:
+
+```bash
+uv run --locked --no-editable fisheye-handpose trace-baseline \
+  runs/ITEM_ID/RUN_ID --output runs/ITEM_ID/RUN_ID.baseline.json
+```
+
+The baseline extractor validates the trace first and records the applied configuration,
+model/calibration provenance, detections, associations, Raw validity/bone statistics,
+tracks, MANO attempts/RMSE, and the temporal stage's actual input source.
 
 ## Stage traces and inspection UIs
 

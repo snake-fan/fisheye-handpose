@@ -177,13 +177,14 @@ pipeline:
 
 ```text
 timestamp CSV + presentation-order stereo video
-  -> RTMDet hand candidates (0, 1, or 2 per view)
-  -> RTMPose Hand5 21-point evidence and confidence
+  -> RTMDet seed/recovery candidate pool (0..4 per native-fisheye view)
+  -> optional hand-centred KB4 virtual-perspective crop
+  -> RTMPose Hand5 21-point evidence mapped back to native pixels
   -> KB4 point rectification
   -> epipolar cross-view association with explicit unmatched candidates
   -> metric raw triangulation in the rectified-left camera frame
   -> sequence-local one-to-one 3D tracking
-  -> optional framewise MANO fitting with per-track handedness and frozen beta
+  -> optional framewise MANO mean-pose/warm-start fitting with accepted track state
   -> timestamp-aware causal temporal baseline
   -> fhp21.jsonl export
 ```
@@ -243,6 +244,14 @@ The request uses the strict `fisheye-handpose/h20-worker-request/v1` schema:
     "max_reprojection_error_px": 3.0,
     "min_ray_angle_deg": 0.5
   },
+  "perception": {
+    "pose_input": "virtual_perspective_kb4_v1",
+    "crop_output_size": [256, 256],
+    "crop_bbox_scale": 1.5,
+    "crop_min_valid_fraction": 0.5,
+    "recovery_bbox_score": 0.2,
+    "max_candidates_per_view": 4
+  },
   "models": {
     "manifest": "/ABS/PATH/model-assets.json",
     "model_dir": "/ABS/PATH/models/openmmlab",
@@ -266,7 +275,7 @@ The request uses the strict `fisheye-handpose/h20-worker-request/v1` schema:
     "manifest": "/ABS/PRIVATE/PATH/mano-assets.json",
     "min_valid_landmarks": 15,
     "max_fit_rmse_m": 0.02,
-    "iterations": 40,
+    "iterations": 200,
     "learning_rate": 0.03
   },
   "temporal": {
@@ -277,7 +286,11 @@ The request uses the strict `fisheye-handpose/h20-worker-request/v1` schema:
 }
 ```
 
-`tracking` and `temporal` may be omitted to use the shown defaults. The backward-compatible
+`perception`, `tracking`, and `temporal` may be omitted to use backward-compatible defaults;
+the default pose input remains `baseline_native_v1`, while the example explicitly opts into
+the virtual-crop ablation profile. The seed threshold is `thresholds.bbox_score`; recovery
+candidates down to `perception.recovery_bbox_score` remain provisional until cross-view
+association, and at most two matches are accepted per frame. The backward-compatible
 `artifacts.overlay_video` field defaults to `false` when absent. `mano` is optional;
 set it to `null` or omit it to run a raw-geometry temporal baseline. That path always emits
 `KINEMATIC_REFINEMENT / SKIPPED / output_status=NOT_PRODUCED` instead of claiming a MANO
@@ -286,12 +299,19 @@ SMPL-X can deserialize either pickle. The manifest must contain the same explici
 provenance, filenames, byte counts, and full SHA-256 identities required by
 `scripts/mano_smoke.py`.
 
-Tracking uses a wrist (or valid-landmark centroid) anchor and deterministic
-max-cardinality/min-distance one-to-one assignment. Every assignment states `MATCHED` or
-`NEW`, its distance, and its actual time delta. The first high-quality MANO frame for each
-track fits both left and right models and selects the lower accepted RMSE. That handedness
-and the selected ten shape coefficients are then shared by the track; later fits optimize
-only pose, global orientation, and translation with beta frozen. The explicit mapping
+Tracking uses the median of valid `[wrist,index/middle/ring/little MCP]` palm references,
+constant-velocity prediction, TTL recovery, and deterministic max-cardinality/min-distance
+one-to-one assignment. It never changes anchor semantics to an all-joint centroid when the
+wrist is missing. Every assignment states `MATCHED` or `NEW`, plus an explicit recovered
+flag/reason, distance, prediction, and actual time delta. The first accepted MANO frame for
+each track tries both left and right mean-pose hypotheses; it is not assumed to be a flat
+hand. The accepted side,
+ten shape coefficients, pose, global orientation, and translation become the next frame's
+warm start. Rejected/error fits never replace that state; beta remains frozen after the first
+accepted fit. If the accepted-state attempt misses the quality gate, the same frame retries
+the locked handedness from the configured cold seed while retaining the accepted beta; only
+a gate-passing recovery may replace the state. The full 45D refinement uses robust residuals,
+post-step best-so-far recovery and an early-stop-capable 200-iteration ceiling. The explicit mapping
 `mano-v1.2-j16-tips-to-fhp21/v1` converts the MANO 16 joints plus five topology fingertip
 vertices to FHP21 order.
 
@@ -331,6 +351,11 @@ fisheye frame. Raw, framewise MANO, temporal, and export event payloads include
 `projected_keypoints_uv.left/right`; each side is always length 21, and an invalid,
 non-finite, null, or behind-camera landmark remains JSON `null` instead of acquiring an
 invented pixel coordinate.
+
+The event DAG follows the real dependency order: association → Raw fusion evidence → track
+assignment → refinement/export. A hand rejected by the Raw hand-level gate still receives
+its own Kinematic, Temporal, and Export `NOT_PRODUCED` records, even when another hand in the
+same frame succeeds. This keeps mixed two-hand failures visible without creating a fake track.
 
 When enabled, the overlay is one seekable 2x2 rectified video per run: raw-left/raw-right
 on the top row and temporal-left/temporal-right on the bottom row. Every synchronized pair

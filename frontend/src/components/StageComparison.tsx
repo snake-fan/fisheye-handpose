@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { ImageIcon } from "lucide-react";
 
 import { traceApi } from "../api/client";
@@ -26,13 +27,23 @@ interface DetectionLayer {
   id: string;
   bbox: [number, number, number, number];
   score: number | null;
+  classification?: "SEED" | "RECOVERY" | "REJECTED";
+  reason?: string;
+  eligible?: boolean;
+  sourceIndex?: number;
+  inPool?: boolean;
+}
+
+interface CandidateAudit {
+  decisions: DetectionLayer[];
+  pool: DetectionLayer[];
 }
 
 interface AssociationMatch {
   matchId: string;
   leftCandidateId: string;
   rightCandidateId: string;
-  trackId: string;
+  trackId: string | null;
 }
 
 const SIDES: readonly Side[] = ["left", "right"];
@@ -77,6 +88,7 @@ function outputProduced(record: TraceRecord): boolean {
 function failureReason(record: TraceRecord): string {
   const payload = payloadOf(record);
   if (typeof payload.reason === "string" && payload.reason) return payload.reason;
+  if (typeof payload.hand_reason === "string" && payload.hand_reason) return payload.hand_reason;
   if (payload.selection && typeof payload.selection === "object") {
     const decision = (payload.selection as Record<string, unknown>).decision;
     if (typeof decision === "string" && decision) return decision;
@@ -223,6 +235,34 @@ function objectValues(value: unknown): Record<string, unknown>[] {
   );
 }
 
+function classificationOf(value: unknown): DetectionLayer["classification"] {
+  return value === "SEED" || value === "RECOVERY" || value === "REJECTED"
+    ? value
+    : undefined;
+}
+
+function detectionLayer(
+  value: Record<string, unknown>,
+  fallbackId: string,
+): DetectionLayer | null {
+  const bbox = value.bbox_xyxy;
+  if (!Array.isArray(bbox) || bbox.length !== 4 || !bbox.every(finiteNumber)) return null;
+  const score = finiteNumber(value.bbox_score)
+    ? value.bbox_score
+    : finiteNumber(value.score) ? value.score : null;
+  return {
+    id: String(value.candidate_id ?? fallbackId),
+    bbox: [bbox[0], bbox[1], bbox[2], bbox[3]],
+    score,
+    classification: classificationOf(value.classification),
+    reason: typeof value.reason === "string" ? value.reason : undefined,
+    eligible: typeof value.eligible_for_association === "boolean"
+      ? value.eligible_for_association
+      : undefined,
+    sourceIndex: finiteNumber(value.source_index) ? value.source_index : undefined,
+  };
+}
+
 function detectionsForSide(records: TraceRecord[], side: Side): DetectionLayer[] {
   const found = new Map<string, DetectionLayer>();
   for (const record of records) {
@@ -233,20 +273,35 @@ function detectionsForSide(records: TraceRecord[], side: Side): DetectionLayer[]
       ? objectValues(payload.detections)
       : objectValues(payload.instances);
     detections.forEach((detection, index) => {
-      const bbox = detection.bbox_xyxy;
-      if (
-        !Array.isArray(bbox)
-        || bbox.length !== 4
-        || !bbox.every(finiteNumber)
-      ) return;
-      const id = String(detection.candidate_id ?? `${side}-candidate-${index}`);
-      const score = finiteNumber(detection.bbox_score)
-        ? detection.bbox_score
-        : finiteNumber(detection.score) ? detection.score : null;
-      found.set(id, { id, bbox: [bbox[0], bbox[1], bbox[2], bbox[3]], score });
+      const parsed = detectionLayer(detection, `${side}-candidate-${index}`);
+      if (parsed) found.set(parsed.id, parsed);
     });
   }
   return [...found.values()].sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function candidateAuditForSide(records: TraceRecord[], side: Side): CandidateAudit | null {
+  const record = [...records].reverse().find((candidate) => {
+    const payload = payloadOf(candidate);
+    return candidate.stage === "DETECTION"
+      && payload.view_id === side
+      && Array.isArray(payload.candidate_decisions);
+  });
+  if (!record) return null;
+  const payload = payloadOf(record);
+  const decisions = objectValues(payload.candidate_decisions).flatMap((value, index) => {
+    const parsed = detectionLayer(value, `${side}-candidate-${index}`);
+    return parsed ? [parsed] : [];
+  });
+  const pool = objectValues(payload.candidate_pool).flatMap((value, index) => {
+    const parsed = detectionLayer(value, `${side}-pool-${index}`);
+    return parsed ? [parsed] : [];
+  });
+  const poolIds = new Set(pool.map((candidate) => candidate.id));
+  return {
+    decisions: decisions.map((candidate) => ({ ...candidate, inPool: poolIds.has(candidate.id) })),
+    pool: pool.map((candidate) => ({ ...candidate, inPool: true })),
+  };
 }
 
 function poseLayers(records: TraceRecord[], side: Side, space: "native" | "rectified"): PoseLayer[] {
@@ -426,21 +481,42 @@ function DetectionGraphic({
   width,
   height,
   label,
+  variant = "legacy",
 }: {
   detections: DetectionLayer[];
   width: number;
   height: number;
   label: string;
+  variant?: "legacy" | "raw" | "pool";
 }) {
   return (
     <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="xMidYMid meet" role="img" aria-label={label}>
       {detections.map((detection) => {
         const [x1, y1, x2, y2] = detection.bbox;
+        const color = detection.classification === "SEED"
+          ? "#74f6c4"
+          : detection.classification === "RECOVERY"
+            ? "#f4bd6a"
+            : detection.classification === "REJECTED"
+              ? "#ff6d78"
+              : trackColor(detection.id);
+        const accessibleLabel = detection.classification && variant !== "legacy"
+          ? `${detection.id} ${detection.classification} ${variant === "raw" ? "raw proposal" : "pool candidate"}`
+          : `${detection.id} detection`;
         return (
-          <g key={detection.id} aria-label={`${detection.id} detection`} stroke={trackColor(detection.id)}>
+          <g
+            key={detection.id}
+            aria-label={accessibleLabel}
+            className={detection.classification
+              ? `candidate-box ${detection.classification.toLowerCase()}`
+              : undefined}
+            data-classification={detection.classification}
+            stroke={color}
+          >
             <rect x={x1} y={y1} width={x2 - x1} height={y2 - y1} fill="none" vectorEffect="non-scaling-stroke" />
-            <text x={x1 + 4} y={Math.max(12, y1 - 5)} fill={trackColor(detection.id)} stroke="none">
+            <text x={x1 + 4} y={Math.max(12, y1 - 5)} fill={color} stroke="none">
               {detection.id}{detection.score === null ? "" : ` ${(detection.score * 100).toFixed(0)}%`}
+              {detection.classification ? ` · ${detection.classification}` : ""}
             </text>
           </g>
         );
@@ -449,16 +525,87 @@ function DetectionGraphic({
   );
 }
 
+function CandidateDecisionList({ decisions, label }: { decisions: DetectionLayer[]; label: string }) {
+  return (
+    <ul className="candidate-decision-list" aria-label={`${label} detector candidate decisions`}>
+      {decisions.map((candidate) => (
+        <li
+          aria-label={`${candidate.id} candidate decision`}
+          className={candidate.classification?.toLowerCase()}
+          data-classification={candidate.classification}
+          data-in-pool={String(candidate.inPool === true)}
+          key={candidate.id}
+        >
+          <div className="candidate-decision-identity">
+            <strong>{candidate.id}</strong>
+            <span>{candidate.classification ?? "UNKNOWN"}</span>
+          </div>
+          <div className="candidate-decision-facts">
+            <span>{candidate.score === null ? "SCORE —" : `SCORE ${(candidate.score * 100).toFixed(1)}%`}</span>
+            <span>{candidate.sourceIndex === undefined ? "SOURCE —" : `SOURCE #${candidate.sourceIndex}`}</span>
+            <span>{candidate.eligible === undefined ? "ELIGIBLE —" : `ELIGIBLE ${candidate.eligible ? "YES" : "NO"}`}</span>
+            <span>{candidate.inPool ? "POOL IN" : "POOL OUT"}</span>
+          </div>
+          <p>{candidate.reason ?? "REASON_NOT_RECORDED"}</p>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function DetectionComparison({ runKey, records }: { runKey: string; records: TraceRecord[] }) {
+  const audits = new Map(SIDES.map((side) => [side, candidateAuditForSide(records, side)]));
+  const candidateAware = [...audits.values()].some(Boolean);
   return (
     <div className="native-comparison">
-      <header className="coordinate-space-banner">SOURCE → DETECTION · NATIVE FISHEYE PIXELS</header>
+      <header className="coordinate-space-banner">
+        {candidateAware
+          ? "RAW DETECTOR PROPOSALS → BOUNDED ASSOCIATION POOL"
+          : "SOURCE → DETECTION · NATIVE FISHEYE PIXELS"}
+      </header>
       <div className="stage-comparison-stereo">
         {SIDES.map((side) => {
           const label = sideLabel(side);
           const source = artifactByRole(records, `source_${side}`);
           const detections = detectionsForSide(records, side);
           const [width, height] = imageSize(records, side);
+          const audit = audits.get(side);
+          if (audit) {
+            return (
+              <section className="stage-comparison-view candidate-audit-view" key={side} aria-label={`${label} HAND_DETECTION`}>
+                <header><strong>{label}</strong><span>{audit.decisions.length} RAW → {audit.pool.length} POOL</span></header>
+                <div className="stage-comparison-pair">
+                  <figure>
+                    <div className="comparison-overlay-stage">
+                      <EvidenceImage runKey={runKey} artifact={source} label={`${label} raw proposal background`} />
+                      <DetectionGraphic
+                        detections={audit.decisions}
+                        width={width}
+                        height={height}
+                        label={`${label} raw detector proposals`}
+                        variant="raw"
+                      />
+                    </div>
+                    <figcaption>BEFORE · {audit.decisions.length} RAW PROPOSALS</figcaption>
+                  </figure>
+                  <figure>
+                    <div className="comparison-overlay-stage">
+                      <EvidenceImage runKey={runKey} artifact={source} label={`${label} bounded pool background`} />
+                      <DetectionGraphic
+                        detections={audit.pool}
+                        width={width}
+                        height={height}
+                        label={`${label} bounded association pool`}
+                        variant="pool"
+                      />
+                    </div>
+                    <figcaption>AFTER · {audit.pool.length} CANDIDATES FOR ASSOCIATION</figcaption>
+                  </figure>
+                </div>
+                <CandidateDecisionList decisions={audit.decisions} label={label} />
+              </section>
+            );
+          }
           return (
             <section className="stage-comparison-view" key={side} aria-label={`${label} HAND_DETECTION`}>
               <header><strong>{label}</strong><span>{detections.length} HAND CANDIDATES</span></header>
@@ -483,6 +630,212 @@ function DetectionComparison({ runKey, records }: { runKey: string; records: Tra
   );
 }
 
+const VIRTUAL_CROP_EVENTS = new Set([
+  "virtual_crop_pose_inferred",
+  "virtual_crop_pose_not_produced",
+]);
+
+interface VirtualCropCandidate {
+  key: string;
+  record: TraceRecord;
+  candidateId: string;
+  side: Side;
+  cropArtifact: ArtifactRef | undefined;
+  maskArtifact: ArtifactRef | undefined;
+  cropPoints: NullablePoint2[];
+  nativePoints: NullablePoint2[];
+  cropSize: [number, number];
+  nativeSize: [number, number];
+  policyId: string;
+  cameraId: string;
+  validFraction: number | null;
+  fov: [number, number] | null;
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function positiveSize(value: unknown, fallback: [number, number]): [number, number] {
+  if (
+    Array.isArray(value)
+    && value.length >= 2
+    && finiteNumber(value[0])
+    && finiteNumber(value[1])
+    && value[0] > 0
+    && value[1] > 0
+  ) return [value[0], value[1]];
+  return fallback;
+}
+
+function virtualFov(camera: Record<string, unknown> | null, size: [number, number]): [number, number] | null {
+  const intrinsics = camera?.K_virtual;
+  if (!Array.isArray(intrinsics) || !Array.isArray(intrinsics[0]) || !Array.isArray(intrinsics[1])) {
+    return null;
+  }
+  const fx = intrinsics[0][0];
+  const fy = intrinsics[1][1];
+  if (!finiteNumber(fx) || !finiteNumber(fy) || fx <= 0 || fy <= 0) return null;
+  const toDegrees = 180 / Math.PI;
+  return [
+    2 * Math.atan(size[0] / (2 * fx)) * toDegrees,
+    2 * Math.atan(size[1] / (2 * fy)) * toDegrees,
+  ];
+}
+
+function virtualCropCandidates(records: TraceRecord[]): VirtualCropCandidate[] {
+  return records.flatMap((record, index) => {
+    if (!VIRTUAL_CROP_EVENTS.has(record.event ?? "")) return [];
+    const payload = payloadOf(record);
+    if (payload.view_id !== "left" && payload.view_id !== "right") return [];
+    const side = payload.view_id as Side;
+    const candidateId = typeof payload.candidate_id === "string" && payload.candidate_id
+      ? payload.candidate_id
+      : `${side}-candidate-${index}`;
+    const camera = objectValue(payload.virtual_camera);
+    const cropSize = positiveSize(camera?.output_size, [256, 256]);
+    const artifacts = artifactsOf(record);
+    return [{
+      key: record.record_id ?? `${side}:${candidateId}:${index}`,
+      record,
+      candidateId,
+      side,
+      cropArtifact: artifacts.find((artifact) => artifact.role === "virtual_crop"),
+      maskArtifact: artifacts.find((artifact) => artifact.role === "virtual_crop_valid_mask"),
+      cropPoints: pointList(payload.keypoints_uv_crop),
+      nativePoints: pointList(payload.keypoints_uv_native ?? payload.keypoints_uv),
+      cropSize,
+      nativeSize: imageSize([record], side),
+      policyId: String(camera?.crop_policy_id ?? payload.crop_policy_id ?? "UNKNOWN_POLICY"),
+      cameraId: String(camera?.virtual_camera_id ?? payload.virtual_camera_id ?? "UNKNOWN_CAMERA"),
+      validFraction: finiteNumber(camera?.valid_fraction) ? camera.valid_fraction : null,
+      fov: virtualFov(camera, cropSize),
+    }];
+  }).sort((left, right) => (
+    left.side.localeCompare(right.side) || left.candidateId.localeCompare(right.candidateId)
+  ));
+}
+
+function VirtualCropDiagnostics({ runKey, records }: { runKey: string; records: TraceRecord[] }) {
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+  const candidates = virtualCropCandidates(records);
+  if (!candidates.length) return null;
+  const sourceBackgrounds: Record<Side, ArtifactRef | undefined> = {
+    left: artifactByRole(records, "source_left"),
+    right: artifactByRole(records, "source_right"),
+  };
+  return (
+    <section className="virtual-crop-diagnostics" aria-label="Virtual crop RTMPose diagnostics">
+      <header className="virtual-crop-heading">
+        <div>
+          <span>V2 · PHYSICAL POSE INPUT</span>
+          <strong>VIRTUAL PERSPECTIVE CROP DIAGNOSTICS</strong>
+        </div>
+        <span>{candidates.length} CANDIDATES · CROP → NATIVE</span>
+      </header>
+      <div className="virtual-crop-candidate-list">
+        {candidates.map((candidate) => {
+          const label = sideLabel(candidate.side);
+          const produced = outputProduced(candidate.record);
+          const expanded = expandedKey === candidate.key;
+          const cropLayer: PoseLayer = { id: candidate.candidateId, points: candidate.cropPoints };
+          const nativeLayer: PoseLayer = { id: candidate.candidateId, points: candidate.nativePoints };
+          return (
+            <article
+              className={`virtual-crop-candidate ${produced ? "produced" : "not-produced"}`}
+              aria-label={`${candidate.candidateId} virtual crop diagnostic`}
+              key={candidate.key}
+            >
+              <header>
+                <div className="virtual-crop-candidate-identity">
+                  <strong>{candidate.candidateId}</strong>
+                  <span>{label.toUpperCase()} · VIRTUAL PINHOLE</span>
+                </div>
+                <div className="virtual-crop-candidate-controls">
+                  <span>{produced ? "PRODUCED" : "NOT_PRODUCED"}</span>
+                  <button
+                    type="button"
+                    aria-expanded={expanded}
+                    aria-label={`${expanded ? "收起" : "展开"} ${candidate.candidateId} 图像证据`}
+                    onClick={() => setExpandedKey(expanded ? null : candidate.key)}
+                  >
+                    {expanded ? "HIDE EVIDENCE" : "LOAD EVIDENCE"}
+                  </button>
+                </div>
+              </header>
+              <dl className="virtual-camera-metrics">
+                <div><dt>POLICY</dt><dd>{candidate.policyId}</dd></div>
+                <div>
+                  <dt>FOV</dt>
+                  <dd>{candidate.fov
+                    ? `FOV ${candidate.fov[0].toFixed(1)}° × ${candidate.fov[1].toFixed(1)}°`
+                    : "FOV —"}</dd>
+                </div>
+                <div>
+                  <dt>VALID RAYS</dt>
+                  <dd>{candidate.validFraction === null
+                    ? "VALID —"
+                    : `VALID ${(candidate.validFraction * 100).toFixed(1)}%`}</dd>
+                </div>
+                <div><dt>CAMERA</dt><dd title={candidate.cameraId}>{candidate.cameraId}</dd></div>
+              </dl>
+              {expanded && (
+                <div className={`virtual-crop-space-grid ${candidate.maskArtifact ? "with-mask" : ""}`}>
+                  <figure>
+                    <OverlayPanel
+                      runKey={runKey}
+                      background={candidate.cropArtifact}
+                      backgroundLabel={`${candidate.candidateId} virtual crop`}
+                      layers={[cropLayer]}
+                      selectedTrack=""
+                      width={candidate.cropSize[0]}
+                      height={candidate.cropSize[1]}
+                      graphicLabel={`${candidate.candidateId} crop-space keypoints`}
+                      layerLabel="crop-space keypoints"
+                    />
+                    <figcaption>BEFORE · RTMPOSE CROP PIXELS</figcaption>
+                  </figure>
+                  <figure>
+                    <OverlayPanel
+                      runKey={runKey}
+                      background={sourceBackgrounds[candidate.side]}
+                      backgroundLabel={`${candidate.candidateId} native fisheye source`}
+                      layers={[nativeLayer]}
+                      selectedTrack=""
+                      width={candidate.nativeSize[0]}
+                      height={candidate.nativeSize[1]}
+                      graphicLabel={`${candidate.candidateId} native-space keypoints`}
+                      layerLabel="native-space keypoints"
+                    />
+                    <figcaption>AFTER · NATIVE FISHEYE PIXELS</figcaption>
+                  </figure>
+                  {candidate.maskArtifact && (
+                    <figure className="virtual-crop-mask">
+                      <EvidenceImage
+                        runKey={runKey}
+                        artifact={candidate.maskArtifact}
+                        label={`${candidate.candidateId} valid mask`}
+                      />
+                      <figcaption>VALID_MASK · PHYSICAL RAYS</figcaption>
+                    </figure>
+                  )}
+                </div>
+              )}
+              {!produced && (
+                <p className="virtual-crop-failure">
+                  <span>REASON</span>{failureReason(candidate.record)}
+                </p>
+              )}
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function PoseComparison({
   runKey,
   records,
@@ -493,47 +846,50 @@ function PoseComparison({
   selectedTrack: string;
 }) {
   return (
-    <div className="native-comparison">
-      <header className="coordinate-space-banner">DETECTION → ALL RTMPOSE HANDS · NATIVE FISHEYE PIXELS</header>
-      <div className="stage-comparison-stereo">
-        {SIDES.map((side) => {
-          const label = sideLabel(side);
-          const source = artifactByRole(records, `source_${side}`);
-          const detections = detectionsForSide(records, side);
-          const layers = poseLayers(records, side, "native");
-          const [width, height] = imageSize(records, side);
-          return (
-            <section className="stage-comparison-view pose-stage-comparison" key={side} aria-label={`${label} HAND_POSE_2D`}>
-              <header><strong>{label}</strong><span>DETECTION → ALL HAND KEYPOINTS</span></header>
-              <div className="stage-comparison-pair">
-                <figure>
-                  <div className="comparison-overlay-stage">
-                    <EvidenceImage runKey={runKey} artifact={source} label={`${label} detection background`} />
-                    <DetectionGraphic detections={detections} width={width} height={height} label={`${label} detection input boxes`} />
-                  </div>
-                  <figcaption>BEFORE · DETECTION</figcaption>
-                </figure>
-                <figure>
-                  <OverlayPanel
-                    runKey={runKey}
-                    background={source}
-                    backgroundLabel={`${label} RTMPose background`}
-                    layers={layers}
-                    selectedTrack={selectedTrack}
-                    width={width}
-                    height={height}
-                    graphicLabel={`${label} RTMPose 全手叠加`}
-                    layerLabel="2D 骨架"
-                  />
-                  <figcaption>AFTER · ALL RTMPOSE HANDS</figcaption>
-                </figure>
-              </div>
-              <TrackLegend layers={layers} selectedTrack={selectedTrack} />
-            </section>
-          );
-        })}
+    <>
+      <VirtualCropDiagnostics runKey={runKey} records={records} />
+      <div className="native-comparison">
+        <header className="coordinate-space-banner">DETECTION → ALL RTMPOSE HANDS · NATIVE FISHEYE PIXELS</header>
+        <div className="stage-comparison-stereo">
+          {SIDES.map((side) => {
+            const label = sideLabel(side);
+            const source = artifactByRole(records, `source_${side}`);
+            const detections = detectionsForSide(records, side);
+            const layers = poseLayers(records, side, "native");
+            const [width, height] = imageSize(records, side);
+            return (
+              <section className="stage-comparison-view pose-stage-comparison" key={side} aria-label={`${label} HAND_POSE_2D`}>
+                <header><strong>{label}</strong><span>DETECTION → ALL HAND KEYPOINTS</span></header>
+                <div className="stage-comparison-pair">
+                  <figure>
+                    <div className="comparison-overlay-stage">
+                      <EvidenceImage runKey={runKey} artifact={source} label={`${label} detection background`} />
+                      <DetectionGraphic detections={detections} width={width} height={height} label={`${label} detection input boxes`} />
+                    </div>
+                    <figcaption>BEFORE · DETECTION</figcaption>
+                  </figure>
+                  <figure>
+                    <OverlayPanel
+                      runKey={runKey}
+                      background={source}
+                      backgroundLabel={`${label} RTMPose background`}
+                      layers={layers}
+                      selectedTrack={selectedTrack}
+                      width={width}
+                      height={height}
+                      graphicLabel={`${label} RTMPose 全手叠加`}
+                      layerLabel="2D 骨架"
+                    />
+                    <figcaption>AFTER · ALL RTMPOSE HANDS</figcaption>
+                  </figure>
+                </div>
+                <TrackLegend layers={layers} selectedTrack={selectedTrack} />
+              </section>
+            );
+          })}
+        </div>
       </div>
-    </div>
+    </>
   );
 }
 
@@ -558,7 +914,9 @@ function associationMatches(records: TraceRecord[]): AssociationMatch[] {
       matchId,
       leftCandidateId,
       rightCandidateId,
-      trackId: typeof assignment?.track_id === "string" ? assignment.track_id : matchId,
+      trackId: typeof assignment?.track_id === "string"
+        ? assignment.track_id
+        : typeof match.track_id === "string" ? match.track_id : null,
     }];
   });
 }
@@ -579,7 +937,11 @@ function AssociationComparison({
       <header className="coordinate-space-banner">CANDIDATES → MATCHED / TRACKED</header>
       <div className="association-summary" aria-label="跨视角匹配结果">
         {matches.length ? matches.map((match) => (
-          <span key={match.matchId}>{match.matchId} → {match.trackId}</span>
+          <span key={match.matchId}>
+            {match.trackId
+              ? `${match.matchId} → ${match.trackId}`
+              : `${match.matchId} · MATCHED · UNTRACKED`}
+          </span>
         )) : <span>NOT_PRODUCED · NO_CROSS_VIEW_MATCH</span>}
       </div>
       <div className="stage-comparison-stereo">
@@ -594,7 +956,11 @@ function AssociationComparison({
               (side === "left" ? value.leftCandidateId : value.rightCandidateId)
                 === (candidate.candidateId ?? candidate.id)
             ));
-            return { ...candidate, id: match?.trackId ?? `${candidate.id} · UNMATCHED` };
+            if (!match) return { ...candidate, id: `${candidate.id} · UNMATCHED` };
+            return {
+              ...candidate,
+              id: match.trackId ?? `${match.matchId} · UNTRACKED`,
+            };
           });
           return (
             <section className="stage-comparison-view" key={side} aria-label={`${label} CROSS_VIEW_ASSOCIATION`}>
@@ -719,25 +1085,48 @@ function NotProducedReasons({ records, stage }: { records: TraceRecord[]; stage:
   );
 }
 
+function RawDownstreamRejectionReasons({ records }: { records: TraceRecord[] }) {
+  const downstreamStages = new Set(["KINEMATIC_REFINEMENT", "TEMPORAL_REFINEMENT", "EXPORT"]);
+  const reasons = [...new Set(records.flatMap((record) => {
+    if (!downstreamStages.has(record.stage ?? "") || outputProduced(record)) return [];
+    const payload = payloadOf(record);
+    if (typeof payload.track_id === "string" && payload.track_id) return [];
+    const reason = failureReason(record);
+    return reason === "OUTPUT_NOT_PRODUCED" || reason === "STAGE_FAILED" ? [] : [reason];
+  }))];
+  if (!reasons.length) return null;
+  return (
+    <ul className="stage-failure-list" aria-label="Raw downstream rejection reasons">
+      {reasons.map((reason) => (
+        <li key={reason}>DOWNSTREAM · NOT_PRODUCED · {reason}</li>
+      ))}
+    </ul>
+  );
+}
+
 function RawComparison({ runKey, records, selectedTrack }: Omit<StageComparisonProps, "selectedNodeId">) {
   const matches = associationMatches(records);
   return (
-    <ProjectionTransition
-      runKey={runKey}
-      records={records}
-      selectedTrack={selectedTrack}
-      heading="ASSOCIATED 2D → STEREO TRIANGULATION · RECTIFIED PIXEL SPACE"
-      beforeLabel="ASSOCIATION"
-      afterLabel="Raw 3D"
-      beforeLayers={(side) => poseLayers(records, side, "rectified").map((layer) => {
-        const match = matches.find((value) => (
-          (side === "left" ? value.leftCandidateId : value.rightCandidateId)
-            === (layer.candidateId ?? layer.id)
-        ));
-        return { ...layer, id: match?.trackId ?? layer.id };
-      })}
-      afterLayers={(side) => projectedLayers(records, "RAW_FUSION", side)}
-    />
+    <>
+      <ProjectionTransition
+        runKey={runKey}
+        records={records}
+        selectedTrack={selectedTrack}
+        heading="ASSOCIATED 2D → STEREO TRIANGULATION · RECTIFIED PIXEL SPACE"
+        beforeLabel="ASSOCIATION"
+        afterLabel="Raw 3D"
+        beforeLayers={(side) => poseLayers(records, side, "rectified").flatMap((layer) => {
+          const match = matches.find((value) => (
+            (side === "left" ? value.leftCandidateId : value.rightCandidateId)
+              === (layer.candidateId ?? layer.id)
+          ));
+          return match?.trackId ? [{ ...layer, id: match.trackId }] : [];
+        })}
+        afterLayers={(side) => projectedLayers(records, "RAW_FUSION", side)}
+      />
+      <NotProducedReasons records={records} stage="RAW_FUSION" />
+      <RawDownstreamRejectionReasons records={records} />
+    </>
   );
 }
 
@@ -778,12 +1167,16 @@ function temporalInputLayers(records: TraceRecord[], side: Side): PoseLayer[] {
 
 function TemporalComparison({ runKey, records, selectedTrack }: Omit<StageComparisonProps, "selectedNodeId">) {
   const temporalRecords = records.filter((record) => record.stage === "TEMPORAL_REFINEMENT");
+  const trackedTemporalRecords = temporalRecords.filter((record) => {
+    const trackId = payloadOf(record).track_id;
+    return typeof trackId === "string" && Boolean(trackId);
+  });
   return (
     <>
       <div className="stage-path-list" aria-label="每手实际时序输入">
-        {temporalRecords.map((record, index) => {
+        {trackedTemporalRecords.map((record, index) => {
           const payload = payloadOf(record);
-          const track = typeof payload.track_id === "string" ? payload.track_id : "NO_TRACK";
+          const track = payload.track_id as string;
           const input = payload.input_stage === "KINEMATIC_REFINEMENT"
             ? "KINEMATIC_REFINEMENT"
             : payload.input_stage === "RAW_FUSION" ? "RAW_FUSION" : "UNKNOWN_INPUT";

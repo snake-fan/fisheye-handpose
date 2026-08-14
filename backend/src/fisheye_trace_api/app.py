@@ -188,7 +188,9 @@ def _artifact_response(
 ) -> Response:
     common_headers = {
         "Accept-Ranges": "bytes",
-        "Cache-Control": "no-store",
+        "Cache-Control": (
+            "private, max-age=31536000, immutable" if artifact.content_addressed else "no-store"
+        ),
         "X-Content-Type-Options": "nosniff",
     }
     if range_header is None:

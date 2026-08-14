@@ -9,6 +9,12 @@ from typing import Any
 
 from .calibration import RectifiedStereo
 from .contracts import ThresholdRequest, WorkerError
+from .fusion import (
+    FUSION_METHOD_ID,
+    JointObservation,
+    RobustStereoFusion,
+    StereoFusionConfig,
+)
 
 
 def normalize_instances(
@@ -51,17 +57,34 @@ def normalize_instances(
             for value in numeric
         ):
             raise WorkerError("runtime inference contains a non-finite numeric value")
-        normalized.append(
-            {
-                "candidate_id": f"{side}-{index}",
-                "bbox_xyxy": [float(value) for value in bbox],
-                "bbox_score": float(bbox_score),
-                "label": label,
-                "keypoints_uv": [[float(u), float(v)] for u, v in points],
-                "keypoints_uv_rectified": rectification.rectify_points(side, points),
-                "keypoint_scores": [float(value) for value in scores],
-            }
-        )
+        candidate_id = instance.get("candidate_id", f"{side}-{index}")
+        if not isinstance(candidate_id, str) or not candidate_id:
+            raise WorkerError("runtime candidate_id must be a non-empty string")
+        normalized_instance = {
+            "candidate_id": candidate_id,
+            "bbox_xyxy": [float(value) for value in bbox],
+            "bbox_score": float(bbox_score),
+            "label": label,
+            "keypoints_uv": [[float(u), float(v)] for u, v in points],
+            "keypoints_uv_rectified": rectification.rectify_points(side, points),
+            "keypoint_scores": [float(value) for value in scores],
+        }
+        for optional in (
+            "source_index",
+            "classification",
+            "reason",
+            "eligible_for_association",
+            "final_selection",
+            "keypoints_uv_crop",
+            "model_keypoint_scores",
+            "keypoint_valid_mask",
+            "model_input_space",
+            "crop_policy_id",
+            "virtual_camera_id",
+        ):
+            if optional in instance:
+                normalized_instance[optional] = instance[optional]
+        normalized.append(normalized_instance)
     return normalized
 
 
@@ -89,8 +112,8 @@ def associate(
     right_instances: list[dict[str, Any]],
     thresholds: ThresholdRequest,
 ) -> dict[str, Any]:
-    if len(left_instances) > 2 or len(right_instances) > 2:
-        raise WorkerError("association supports at most two candidates per view")
+    if len(left_instances) > 4 or len(right_instances) > 4:
+        raise WorkerError("association supports at most four candidates per view")
     candidates: list[tuple[float, int, int, int]] = []
     for left_index, left in enumerate(left_instances):
         for right_index, right in enumerate(right_instances):
@@ -99,7 +122,7 @@ def associate(
                 candidates.append((cost, -support, left_index, right_index))
     candidates.sort(key=lambda value: (value[2], value[3], value[0], value[1]))
     assignments: list[tuple[tuple[float, int, int, int], ...]] = [()]
-    for size in range(1, min(len(left_instances), len(right_instances)) + 1):
+    for size in range(1, min(2, len(left_instances), len(right_instances)) + 1):
         for subset in combinations(candidates, size):
             left_indices = {candidate[2] for candidate in subset}
             right_indices = {candidate[3] for candidate in subset}
@@ -156,87 +179,93 @@ def triangulate_match(
     rectification: RectifiedStereo,
     thresholds: ThresholdRequest,
 ) -> dict[str, Any]:
-    import cv2
-    import numpy as np
-
-    _, left_inverse = _camera_center_and_inverse(rectification.p1)
-    _, right_inverse = _camera_center_and_inverse(rectification.p2)
-    landmarks: list[list[float] | None] = []
-    validity: list[str] = []
-    metrics: list[dict[str, Any]] = []
-    for joint_index, (left_uv, right_uv, left_score, right_score) in enumerate(
-        zip(
-            left["keypoints_uv_rectified"],
-            right["keypoints_uv_rectified"],
-            left["keypoint_scores"],
-            right["keypoint_scores"],
-            strict=True,
+    def observations(instance: dict[str, Any]) -> list[JointObservation]:
+        masks = instance.get("keypoint_valid_mask", [True] * 21)
+        covariances = instance.get(
+            "keypoint_covariance_px2",
+            [[[1.0, 0.0], [0.0, 1.0]] for _ in range(21)],
         )
-    ):
-        metric: dict[str, Any] = {
+        if not isinstance(masks, list) or len(masks) != 21:
+            raise WorkerError("keypoint_valid_mask must contain 21 booleans")
+        if any(not isinstance(value, bool) for value in masks):
+            raise WorkerError("keypoint_valid_mask must contain booleans")
+        if not isinstance(covariances, list) or len(covariances) != 21:
+            raise WorkerError("keypoint_covariance_px2 must contain 21 matrices")
+        return [
+            JointObservation(
+                uv=(float(uv[0]), float(uv[1])),
+                score=float(score),
+                covariance_px2=(
+                    (float(covariance[0][0]), float(covariance[0][1])),
+                    (float(covariance[1][0]), float(covariance[1][1])),
+                ),
+                valid_mask=mask,
+            )
+            for uv, score, covariance, mask in zip(
+                instance["keypoints_uv_rectified"],
+                instance["keypoint_scores"],
+                covariances,
+                masks,
+                strict=True,
+            )
+        ]
+
+    fusion = RobustStereoFusion(
+        rectification.p1,
+        rectification.p2,
+        config=StereoFusionConfig(
+            min_keypoint_score=thresholds.keypoint_score,
+            max_epipolar_error_px=thresholds.association_epipolar_px,
+            max_reprojection_error_px=thresholds.max_reprojection_error_px,
+            min_ray_angle_deg=thresholds.min_ray_angle_deg,
+            min_depth_m=thresholds.min_depth_m,
+            max_depth_m=thresholds.max_depth_m,
+        ),
+    )
+    hand = fusion.fuse_hand(observations(left), observations(right))
+    landmarks = [
+        None if joint.point_xyz_m is None else list(joint.point_xyz_m) for joint in hand.joints
+    ]
+    validity = ["VALID" if joint.valid else (joint.reason or "INVALID") for joint in hand.joints]
+    covariance_m2 = [
+        None if joint.covariance_m2 is None else [list(row) for row in joint.covariance_m2]
+        for joint in hand.joints
+    ]
+    covariance_status = [
+        joint.covariance_status if joint.covariance_m2 is not None else "NOT_ESTIMATED"
+        for joint in hand.joints
+    ]
+    metrics = [
+        {
             "joint_index": joint_index,
-            "epipolar_error_px": abs(left_uv[1] - right_uv[1]),
-            "left_score": left_score,
-            "right_score": right_score,
-            "left_reprojection_error_px": None,
-            "right_reprojection_error_px": None,
-            "ray_angle_deg": None,
+            "epipolar_error_px": joint.epipolar_error_px,
+            "left_score": float(left["keypoint_scores"][joint_index]),
+            "right_score": float(right["keypoint_scores"][joint_index]),
+            "left_reprojection_error_px": joint.left_reprojection_error_px,
+            "right_reprojection_error_px": joint.right_reprojection_error_px,
+            "ray_angle_deg": joint.ray_angle_deg,
+            "left_depth_m": joint.left_depth_m,
+            "right_depth_m": joint.right_depth_m,
+            "support_view_count": joint.support_view_count,
+            "covariance_status": joint.covariance_status,
         }
-        reason: str | None = None
-        point: Any | None = None
-        if left_score < thresholds.keypoint_score or right_score < thresholds.keypoint_score:
-            reason = "LOW_KEYPOINT_SCORE"
-        elif metric["epipolar_error_px"] > thresholds.association_epipolar_px:
-            reason = "EPIPOLAR_ERROR"
-        else:
-            homogeneous = cv2.triangulatePoints(
-                rectification.p1,
-                rectification.p2,
-                np.asarray(left_uv, dtype=np.float64).reshape(2, 1),
-                np.asarray(right_uv, dtype=np.float64).reshape(2, 1),
-            )[:, 0]
-            if not np.all(np.isfinite(homogeneous)) or abs(float(homogeneous[3])) <= 1e-12:
-                reason = "DEGENERATE_TRIANGULATION"
-            else:
-                point = homogeneous[:3] / homogeneous[3]
-                if not np.all(np.isfinite(point)) or point[2] <= 0:
-                    reason = "BEHIND_CAMERA"
-                else:
-                    reprojections: list[float] = []
-                    for projection, observed, label in (
-                        (rectification.p1, left_uv, "left"),
-                        (rectification.p2, right_uv, "right"),
-                    ):
-                        projected = projection @ np.append(point, 1.0)
-                        projected_uv = projected[:2] / projected[2]
-                        error = float(np.linalg.norm(projected_uv - np.asarray(observed)))
-                        metric[f"{label}_reprojection_error_px"] = error
-                        reprojections.append(error)
-                    left_ray = left_inverse @ np.asarray([*left_uv, 1.0])
-                    right_ray = right_inverse @ np.asarray([*right_uv, 1.0])
-                    left_ray /= np.linalg.norm(left_ray)
-                    right_ray /= np.linalg.norm(right_ray)
-                    cosine = float(np.clip(np.dot(left_ray, right_ray), -1.0, 1.0))
-                    metric["ray_angle_deg"] = math.degrees(math.acos(cosine))
-                    if max(reprojections) > thresholds.max_reprojection_error_px:
-                        reason = "REPROJECTION_ERROR"
-                    elif metric["ray_angle_deg"] < thresholds.min_ray_angle_deg:
-                        reason = "RAY_ANGLE_TOO_SMALL"
-        if reason is None and point is not None:
-            landmarks.append([float(value) for value in point])
-            validity.append("VALID")
-        else:
-            landmarks.append(None)
-            validity.append(reason or "INVALID")
-        metrics.append(metric)
+        for joint_index, joint in enumerate(hand.joints)
+    ]
     return {
+        "fusion_method": FUSION_METHOD_ID,
         "coordinate_frame": "rectified_left_camera",
         "length_unit": "m",
         "landmark_schema": "fhp21/v1",
         "landmarks_xyz_m": landmarks,
         "validity": validity,
+        "covariance_m2": covariance_m2,
+        "covariance_status": covariance_status,
         "metrics": metrics,
         "valid_landmark_count": sum(value == "VALID" for value in validity),
+        "hand_validity": hand.validity,
+        "hand_reason": hand.reason,
+        "palm_support_count": hand.palm_support_count,
+        "minimum_palm_support": hand.minimum_palm_support,
     }
 
 

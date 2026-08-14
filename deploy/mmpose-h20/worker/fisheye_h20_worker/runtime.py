@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .candidates import CandidateBatch, CandidatePolicy
 from .contracts import WorkerError
 from .mano import MANO_FHP21_MAPPING_ID, MANO_FHP21_SOURCES
 
@@ -125,7 +127,7 @@ class OpenMMLabRuntime:
         finally:
             capture.release()
 
-    def infer(
+    def detect(
         self,
         models: LoadedModels,
         frame: Any,
@@ -134,10 +136,18 @@ class OpenMMLabRuntime:
         category_id: int,
         max_instances: int = 2,
     ) -> list[dict[str, Any]]:
+        """Return deterministic native-fisheye detector proposals without running pose."""
+
         import numpy as np
         from mmdet.apis import inference_detector
         from mmengine.registry import DefaultScope
-        from mmpose.apis import inference_topdown
+
+        if (
+            isinstance(max_instances, bool)
+            or not isinstance(max_instances, int)
+            or max_instances < 1
+        ):
+            raise WorkerError("max_instances must be a positive integer")
 
         with DefaultScope.overwrite_default_scope("mmdet"):
             detection_result = inference_detector(models.detector, frame)
@@ -158,17 +168,71 @@ class OpenMMLabRuntime:
         ]
         selected.sort(key=lambda index: (-float(scores[index]), index))
         selected = selected[:max_instances]
-        if not selected:
+        return [
+            {
+                "bbox_xyxy": bboxes[index].astype(float).tolist(),
+                "bbox_score": float(scores[index]),
+                "label": int(labels[index]),
+            }
+            for index in selected
+        ]
+
+    def detect_candidates(
+        self,
+        models: LoadedModels,
+        frame: Any,
+        *,
+        policy: CandidatePolicy,
+        category_id: int,
+        view_id: str,
+    ) -> CandidateBatch:
+        """Classify every raw detector proposal before bounding the association pool."""
+
+        import numpy as np
+        from mmdet.apis import inference_detector
+        from mmengine.registry import DefaultScope
+
+        if not isinstance(policy, CandidatePolicy):
+            raise WorkerError("candidate policy must be a CandidatePolicy")
+        with DefaultScope.overwrite_default_scope("mmdet"):
+            detection_result = inference_detector(models.detector, frame)
+        predicted = getattr(detection_result, "pred_instances", None)
+        if predicted is None:
+            raise WorkerError("detector result has no pred_instances")
+        return policy.classify(
+            bboxes=_numpy(getattr(predicted, "bboxes", []), np),
+            scores=_numpy(getattr(predicted, "scores", []), np),
+            labels=_numpy(getattr(predicted, "labels", []), np),
+            category_id=category_id,
+            view_id=view_id,
+        )
+
+    def infer_pose(
+        self,
+        models: LoadedModels,
+        frame: Any,
+        *,
+        bboxes: list[list[float]],
+    ) -> list[dict[str, Any]]:
+        """Run top-down pose for explicit boxes in the supplied physical image space."""
+
+        import numpy as np
+        from mmengine.registry import DefaultScope
+        from mmpose.apis import inference_topdown
+
+        selected_boxes = np.asarray(bboxes, dtype=np.float32)
+        if selected_boxes.size == 0:
             return []
-        selected_boxes = np.asarray([bboxes[index] for index in selected], dtype=np.float32)
+        if selected_boxes.ndim != 2 or selected_boxes.shape[1:] != (4,):
+            raise WorkerError(f"pose bbox shape is invalid: {selected_boxes.shape}")
+        if not np.all(np.isfinite(selected_boxes)):
+            raise WorkerError("pose bboxes contain non-finite values")
         with DefaultScope.overwrite_default_scope("mmpose"):
             pose_results = inference_topdown(models.pose, frame, bboxes=selected_boxes)
-        if len(pose_results) != len(selected):
+        if len(pose_results) != len(selected_boxes):
             raise WorkerError("pose result count differs from detector box count")
-        instances: list[dict[str, Any]] = []
-        for output_index, (detection_index, pose_result) in enumerate(
-            zip(selected, pose_results, strict=True)
-        ):
+        evidence: list[dict[str, Any]] = []
+        for output_index, pose_result in enumerate(pose_results):
             pose = getattr(pose_result, "pred_instances", None)
             if pose is None or not hasattr(pose, "keypoints"):
                 raise WorkerError(f"pose instance {output_index} has no keypoints")
@@ -183,22 +247,42 @@ class OpenMMLabRuntime:
                     f"pose instance must have (21,2)/(21,) output, got "
                     f"{keypoints.shape}/{keypoint_scores.shape}"
                 )
-            if not (
-                np.all(np.isfinite(keypoints))
-                and np.all(np.isfinite(keypoint_scores))
-                and np.all(np.isfinite(bboxes[detection_index]))
-            ):
+            if not (np.all(np.isfinite(keypoints)) and np.all(np.isfinite(keypoint_scores))):
                 raise WorkerError("model output contains non-finite values")
-            instances.append(
+            evidence.append(
                 {
-                    "bbox_xyxy": bboxes[detection_index].astype(float).tolist(),
-                    "bbox_score": float(scores[detection_index]),
-                    "label": int(labels[detection_index]),
                     "keypoints_uv": keypoints.astype(float).tolist(),
                     "keypoint_scores": keypoint_scores.astype(float).tolist(),
                 }
             )
-        return instances
+        return evidence
+
+    def infer(
+        self,
+        models: LoadedModels,
+        frame: Any,
+        *,
+        bbox_threshold: float,
+        category_id: int,
+        max_instances: int = 2,
+    ) -> list[dict[str, Any]]:
+        """Compatibility composition for the recorded native-fisheye baseline profile."""
+
+        detections = self.detect(
+            models,
+            frame,
+            bbox_threshold=bbox_threshold,
+            category_id=category_id,
+            max_instances=max_instances,
+        )
+        if not detections:
+            return []
+        poses = self.infer_pose(
+            models,
+            frame,
+            bboxes=[detection["bbox_xyxy"] for detection in detections],
+        )
+        return [{**detection, **pose} for detection, pose in zip(detections, poses, strict=True)]
 
     def encode_frame(self, frame: Any, image_format: str) -> bytes:
         import cv2
@@ -243,7 +327,7 @@ class OpenMMLabRuntime:
                 ext="pkl",
                 is_rhand=side == "right",
                 use_pca=False,
-                flat_hand_mean=True,
+                flat_hand_mean=False,
                 batch_size=1,
                 dtype=torch.float32,
             ).to(torch.device(device))
@@ -282,8 +366,10 @@ class OpenMMLabRuntime:
         device: str,
         iterations: int,
         learning_rate: float,
+        initial_parameters: dict[str, Any] | None = None,
+        seed_id: str = "mano_mean",
     ) -> dict[str, Any]:
-        """Framewise Adam baseline with optional frozen sequence shape coefficients."""
+        """Robust full-pose fit with accepted-state warm start and best-state recovery."""
         import torch
 
         if side not in {"left", "right"} or side not in models:
@@ -298,34 +384,69 @@ class OpenMMLabRuntime:
         ]
         if not valid_indices:
             raise WorkerError("MANO fit requires at least one valid target landmark")
+        if not isinstance(seed_id, str) or not seed_id:
+            raise WorkerError("MANO fit seed_id must be non-empty")
+        if initial_parameters is not None and not isinstance(initial_parameters, dict):
+            raise WorkerError("MANO initial_parameters must be an object or null")
         dense_target = [([0.0, 0.0, 0.0] if point is None else point) for point in target_xyz_m]
         target = torch.tensor(dense_target, dtype=torch.float32, device=torch_device)
         mask = torch.tensor(valid_indices, dtype=torch.long, device=torch_device)
         if not bool(torch.isfinite(target.index_select(0, mask)).all().item()):
             raise WorkerError("MANO fit target contains non-finite values")
 
+        def initial_tensor(field: str, length: int, default: Any) -> Any:
+            value = None if initial_parameters is None else initial_parameters.get(field)
+            if value is None:
+                return default.detach().clone()
+            if not isinstance(value, list) or len(value) != length:
+                raise WorkerError(f"MANO initial {field} must contain {length} values")
+            tensor = torch.tensor([value], dtype=torch.float32, device=torch_device)
+            if not bool(torch.isfinite(tensor).all().item()):
+                raise WorkerError(f"MANO initial {field} must be finite")
+            return tensor
+
         hand_pose = torch.nn.Parameter(
-            torch.zeros((1, 45), dtype=torch.float32, device=torch_device)
+            initial_tensor(
+                "hand_pose",
+                45,
+                torch.zeros((1, 45), dtype=torch.float32, device=torch_device),
+            )
         )
         global_orient = torch.nn.Parameter(
-            torch.zeros((1, 3), dtype=torch.float32, device=torch_device)
+            initial_tensor(
+                "global_orient",
+                3,
+                torch.zeros((1, 3), dtype=torch.float32, device=torch_device),
+            )
         )
         target_center = target.index_select(0, mask).mean(dim=0, keepdim=True)
-        transl = torch.nn.Parameter(target_center.detach().clone())
+        transl = torch.nn.Parameter(initial_tensor("transl", 3, target_center))
         if fixed_beta is None:
             beta: Any = torch.nn.Parameter(
-                torch.zeros((1, 10), dtype=torch.float32, device=torch_device)
+                initial_tensor(
+                    "beta",
+                    10,
+                    torch.zeros((1, 10), dtype=torch.float32, device=torch_device),
+                )
             )
             parameters = [hand_pose, global_orient, transl, beta]
         else:
             if len(fixed_beta) != 10:
                 raise WorkerError("fixed MANO beta must contain 10 values")
             beta = torch.tensor([fixed_beta], dtype=torch.float32, device=torch_device).detach()
+            if not bool(torch.isfinite(beta).all().item()):
+                raise WorkerError("fixed MANO beta must be finite")
             parameters = [hand_pose, global_orient, transl]
         optimizer = torch.optim.Adam(parameters, lr=learning_rate)
         model = models[side]
-        for _ in range(iterations):
-            optimizer.zero_grad(set_to_none=True)
+        best_loss = math.inf
+        final_loss = math.inf
+        best_values: tuple[Any, Any, Any, Any] | None = None
+        stale_steps = 0
+        patience = min(40, max(10, iterations // 5))
+        iterations_run = 0
+
+        def objective() -> Any:
             output = model(
                 global_orient=global_orient,
                 hand_pose=hand_pose,
@@ -335,14 +456,33 @@ class OpenMMLabRuntime:
             )
             mapped = self._mapped_mano_tensor(output, torch)
             residual = mapped.index_select(0, mask) - target.index_select(0, mask)
-            data_loss = residual.square().sum(dim=1).mean()
+            residual_norm = torch.linalg.vector_norm(residual, dim=1)
+            huber_delta = torch.tensor(0.02, dtype=torch.float32, device=torch_device)
+            quadratic = torch.minimum(residual_norm, huber_delta)
+            linear = residual_norm - quadratic
+            data_loss = (0.5 * quadratic.square() + huber_delta * linear).mean()
             regularization = 1e-4 * hand_pose.square().mean()
             regularization = regularization + 1e-5 * global_orient.square().mean()
             if fixed_beta is None:
                 regularization = regularization + 1e-5 * beta.square().mean()
-            loss = data_loss + regularization
+            return data_loss + regularization
+
+        def parameter_snapshot() -> tuple[Any, Any, Any, Any]:
+            return (
+                hand_pose.detach().clone(),
+                global_orient.detach().clone(),
+                transl.detach().clone(),
+                beta.detach().clone(),
+            )
+
+        for step in range(iterations):
+            optimizer.zero_grad(set_to_none=True)
+            loss = objective()
             if not bool(torch.isfinite(loss).item()):
                 raise WorkerError("MANO optimization loss is non-finite")
+            if best_values is None:
+                best_loss = float(loss.detach().item())
+                best_values = parameter_snapshot()
             loss.backward()
             if any(
                 parameter.grad is None or not bool(torch.isfinite(parameter.grad).all().item())
@@ -350,6 +490,30 @@ class OpenMMLabRuntime:
             ):
                 raise WorkerError("MANO optimization gradient is missing or non-finite")
             optimizer.step()
+            iterations_run = step + 1
+            with torch.no_grad():
+                post_step_loss = objective()
+            if not bool(torch.isfinite(post_step_loss).item()):
+                raise WorkerError("MANO post-step optimization loss is non-finite")
+            final_loss = float(post_step_loss.detach().item())
+            if final_loss < best_loss - 1e-10:
+                best_loss = final_loss
+                best_values = parameter_snapshot()
+                stale_steps = 0
+            else:
+                stale_steps += 1
+            if iterations_run >= 20 and stale_steps >= patience:
+                break
+        if best_values is None:
+            raise WorkerError("MANO optimizer did not produce a finite state")
+        with torch.no_grad():
+            hand_pose.copy_(best_values[0])
+            global_orient.copy_(best_values[1])
+            transl.copy_(best_values[2])
+            if fixed_beta is None:
+                beta.copy_(best_values[3])
+            else:
+                beta = best_values[3]
         with torch.no_grad():
             output = model(
                 global_orient=global_orient,
@@ -361,6 +525,7 @@ class OpenMMLabRuntime:
             mapped = self._mapped_mano_tensor(output, torch)
             residual = mapped.index_select(0, mask) - target.index_select(0, mask)
             rmse = torch.sqrt(residual.square().sum(dim=1).mean())
+            all_residuals = torch.linalg.vector_norm(mapped - target, dim=1)
         tensors = (mapped, rmse, hand_pose, global_orient, transl, beta)
         if not all(bool(torch.isfinite(value).all().item()) for value in tensors):
             raise WorkerError("MANO fit output contains non-finite values")
@@ -374,6 +539,15 @@ class OpenMMLabRuntime:
             "hand_pose": hand_pose.detach().cpu()[0].tolist(),
             "transl": transl.detach().cpu()[0].tolist(),
             "beta": beta.detach().cpu()[0].tolist(),
+            "iterations_run": iterations_run,
+            "best_loss": best_loss,
+            "final_loss": final_loss,
+            "joint_residuals_m": [
+                (float(all_residuals[index].detach().item()) if index in valid_indices else None)
+                for index in range(21)
+            ],
+            "converged": iterations_run < iterations,
+            "seed_id": seed_id,
         }
 
 
