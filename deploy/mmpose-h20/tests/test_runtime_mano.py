@@ -59,6 +59,35 @@ class RuntimeManoTests(unittest.TestCase):
         self.assertTrue(math.isclose(result["final_loss"], expected_post_step_loss, abs_tol=1e-6))
         self.assertTrue(math.isclose(result["best_loss"], expected_post_step_loss, abs_tol=1e-6))
 
+    def test_joint_weights_control_the_objective_but_preserve_full_rmse(self) -> None:
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("torch is unavailable in the lightweight local test environment")
+
+        result = OpenMMLabRuntime().fit_mano(
+            {"right": _TranslationOnlyMano()},
+            side="right",
+            target_xyz_m=[[1.0, 0.0, 0.0] for _ in range(20)] + [[-10.0, 0.0, 0.0]],
+            validity=["VALID"] * 21,
+            joint_weights=[1.0] * 20 + [0.0],
+            fixed_beta=[0.0] * 10,
+            device="cpu",
+            iterations=80,
+            learning_rate=0.1,
+            initial_parameters={
+                "hand_pose": [0.0] * 45,
+                "global_orient": [0.0] * 3,
+                "transl": [0.0] * 3,
+            },
+        )
+
+        self.assertGreater(result["transl"][0], 0.8)
+        self.assertLess(result["weighted_rmse_m"], 0.2)
+        self.assertGreater(result["rmse_m"], 2.0)
+        self.assertEqual(result["effective_joint_count"], 20)
+        self.assertEqual(result["joint_weights"], [1.0] * 20 + [0.0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -332,18 +332,25 @@ L = L_2d_left + L_2d_right
 
 V7.1 在不修改 Raw observation 的前提下采用以下确定性流程：
 
-1. 第一阶段继续使用全部有效 Raw joints 做当前 Huber fit，并保存逐关节 residual 与普通
-   `raw_rmse_m`；
-2. 只有普通 RMSE 未通过 20 mm 时，才从 residual 大于 20 mm 的关节中按 residual 降序选择
+1. 第一阶段继续使用全部有效 Raw joints 做当前 Huber fit，并保存逐关节 residual 与
+   `first_pass_rmse_m`；
+2. 只有普通 RMSE 未通过配置的 gate（当前 profile 为 20 mm）时，才从 residual 大于同一
+   gate 的关节中按 residual 降序选择
    最多 `floor(valid_count * 0.10)` 个离群点；任何情况下都保留至少 15 个有效支持点；
 3. 使用第一阶段最佳参数作为初始化，对 inlier 权重重新拟合一次；被降权关节不从 Raw、
    Trace 或最终 provenance 中删除；
-4. 接受条件为 `inlier_rmse_m <= 20 mm`、`effective_joint_count >= 15`，同时要求完整关节
-   `raw_rmse_m <= 40 mm` 作为灾难性错误上限；不满足任一条件仍为 `NOT_PRODUCED`；
-5. ordinary/full RMSE 不改名也不覆盖；新增 `inlier_rmse_m`、`weighted_rmse_m`、
+4. 接受条件为 `inlier_rmse_m <= gate`、`effective_joint_count >= 15`，同时要求第二阶段
+   输出对全部 Raw 有效点计算的 `full_rmse_m <= 2 * gate`（当前为 40 mm）作为灾难性错误
+   上限；不满足任一条件仍为 `NOT_PRODUCED`；
+5. `rmse_m`/`raw_rmse_m` 继续表示最终参数对全部 Raw 有效点的普通 RMSE，不改名也不以
+   inlier 值覆盖；另保留 `first_pass_rmse_m`，并新增 `inlier_rmse_m`、`weighted_rmse_m`、
    `joint_weights[21]`、`inlier_mask[21]`、`effective_joint_count`、两阶段迭代数和 gate
    reason。方法标识固定为 `RESIDUAL_TRIM_10PCT_V1`，uncertainty status 为
    `HEURISTIC_UNCALIBRATED`。
+
+不同 handedness/seed hypothesis 之间仍按最终 `full_rmse_m` 统一排序；inlier RMSE 只用于
+各 hypothesis 自身的 pass/fail，不能与未裁剪 hypothesis 的 full RMSE 混排。鲁棒诊断只
+进入 Trace 与 kinematic method provenance；严格 `fhp21/v1` 顶层结构保持不变。
 
 该切片是针对真实失败分布的可审计鲁棒门禁，不是对错误测量的概率校准，也不替代 V3
 robust association、PCA coarse-to-fine 或双向 Temporal MANO。离群点比例、15 点支持数和
@@ -491,6 +498,7 @@ fusion/hand gate 虽均已进入此真实主链，各自完整 phase gate 仍未
 | V5 tracking | `tracking.py` 已实现固定掌心 median、constant velocity、TTL recovery 与 one-to-one assignment | 已替换 runner 主 tracker；missing 帧仍推进 active-state lineage，last-seen 不变 | 本地确定性测试覆盖 palm 缺点、交叉、gap、乱序时间和 recovery | H20 只产生 2 tracks：118/120 hand-frames，NEW=2、MATCHED=236、recovered=2 | 无第三条 split 的回归通过；无身份 GT，不宣称 ID switch=0；covariance gate/cost matrix/reset 仍缺 |
 | V6 MANO anchor/coarse | `mano_anchor.py` 已实现 pose-agnostic、按 track、top-K 且时间去冗余的质量锚点选择 | **未接 runner**；PCA model 与 PCA→45D 转换仍未实现 | 仅独立 evidence/排序/fail-closed 测试；不会奖励首帧或平手 | 未 H20 实测 | anchor seam 已实现，coarse-to-fine 尚未实现，不能记作 V6 完成 |
 | V7 MANO bidirectional | `mano_fitting.py` 已实现 track-local accepted-state 控制器；runtime 支持完整参数 warm-start、Huber、best-so-far、early-stop 与诊断 | 已接 runner；`flat_hand_mean=False,use_pca=False`，mean-pose cold start，只有 accepted fit 更新状态，warm 失败后可 cold recovery，上限 200 iter | controller/runtime 契约覆盖 reject/error 不污染状态；仍只有按时间向前传播 | 真实 H20/MANO：213/238=89.496%；accepted RMSE median=9.008 mm、P95=16.960 mm、max=19.997 mm | 误差分布 gate 通过，产出率 95% gate 失败；双向 pass、anchor 驱动、PCA coarse 和共享 shape 全轨复估仍未实现 |
+| V7.1 robust MANO gate | 本地候选已实现 full-Huber→10% residual-trim weighted refit、15 点支持、inlier gate 与 2×full ceiling | 已接 `runtime.fit_mano(joint_weights=...)`、accepted-state controller、runner Trace 和 v3 provenance；Raw 与 `fhp21/v1` 顶层不变 | deploy 187 passed/2 environment skips；另以本机真实 Torch 验证 weighted objective 与 full/weighted RMSE 分离 | **尚未 H20 实跑**；旧 `8e49061` 数字不回填到新策略 | local contract PASS；必须先 1-pair smoke，再以新 immutable 120-pair run 决定 production gate |
 
 V8/V9 尚未开始。当前 `runner.py` 仍是单遍 frame-major 调度，Temporal 仍为 Raw 或已接受
 frame-wise MANO 关节 XYZ 上的 `causal_time_ema_v1`；没有 Temporal MANO、三 pass spool 或
@@ -690,6 +698,7 @@ presence GT 冲突，以 GT 为准并在偏离记录中修改该回归门槛，�
 | 2026-08-14 | V2/V4 / `8e49061` smoke | score 修正必须先通过 1-pair package smoke | 使用新 immutable run `v2-8e49061-h20-smoke1` 完整执行 real OpenMMLab/MANO、逐条 validator、artifact import 和 overlay | raw max=1.00577068 原样留证且 bounded=1；2/2 export 与 MANO；39 records/27 blobs 完整校验 | 证明 package 修正可用，不使用 1 帧统计宣称长轨或质量 gate | smoke PASS；按原计划使用新 run ID 执行 120 pairs |
 | 2026-08-14 | V0–V7 / `v2-8e49061-h20-120` | 修正 package 后重跑 120 pairs，MANO production 目标 ≥95% | canonical run `COMPLETED / PRODUCED`，但 MANO production 仅 213/238=89.496%；25 个失败仍显式回退 Raw | Trace 2,911 records/1,922 blobs 完整校验；accepted RMSE median/P95 9.008/16.960 mm；2 个 Raw hand-gate reject；2 条长轨 | score/package 修正已验证；不放宽 20 mm 或 95% 门禁；Temporal 仍有 25 个 Raw fallback，新指标不可写回历史 baseline | canonical 系统 run PASS；V7 production gate FAIL；robust association、PCA/bidirectional、Temporal MANO 和 GT 精度继续待完成 |
 | 2026-08-14 | V7.1 / implementation plan | 继续增加迭代、放宽 20 mm 门槛或优先实现 PCA/双向传播 | 先实现二阶段 residual-trim refit，并用与鲁棒 loss 一致的 inlier gate；保留 ordinary RMSE 和 40 mm 全局安全上限 | 25/25 拒绝帧最大异常骨段均为 wrist→little MCP；失败/通过帧最大骨长中位数 155.7/105.6 mm，covariance std 48.9/21.6 mm，而失败帧重投影误差反而更低。反事实 trim-worst-1/10% 的预计产出率为 97.90%/99.16%；增加 seed、反向初始化和单纯增加 iteration 均未解决 | Raw observation 与 20 mm inlier 门槛不变；MANO Trace/attempt schema 增加权重、mask、两类 RMSE 和 gate reason；需要新 run ID 完整重跑，旧 run 不改写 | 方案先行，按 TDD 实现 `RESIDUAL_TRIM_10PCT_V1`；真实 H20 数据决定是否保留或修订该策略 |
+| 2026-08-14 | V7.1 / local implementation | 固定写死 20/40 mm，并用 inlier RMSE 同时做 gate 与跨 hypothesis 排序 | trigger/residual threshold 从现有 `max_fit_rmse_m` 派生，full ceiling 固定为其 2 倍；gate 仍用 inlier，但 handedness/seed 统一按 final full RMSE 排序 | 独立审查发现硬编码会与合法非 20 mm 配置分叉，且不同 mask 的 inlier RMSE 不可横向比较；14 点低 RMSE、左右不同 gate、weighted reject/error accepted-state 防污染均有回归 | 默认 profile 的数值仍是 20/40 mm；配置兼容性和 handedness 选择语义更明确；Trace 新增 first/full/inlier、21 点 weights/mask、支持数与阶段迭代，FHP21 v1 不变 | 属于实现阶段必要修正，已同步正文；H20 前本地 contract PASS，真实策略效果仍待 smoke/full run |
 
 复制模板：
 
@@ -717,3 +726,4 @@ presence GT 冲突，以 GT 为准并在偏离记录中修改该回归门槛，�
 | 2026-08-14 | `v2-8e49061-h20-smoke1` 完成 1-pair package smoke；raw >1 score 保留、bounded weight、strict validator、真实 MANO、完整 artifact import 与 1 帧 overlay 全部通过。 |
 | 2026-08-14 | `v2-8e49061-h20-120` 以 `COMPLETED / PRODUCED` 封存；回写 baseline/configuration hash、候选到导出的逐阶段证据、Trace API 功能验收与 gate 结论。双手/export 数量回归通过，MANO production 只有 89.496%，异常骨长、API 性能复测、native ablation、GT 精度、PCA/bidirectional 和 Temporal MANO 仍未完成。 |
 | 2026-08-14 | 在实现前冻结 V7.1 二阶段鲁棒 MANO 方案：第一阶段全有效点 Huber，失败后最多裁剪 10% 的高残差点并从最佳参数重拟合；使用 20 mm inlier RMSE、至少 15 点支持和 40 mm full-RMSE 安全上限，Raw 与失败证据保持不可变。 |
+| 2026-08-14 | 完成本地 V7.1 TDD 切片：weighted runtime、accepted-state robust gate、runner Trace 与 v3 provenance 接通；修正为配置派生 gate/2×ceiling、跨 hypothesis 按 full RMSE 排序，严格 `fhp21/v1` 顶层不变。deploy 187 项通过，真实 Torch weighted objective 通过；H20 smoke/full 仍待执行。 |

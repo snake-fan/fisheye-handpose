@@ -8,6 +8,15 @@ export const FHP21_EDGES: ReadonlyArray<readonly [number, number]> = [
   [0, 17], [17, 18], [18, 19], [19, 20],
 ];
 
+export const FHP21_NAMES: readonly string[] = [
+  "wrist_center",
+  "thumb_cmc", "thumb_mcp", "thumb_ip", "thumb_tip",
+  "index_mcp", "index_pip", "index_dip", "index_tip",
+  "middle_mcp", "middle_pip", "middle_dip", "middle_tip",
+  "ring_mcp", "ring_pip", "ring_dip", "ring_tip",
+  "little_mcp", "little_pip", "little_dip", "little_tip",
+];
+
 export const FINGER_COLORS = ["#75f6c4", "#63d7e5", "#7ba6ff", "#f2c66d", "#ef86b8"];
 
 export type Point2 = [number, number];

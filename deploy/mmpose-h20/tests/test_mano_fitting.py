@@ -85,12 +85,29 @@ def test_cold_start_tries_both_sides_and_seeds_then_accepts_lowest_passing_rmse(
     assert decision["fit"] == _fit_result(side="right", rmse_m=0.006, marker=0.21)
     assert decision["selected_attempt_index"] == 2
     assert [
-        (call["side"], call["seed_id"], call["initial_parameters"]) for call in runtime.calls
+        (
+            call["side"],
+            call["seed_id"],
+            call["initial_parameters"],
+            call["joint_weights"],
+        )
+        for call in runtime.calls
     ] == [
-        ("left", "mean", None),
-        ("left", "relaxed", relaxed_seed),
-        ("right", "mean", None),
-        ("right", "relaxed", relaxed_seed),
+        ("left", "mean", None, None),
+        (
+            "left",
+            "mean",
+            {
+                "global_orient": [0.11, 0.0, 0.0],
+                "hand_pose": [0.11] * 45,
+                "transl": [0.11, 0.21000000000000002, 0.31],
+                "beta": [0.11] * 10,
+            },
+            [0.0, 0.0] + [1.0] * 19,
+        ),
+        ("left", "relaxed", relaxed_seed, None),
+        ("right", "mean", None, None),
+        ("right", "relaxed", relaxed_seed, None),
     ]
     assert all(call["fixed_beta"] is None for call in runtime.calls)
     assert decision["fit"]["iterations_run"] == 17
@@ -247,10 +264,12 @@ def test_rejected_warm_start_retries_a_cold_seed_on_the_locked_side() -> None:
     assert recovered["status"] == "ACCEPTED"
     assert [(call["side"], call["seed_id"]) for call in runtime.calls] == [
         ("right", "accepted_state"),
+        ("right", "accepted_state"),
         ("right", "mean"),
     ]
-    assert runtime.calls[1]["initial_parameters"] is None
-    assert runtime.calls[1]["fixed_beta"] == [0.21] * 10
+    assert runtime.calls[1]["joint_weights"] == [0.0, 0.0] + [1.0] * 19
+    assert runtime.calls[2]["initial_parameters"] is None
+    assert runtime.calls[2]["fixed_beta"] == [0.21] * 10
     assert [attempt["init_source"] for attempt in recovered["attempts"]] == [
         "ACCEPTED_STATE",
         "COLD_RECOVERY",

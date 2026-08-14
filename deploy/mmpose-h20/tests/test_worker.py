@@ -564,9 +564,23 @@ class FakeManoRuntime(FakeRuntime):
 class IntermittentManoRuntime(FakeManoRuntime):
     def fit_mano(self, models: object, **kwargs: Any) -> dict[str, Any]:
         result = super().fit_mano(models, **kwargs)
-        if len(self.mano_fit_calls) in {3, 4}:
+        # Frame two rejects its warm full/weighted attempt and cold-recovery
+        # full/weighted attempt. Frame three can then verify accepted-state ancestry.
+        if len(self.mano_fit_calls) in {3, 4, 5, 6}:
             result["rmse_m"] = 0.03
             result["joint_residuals_m"] = [0.03] * 21
+        return result
+
+
+class RobustOutlierManoRuntime(FakeManoRuntime):
+    def fit_mano(self, models: object, **kwargs: Any) -> dict[str, Any]:
+        result = super().fit_mano(models, **kwargs)
+        if kwargs.get("joint_weights") is None:
+            result["rmse_m"] = 0.03
+            result["joint_residuals_m"] = [0.01] * 19 + [0.09, 0.07]
+        else:
+            result["rmse_m"] = 0.028
+            result["joint_residuals_m"] = [0.009] * 19 + [0.088, 0.068]
         return result
 
 
@@ -1366,6 +1380,34 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(mano_events[0]["payload"]["selection"]["decision"], "SELECTED")
         self.assertEqual(mano_events[0]["payload"]["loss"]["metric"], "RMSE_M")
         self.assertEqual(mano_events[0]["payload"]["loss"]["value"], 0.005)
+        robust_gate = mano_events[0]["payload"]["selection"]["gate"]
+        self.assertEqual(robust_gate["method"], "RESIDUAL_TRIM_10PCT_V1")
+        self.assertEqual(robust_gate["status"], "HEURISTIC_UNCALIBRATED")
+        self.assertFalse(robust_gate["triggered"])
+        self.assertEqual(robust_gate["first_pass_rmse_m"], 0.005)
+        self.assertEqual(robust_gate["raw_rmse_m"], 0.005)
+        self.assertEqual(robust_gate["full_rmse_m"], 0.005)
+        self.assertEqual(robust_gate["weighted_rmse_m"], 0.005)
+        self.assertEqual(robust_gate["inlier_rmse_m"], 0.005)
+        self.assertEqual(robust_gate["joint_weights"], [1.0] * 21)
+        self.assertEqual(robust_gate["inlier_mask"], [True] * 21)
+        self.assertEqual(robust_gate["effective_joint_count"], 21)
+        self.assertEqual(mano_events[0]["payload"]["fit_quality"], robust_gate)
+        self.assertEqual(mano_events[0]["payload"]["raw_rmse_m"], 0.005)
+        self.assertEqual(mano_events[0]["payload"]["full_rmse_m"], 0.005)
+        self.assertEqual(mano_events[0]["payload"]["weighted_rmse_m"], 0.005)
+        self.assertEqual(mano_events[0]["payload"]["inlier_rmse_m"], 0.005)
+        self.assertEqual(mano_events[0]["payload"]["joint_weights"], [1.0] * 21)
+        self.assertEqual(mano_events[0]["payload"]["inlier_mask"], [True] * 21)
+        self.assertEqual(mano_events[0]["payload"]["effective_joint_count"], 21)
+        self.assertEqual(
+            mano_events[0]["payload"]["robust_gate_method"],
+            "RESIDUAL_TRIM_10PCT_V1",
+        )
+        self.assertEqual(
+            mano_events[0]["payload"]["robust_gate_status"],
+            "HEURISTIC_UNCALIBRATED",
+        )
         self.assertEqual(mano_events[0]["payload"]["optimizer"]["iterations_run"], 17)
         self.assertEqual(mano_events[0]["payload"]["selection"]["init_source"], "COLD_START")
         self.assertEqual(mano_events[1]["payload"]["selection"]["init_source"], "ACCEPTED_STATE")
@@ -1379,6 +1421,10 @@ class WorkerContractTests(unittest.TestCase):
         )
         self.assertTrue(mano_events[1]["payload"]["beta_frozen"])
         self.assertEqual(exported[0]["mano"]["mapping_id"], MANO_FHP21_MAPPING_ID)
+        self.assertEqual(
+            exported[0]["backend_provenance"]["kinematic_method"],
+            "mano_v1.2_full45_robust_weighted_v3",
+        )
         self.assertEqual(exported[0]["kind"], ["REFINED"] * 21)
         self.assertEqual(result["mano_output_count"], 2)
 
@@ -1424,6 +1470,49 @@ class WorkerContractTests(unittest.TestCase):
             temporal["payload"]["state_predecessor_event_id"],
             f"{prior_prefix}:temporal:match-0",
         )
+
+    def test_robust_mano_refit_trace_keeps_full_and_inlier_metrics_distinct(self) -> None:
+        runtime = RobustOutlierManoRuntime()
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+            _configure_mano(fixture, root)
+            result_dir = root / "result"
+
+            run_worker(fixture["request"], result_dir, runtime=runtime)
+            events = [
+                json.loads(line)
+                for line in (result_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            exported = json.loads(
+                (result_dir / "fhp21.jsonl").read_text(encoding="utf-8").splitlines()[0]
+            )
+
+        mano_event = next(event for event in events if event["event"] == "mano_frame_fitted")
+        gate = mano_event["payload"]["selection"]["gate"]
+        self.assertEqual(len(runtime.mano_fit_calls), 4)
+        self.assertTrue(gate["triggered"])
+        self.assertEqual(gate["reason"], "ROBUST_INLIER_GATE_PASSED")
+        self.assertEqual(gate["first_pass_rmse_m"], 0.03)
+        self.assertEqual(gate["raw_rmse_m"], 0.028)
+        self.assertEqual(gate["full_rmse_m"], 0.028)
+        self.assertAlmostEqual(gate["weighted_rmse_m"], 0.009)
+        self.assertAlmostEqual(gate["inlier_rmse_m"], 0.009)
+        self.assertEqual(gate["joint_weights"], [1.0] * 19 + [0.0, 0.0])
+        self.assertEqual(gate["inlier_mask"], [True] * 19 + [False, False])
+        self.assertEqual(gate["effective_joint_count"], 19)
+        self.assertEqual(gate["trimmed_joint_indices"], [19, 20])
+        self.assertEqual(
+            gate["stage_iterations"],
+            [
+                {"stage": "FULL_HUBER", "iterations_run": 17},
+                {"stage": "WEIGHTED_REFIT", "iterations_run": 17},
+            ],
+        )
+        self.assertEqual(mano_event["payload"]["fit_quality"], gate)
+        self.assertEqual(mano_event["payload"]["rmse_m"], 0.028)
+        self.assertEqual(exported["mano"]["rmse_m"], 0.028)
+        self.assertEqual(exported["schema_version"], "fisheye-handpose/fhp21-output/v1")
 
     def test_rejected_mano_attempt_is_not_used_as_the_next_accepted_state_predecessor(
         self,

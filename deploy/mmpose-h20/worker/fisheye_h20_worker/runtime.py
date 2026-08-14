@@ -366,6 +366,7 @@ class OpenMMLabRuntime:
         device: str,
         iterations: int,
         learning_rate: float,
+        joint_weights: list[float] | None = None,
         initial_parameters: dict[str, Any] | None = None,
         seed_id: str = "mano_mean",
     ) -> dict[str, Any]:
@@ -384,6 +385,31 @@ class OpenMMLabRuntime:
         ]
         if not valid_indices:
             raise WorkerError("MANO fit requires at least one valid target landmark")
+        if joint_weights is None:
+            normalized_joint_weights = [
+                1.0 if index in valid_indices else 0.0 for index in range(21)
+            ]
+        else:
+            if not isinstance(joint_weights, list) or len(joint_weights) != 21:
+                raise WorkerError("MANO joint_weights must contain 21 values")
+            normalized_joint_weights = []
+            for index, value in enumerate(joint_weights):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                    or not 0.0 <= float(value) <= 1.0
+                ):
+                    raise WorkerError("MANO joint_weights must be finite values in [0, 1]")
+                weight = float(value)
+                if index not in valid_indices and weight != 0.0:
+                    raise WorkerError("MANO joint_weights must be zero for invalid landmarks")
+                normalized_joint_weights.append(weight)
+        weighted_indices = [
+            index for index in valid_indices if normalized_joint_weights[index] > 0.0
+        ]
+        if not weighted_indices:
+            raise WorkerError("MANO fit requires at least one positive valid joint weight")
         if not isinstance(seed_id, str) or not seed_id:
             raise WorkerError("MANO fit seed_id must be non-empty")
         if initial_parameters is not None and not isinstance(initial_parameters, dict):
@@ -391,6 +417,11 @@ class OpenMMLabRuntime:
         dense_target = [([0.0, 0.0, 0.0] if point is None else point) for point in target_xyz_m]
         target = torch.tensor(dense_target, dtype=torch.float32, device=torch_device)
         mask = torch.tensor(valid_indices, dtype=torch.long, device=torch_device)
+        selected_weights = torch.tensor(
+            [normalized_joint_weights[index] for index in valid_indices],
+            dtype=torch.float32,
+            device=torch_device,
+        )
         if not bool(torch.isfinite(target.index_select(0, mask)).all().item()):
             raise WorkerError("MANO fit target contains non-finite values")
 
@@ -419,7 +450,10 @@ class OpenMMLabRuntime:
                 torch.zeros((1, 3), dtype=torch.float32, device=torch_device),
             )
         )
-        target_center = target.index_select(0, mask).mean(dim=0, keepdim=True)
+        selected_target = target.index_select(0, mask)
+        target_center = (selected_target * selected_weights[:, None]).sum(
+            dim=0, keepdim=True
+        ) / selected_weights.sum()
         transl = torch.nn.Parameter(initial_tensor("transl", 3, target_center))
         if fixed_beta is None:
             beta: Any = torch.nn.Parameter(
@@ -460,7 +494,8 @@ class OpenMMLabRuntime:
             huber_delta = torch.tensor(0.02, dtype=torch.float32, device=torch_device)
             quadratic = torch.minimum(residual_norm, huber_delta)
             linear = residual_norm - quadratic
-            data_loss = (0.5 * quadratic.square() + huber_delta * linear).mean()
+            per_joint_loss = 0.5 * quadratic.square() + huber_delta * linear
+            data_loss = (per_joint_loss * selected_weights).sum() / selected_weights.sum()
             regularization = 1e-4 * hand_pose.square().mean()
             regularization = regularization + 1e-5 * global_orient.square().mean()
             if fixed_beta is None:
@@ -525,8 +560,12 @@ class OpenMMLabRuntime:
             mapped = self._mapped_mano_tensor(output, torch)
             residual = mapped.index_select(0, mask) - target.index_select(0, mask)
             rmse = torch.sqrt(residual.square().sum(dim=1).mean())
+            residual_square = residual.square().sum(dim=1)
+            weighted_rmse = torch.sqrt(
+                (residual_square * selected_weights).sum() / selected_weights.sum()
+            )
             all_residuals = torch.linalg.vector_norm(mapped - target, dim=1)
-        tensors = (mapped, rmse, hand_pose, global_orient, transl, beta)
+        tensors = (mapped, rmse, weighted_rmse, hand_pose, global_orient, transl, beta)
         if not all(bool(torch.isfinite(value).all().item()) for value in tensors):
             raise WorkerError("MANO fit output contains non-finite values")
         return {
@@ -535,6 +574,9 @@ class OpenMMLabRuntime:
             "landmarks_xyz_m": mapped.detach().cpu().tolist(),
             "validity": ["VALID"] * 21,
             "rmse_m": float(rmse.detach().item()),
+            "weighted_rmse_m": float(weighted_rmse.detach().item()),
+            "effective_joint_count": len(weighted_indices),
+            "joint_weights": normalized_joint_weights,
             "global_orient": global_orient.detach().cpu()[0].tolist(),
             "hand_pose": hand_pose.detach().cpu()[0].tolist(),
             "transl": transl.detach().cpu()[0].tolist(),

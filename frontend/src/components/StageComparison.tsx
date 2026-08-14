@@ -3,7 +3,7 @@ import { ImageIcon } from "lucide-react";
 
 import { traceApi } from "../api/client";
 import type { ArtifactRef, TraceRecord } from "../api/types";
-import { artifactsOf, FHP21_EDGES, payloadOf } from "../domain/trace";
+import { artifactsOf, FHP21_EDGES, FHP21_NAMES, payloadOf } from "../domain/trace";
 import type { PipelineNodeId } from "./PipelineNodeRail";
 
 interface StageComparisonProps {
@@ -90,7 +90,10 @@ function failureReason(record: TraceRecord): string {
   if (typeof payload.reason === "string" && payload.reason) return payload.reason;
   if (typeof payload.hand_reason === "string" && payload.hand_reason) return payload.hand_reason;
   if (payload.selection && typeof payload.selection === "object") {
-    const decision = (payload.selection as Record<string, unknown>).decision;
+    const selection = payload.selection as Record<string, unknown>;
+    const gate = recordObject(selection.gate);
+    if (typeof gate?.reason === "string" && gate.reason) return gate.reason;
+    const decision = selection.decision;
     if (typeof decision === "string" && decision) return decision;
   }
   return record.status === "FAILED" ? "STAGE_FAILED" : "OUTPUT_NOT_PRODUCED";
@@ -1130,6 +1133,156 @@ function RawComparison({ runKey, records, selectedTrack }: Omit<StageComparisonP
   );
 }
 
+function recordObject(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function manoGateOf(record: TraceRecord): Record<string, unknown> | null {
+  const payload = payloadOf(record);
+  const fitQuality = recordObject(payload.fit_quality);
+  const selection = recordObject(payload.selection);
+  const selectionGate = recordObject(selection?.gate);
+  if (!fitQuality && !selectionGate) return null;
+  const gate = { ...(selectionGate ?? {}), ...(fitQuality ?? {}) };
+  const diagnosticFields = [
+    "method",
+    "first_pass_rmse_m",
+    "full_rmse_m",
+    "inlier_rmse_m",
+    "joint_weights",
+    "inlier_mask",
+  ];
+  return diagnosticFields.some((field) => Object.hasOwn(gate, field)) ? gate : null;
+}
+
+function metricMillimetres(value: unknown): string {
+  return finiteNumber(value) ? `${(value * 1000).toFixed(2)} mm` : "—";
+}
+
+function integerDisplay(value: unknown): string {
+  return finiteNumber(value) ? String(Math.trunc(value)) : "—";
+}
+
+function ManoGateDiagnostics({ records, selectedTrack }: { records: TraceRecord[]; selectedTrack: string }) {
+  const diagnostics = records.flatMap((record) => {
+    if (record.stage !== "KINEMATIC_REFINEMENT") return [];
+    const gate = manoGateOf(record);
+    return gate ? [{ record, gate }] : [];
+  });
+  if (!diagnostics.length) return null;
+
+  return (
+    <section className="mano-gate-diagnostics" aria-label="MANO robust gate diagnostics">
+      <header className="mano-gate-heading">
+        <div>
+          <span>FRAME-WISE FIT AUDIT</span>
+          <strong>MANO ROBUST GATE · METRIC RESIDUALS</strong>
+        </div>
+        <span>HEURISTIC DIAGNOSTIC · NOT CALIBRATED</span>
+      </header>
+      <div className="mano-gate-list">
+        {diagnostics.map(({ record, gate }, index) => {
+          const payload = payloadOf(record);
+          const trackId = typeof payload.track_id === "string" && payload.track_id
+            ? payload.track_id
+            : "NO_TRACK";
+          const stages = objectValues(gate.stage_iterations);
+          const weightedRefit = gate.triggered === true
+            || stages.some((stage) => stage.stage === "WEIGHTED_REFIT");
+          const weights = Array.isArray(gate.joint_weights) ? gate.joint_weights : [];
+          const mask = Array.isArray(gate.inlier_mask) ? gate.inlier_mask : [];
+          const trimmedIndices = Array.isArray(gate.trimmed_joint_indices)
+            ? [...new Set(gate.trimmed_joint_indices.filter(
+              (value): value is number => Number.isInteger(value) && value >= 0 && value < FHP21_NAMES.length,
+            ))].sort((left, right) => left - right)
+            : [];
+          const accepted = gate.accepted === true;
+          const produced = outputProduced(record);
+          return (
+            <article
+              key={record.record_id ?? `mano-gate-${index}`}
+              className={`mano-gate-card ${produced ? "produced" : "not-produced"} ${selectedTrack === trackId ? "selected" : ""}`}
+              aria-label={`${trackId} MANO robust gate diagnostic`}
+              aria-current={selectedTrack === trackId}
+            >
+              <header>
+                <div>
+                  <strong>{trackId}</strong>
+                  <span>{produced ? "PRODUCED" : "NOT_PRODUCED"}</span>
+                </div>
+                <div className="mano-gate-identity">
+                  <span>{typeof gate.method === "string" ? gate.method : "METHOD_UNRECORDED"}</span>
+                  <span>{typeof gate.status === "string" ? gate.status : "STATUS_UNRECORDED"}</span>
+                  <strong>{accepted ? "GATE ACCEPTED" : "GATE REJECTED"}</strong>
+                </div>
+              </header>
+              <p className="mano-gate-reason">
+                <span>GATE REASON</span>
+                {typeof gate.reason === "string" && gate.reason ? gate.reason : failureReason(record)}
+              </p>
+              <dl className="mano-gate-metrics">
+                <div><dt>首遍 RMSE</dt><dd>{metricMillimetres(gate.first_pass_rmse_m)}</dd></div>
+                <div><dt>普通 / FULL RMSE</dt><dd>{metricMillimetres(gate.full_rmse_m)}</dd></div>
+                <div><dt>INLIER RMSE</dt><dd>{metricMillimetres(gate.inlier_rmse_m)}</dd></div>
+                <div><dt>WEIGHTED RMSE</dt><dd>{metricMillimetres(gate.weighted_rmse_m)}</dd></div>
+                <div><dt>INLIER GATE ≤</dt><dd>{metricMillimetres(gate.rmse_gate_m ?? 0.02)}</dd></div>
+                <div><dt>FULL CEILING ≤</dt><dd>{metricMillimetres(gate.full_rmse_ceiling_m ?? 0.04)}</dd></div>
+                <div>
+                  <dt>有效支持 / 最少</dt>
+                  <dd>{integerDisplay(gate.effective_joint_count)} / {integerDisplay(gate.minimum_effective_joint_count)}</dd>
+                </div>
+                <div>
+                  <dt>WEIGHTED REFIT</dt>
+                  <dd>{weightedRefit ? "YES" : "NO"} · {stages.length} STAGES</dd>
+                </div>
+              </dl>
+              {stages.length > 0 && (
+                <div className="mano-gate-iterations" aria-label={`${trackId} MANO stage iterations`}>
+                  {stages.map((stage, stageIndex) => (
+                    <span key={`${String(stage.stage ?? "STAGE")}-${stageIndex}`}>
+                      {String(stage.stage ?? "STAGE_UNRECORDED")} · {integerDisplay(stage.iterations_run)}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="mano-gate-trimmed">
+                <span>TRIMMED FHP21</span>
+                {trimmedIndices.length
+                  ? trimmedIndices.map((jointIndex) => (
+                    <strong key={jointIndex}>{jointIndex} · {FHP21_NAMES[jointIndex]}</strong>
+                  ))
+                  : <em>NONE</em>}
+              </div>
+              {(weights.length > 0 || mask.length > 0) && (
+                <ul className="mano-joint-weights" aria-label={`${trackId} FHP21 joint weights`}>
+                  {FHP21_NAMES.map((name, jointIndex) => {
+                    const weight = finiteNumber(weights[jointIndex]) ? weights[jointIndex] : null;
+                    const inlier = typeof mask[jointIndex] === "boolean"
+                      ? mask[jointIndex]
+                      : weight === null || weight > 0;
+                    return (
+                      <li
+                        key={name}
+                        className={inlier ? "inlier" : "trimmed"}
+                        title={`${jointIndex} · ${name} · weight ${weight === null ? "—" : weight.toFixed(2)} · ${inlier ? "INLIER" : "TRIMMED"}`}
+                      >
+                        <span>{jointIndex}</span>
+                        <i style={{ opacity: weight === null ? 0.35 : Math.max(0.18, Math.min(1, weight)) }} />
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function ManoComparison({ runKey, records, selectedTrack }: Omit<StageComparisonProps, "selectedNodeId">) {
   return (
     <>
@@ -1143,6 +1296,7 @@ function ManoComparison({ runKey, records, selectedTrack }: Omit<StageComparison
         beforeLayers={(side) => projectedLayers(records, "RAW_FUSION", side)}
         afterLayers={(side) => projectedLayers(records, "KINEMATIC_REFINEMENT", side)}
       />
+      <ManoGateDiagnostics records={records} selectedTrack={selectedTrack} />
       <NotProducedReasons records={records} stage="KINEMATIC_REFINEMENT" />
     </>
   );

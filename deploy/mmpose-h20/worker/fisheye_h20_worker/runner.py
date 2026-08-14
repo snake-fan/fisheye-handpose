@@ -16,7 +16,7 @@ from .crop import VirtualPerspectiveCropper
 from .fusion import FUSION_METHOD_ID
 from .geometry import associate, normalize_instances, triangulate_match
 from .mano import MANO_FHP21_MAPPING_ID, verify_mano_assets
-from .mano_fitting import ManoTrackFitter
+from .mano_fitting import ROBUST_GATE_METHOD, ROBUST_GATE_STATUS, ManoTrackFitter
 from .output_contract import build_pose_estimate
 from .pose_adapter import VirtualCropPoseAdapter
 from .runtime import OpenMMLabRuntime
@@ -296,6 +296,7 @@ def _mano_selection_payload(
         "reset_reason": decision["reset_reason"],
         "selected_attempt_index": decision["selected_attempt_index"],
         "selected_side": None if selected is None else selected["side"],
+        "gate": decision.get("gate"),
         "first_high_quality_frame": status == "ACCEPTED"
         and decision["init_source"] == "COLD_START",
         "best_attempt": decision["best_attempt"],
@@ -440,7 +441,7 @@ def run_worker(
         "keypoint_quality_weight_method": QUALITY_WEIGHT_METHOD,
         "keypoint_quality_weight_status": QUALITY_WEIGHT_STATUS,
         "kinematic_method": (
-            "mano_v1.2_full45_mean_warmstart_v2" if request.mano is not None else "NONE"
+            "mano_v1.2_full45_robust_weighted_v3" if request.mano is not None else "NONE"
         ),
         "temporal_method": request.temporal.method,
     }
@@ -1175,6 +1176,7 @@ def run_worker(
                                 "output_status": "NOT_PRODUCED",
                                 "state_predecessor_event_id": mano_predecessor,
                                 "selection": selection,
+                                "fit_quality": selection.get("gate"),
                                 **_projection_fields(rectification),
                             }
                             writer.append(
@@ -1209,6 +1211,7 @@ def run_worker(
                                 "landmark_schema": "fhp21/v1",
                                 "handedness": mano_fit["side"],
                                 "selection": selection,
+                                "fit_quality": selection["gate"],
                                 "beta_frozen": not selection["first_high_quality_frame"],
                                 "pose": mano_fit["hand_pose"],
                                 "global_orient": mano_fit["global_orient"],
@@ -1216,6 +1219,15 @@ def run_worker(
                                 "beta": mano_fit["beta"],
                                 "mapping_id": mano_fit["mapping_id"],
                                 "rmse_m": mano_fit["rmse_m"],
+                                "raw_rmse_m": selection["gate"]["raw_rmse_m"],
+                                "full_rmse_m": selection["gate"]["full_rmse_m"],
+                                "weighted_rmse_m": selection["gate"]["weighted_rmse_m"],
+                                "inlier_rmse_m": selection["gate"]["inlier_rmse_m"],
+                                "joint_weights": selection["gate"]["joint_weights"],
+                                "inlier_mask": selection["gate"]["inlier_mask"],
+                                "effective_joint_count": selection["gate"]["effective_joint_count"],
+                                "robust_gate_method": ROBUST_GATE_METHOD,
+                                "robust_gate_status": ROBUST_GATE_STATUS,
                                 "loss": {
                                     "metric": "RMSE_M",
                                     "value": mano_fit["rmse_m"],

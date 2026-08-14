@@ -10,6 +10,11 @@ from typing import Any
 
 from .contracts import WorkerError
 
+ROBUST_GATE_METHOD = "RESIDUAL_TRIM_10PCT_V1"
+ROBUST_GATE_STATUS = "HEURISTIC_UNCALIBRATED"
+_ROBUST_TRIM_FRACTION = 0.10
+_ROBUST_MIN_EFFECTIVE_JOINTS = 15
+
 
 @dataclass(frozen=True)
 class _AcceptedState:
@@ -19,6 +24,12 @@ class _AcceptedState:
     hand_pose: tuple[float, ...]
     transl: tuple[float, ...]
     beta: tuple[float, ...]
+
+
+class _RobustRefitError(Exception):
+    def __init__(self, gate: dict[str, Any]) -> None:
+        super().__init__("MANO weighted refit failed")
+        self.gate = gate
 
 
 class ManoTrackFitter:
@@ -83,7 +94,7 @@ class ManoTrackFitter:
         validity: list[str],
         timestamp_ns: int,
     ) -> dict[str, Any]:
-        """Fit one track frame and update warm-start state only after the RMSE gate."""
+        """Fit one track frame and update warm-start state only after the robust gate."""
         if not isinstance(track_id, str) or not track_id:
             raise WorkerError("MANO track_id must be non-empty")
         if isinstance(timestamp_ns, bool) or not isinstance(timestamp_ns, int):
@@ -137,15 +148,18 @@ class ManoTrackFitter:
         attempts: list[dict[str, Any]] = []
         passing: list[tuple[float, int, dict[str, Any]]] = []
         scored: list[tuple[float, int]] = []
+        errored_after_first_pass: list[tuple[float, int]] = []
+        valid_indices = self._valid_joint_indices(target_xyz_m, validity)
 
         def run_hypotheses(values: list[tuple[str, str, Any, Any, str]]) -> None:
             for side, seed_id, initial_parameters, fixed_beta, attempt_source in values:
                 try:
-                    result = self._runtime.fit_mano(
+                    first_result = self._runtime.fit_mano(
                         self._models,
                         side=side,
                         target_xyz_m=target_xyz_m,
                         validity=validity,
+                        joint_weights=None,
                         fixed_beta=fixed_beta,
                         device=self._device,
                         iterations=self._iterations,
@@ -153,7 +167,11 @@ class ManoTrackFitter:
                         initial_parameters=deepcopy(initial_parameters),
                         seed_id=seed_id,
                     )
-                    rmse_m = self._validate_result(result, expected_side=side)
+                    first_rmse_m = self._validate_result(
+                        first_result,
+                        expected_side=side,
+                        expected_valid_indices=valid_indices,
+                    )
                 except Exception as error:
                     attempts.append(
                         {
@@ -170,7 +188,38 @@ class ManoTrackFitter:
                         }
                     )
                     continue
-                status = "ACCEPTED" if rmse_m <= self._rmse_gate_m else "REJECTED"
+                try:
+                    result, gate = self._robust_refit_and_gate(
+                        side=side,
+                        seed_id=seed_id,
+                        first_result=first_result,
+                        first_rmse_m=first_rmse_m,
+                        target_xyz_m=target_xyz_m,
+                        validity=validity,
+                        valid_indices=valid_indices,
+                        fixed_beta=fixed_beta,
+                    )
+                except _RobustRefitError as error:
+                    attempts.append(
+                        {
+                            "side": side,
+                            "seed_id": seed_id,
+                            "init_source": attempt_source,
+                            "status": "ERROR",
+                            "rmse_m": first_rmse_m,
+                            "result": None,
+                            "first_pass_result": first_result,
+                            "gate": error.gate,
+                            "error": {
+                                "type": type(error.__cause__).__name__,
+                                "message": str(error.__cause__),
+                            },
+                        }
+                    )
+                    errored_after_first_pass.append((first_rmse_m, len(attempts) - 1))
+                    continue
+                rmse_m = float(gate["full_rmse_m"])
+                status = "ACCEPTED" if gate["accepted"] else "REJECTED"
                 attempts.append(
                     {
                         "side": side,
@@ -179,6 +228,8 @@ class ManoTrackFitter:
                         "status": status,
                         "rmse_m": rmse_m,
                         "result": result,
+                        "first_pass_result": first_result,
+                        "gate": gate,
                         "error": None,
                     }
                 )
@@ -202,6 +253,13 @@ class ManoTrackFitter:
             )
 
         if not scored:
+            diagnostic_attempt = (
+                None
+                if not errored_after_first_pass
+                else attempts[
+                    min(errored_after_first_pass, key=lambda value: (value[0], value[1]))[1]
+                ]
+            )
             return {
                 "track_id": track_id,
                 "timestamp_ns": timestamp_ns,
@@ -209,7 +267,8 @@ class ManoTrackFitter:
                 "fit": None,
                 "selected_attempt_index": None,
                 "attempts": attempts,
-                "best_attempt": None,
+                "best_attempt": diagnostic_attempt,
+                "gate": None if diagnostic_attempt is None else diagnostic_attempt.get("gate"),
                 "init_source": init_source,
                 "predecessor_timestamp_ns": predecessor_timestamp_ns,
                 "reset_reason": reset_reason,
@@ -224,6 +283,7 @@ class ManoTrackFitter:
                 "selected_attempt_index": None,
                 "attempts": attempts,
                 "best_attempt": best_attempt,
+                "gate": best_attempt.get("gate"),
                 "init_source": init_source,
                 "predecessor_timestamp_ns": predecessor_timestamp_ns,
                 "reset_reason": reset_reason,
@@ -238,10 +298,233 @@ class ManoTrackFitter:
             "selected_attempt_index": selected_index,
             "attempts": attempts,
             "best_attempt": attempts[selected_index],
+            "gate": attempts[selected_index]["gate"],
             "init_source": init_source,
             "predecessor_timestamp_ns": predecessor_timestamp_ns,
             "reset_reason": reset_reason,
         }
+
+    @staticmethod
+    def _valid_joint_indices(
+        target_xyz_m: list[list[float] | None],
+        validity: list[str],
+    ) -> list[int]:
+        return [
+            index
+            for index, (point, flag) in enumerate(zip(target_xyz_m, validity, strict=False))
+            if flag == "VALID" and isinstance(point, list) and len(point) == 3
+        ]
+
+    @staticmethod
+    def _result_initial_parameters(result: dict[str, Any]) -> dict[str, list[float]]:
+        return {
+            "global_orient": list(result["global_orient"]),
+            "hand_pose": list(result["hand_pose"]),
+            "transl": list(result["transl"]),
+            "beta": list(result["beta"]),
+        }
+
+    @staticmethod
+    def _weighted_rmse(
+        residuals: list[float | None],
+        weights: list[float],
+    ) -> float:
+        weighted_square_sum = 0.0
+        weight_sum = 0.0
+        for residual, weight in zip(residuals, weights, strict=True):
+            if residual is None or weight <= 0.0:
+                continue
+            weighted_square_sum += weight * float(residual) ** 2
+            weight_sum += weight
+        if weight_sum <= 0.0:
+            raise WorkerError("MANO robust gate requires at least one weighted residual")
+        return math.sqrt(weighted_square_sum / weight_sum)
+
+    def _gate_payload(
+        self,
+        *,
+        first_pass_rmse_m: float,
+        full_rmse_m: float,
+        residuals: list[float | None],
+        weights: list[float],
+        trimmed_joint_indices: list[int],
+        triggered: bool,
+        reason: str,
+        accepted: bool,
+        stage_iterations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        effective_joint_count = sum(weight > 0.0 for weight in weights)
+        weighted_rmse_m = self._weighted_rmse(residuals, weights)
+        return {
+            "method": ROBUST_GATE_METHOD,
+            "status": ROBUST_GATE_STATUS,
+            "accepted": accepted,
+            "triggered": triggered,
+            "reason": reason,
+            "gate_metric": "INLIER_RMSE_M" if triggered else "FULL_RMSE_M",
+            "gate_value_m": weighted_rmse_m if triggered else full_rmse_m,
+            "rmse_gate_m": self._rmse_gate_m,
+            "full_rmse_ceiling_m": 2.0 * self._rmse_gate_m,
+            "trigger_rmse_m": self._rmse_gate_m,
+            "residual_trim_threshold_m": self._rmse_gate_m,
+            "trim_fraction": _ROBUST_TRIM_FRACTION,
+            "minimum_effective_joint_count": _ROBUST_MIN_EFFECTIVE_JOINTS,
+            "first_pass_rmse_m": first_pass_rmse_m,
+            "raw_rmse_m": full_rmse_m,
+            "full_rmse_m": full_rmse_m,
+            "weighted_rmse_m": weighted_rmse_m,
+            "inlier_rmse_m": weighted_rmse_m,
+            "effective_joint_count": effective_joint_count,
+            "joint_weights": weights,
+            "inlier_mask": [weight > 0.0 for weight in weights],
+            "trimmed_joint_indices": trimmed_joint_indices,
+            "stage_iterations": stage_iterations,
+        }
+
+    def _robust_refit_and_gate(
+        self,
+        *,
+        side: str,
+        seed_id: str,
+        first_result: dict[str, Any],
+        first_rmse_m: float,
+        target_xyz_m: list[list[float] | None],
+        validity: list[str],
+        valid_indices: list[int],
+        fixed_beta: list[float] | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        first_residuals = first_result["joint_residuals_m"]
+        weights = [1.0 if index in valid_indices else 0.0 for index in range(21)]
+        first_stage = {
+            "stage": "FULL_HUBER",
+            "iterations_run": first_result["iterations_run"],
+        }
+        if len(valid_indices) < _ROBUST_MIN_EFFECTIVE_JOINTS:
+            gate = self._gate_payload(
+                first_pass_rmse_m=first_rmse_m,
+                full_rmse_m=first_rmse_m,
+                residuals=first_residuals,
+                weights=weights,
+                trimmed_joint_indices=[],
+                triggered=False,
+                reason="INSUFFICIENT_EFFECTIVE_JOINTS",
+                accepted=False,
+                stage_iterations=[first_stage],
+            )
+            return first_result, gate
+        if first_rmse_m <= self._rmse_gate_m:
+            gate = self._gate_payload(
+                first_pass_rmse_m=first_rmse_m,
+                full_rmse_m=first_rmse_m,
+                residuals=first_residuals,
+                weights=weights,
+                trimmed_joint_indices=[],
+                triggered=False,
+                reason="FULL_RMSE_GATE_PASSED",
+                accepted=True,
+                stage_iterations=[first_stage],
+            )
+            return first_result, gate
+
+        trim_capacity = min(
+            math.floor(len(valid_indices) * _ROBUST_TRIM_FRACTION),
+            len(valid_indices) - _ROBUST_MIN_EFFECTIVE_JOINTS,
+        )
+        eligible = sorted(
+            (
+                (float(first_residuals[index]), index)
+                for index in valid_indices
+                if first_residuals[index] is not None
+                and float(first_residuals[index]) > self._rmse_gate_m
+            ),
+            key=lambda value: (-value[0], value[1]),
+        )
+        trimmed_joint_indices = sorted(index for _, index in eligible[:trim_capacity])
+        if not trimmed_joint_indices:
+            gate = self._gate_payload(
+                first_pass_rmse_m=first_rmse_m,
+                full_rmse_m=first_rmse_m,
+                residuals=first_residuals,
+                weights=weights,
+                trimmed_joint_indices=[],
+                triggered=False,
+                reason="NO_TRIMMABLE_RESIDUAL",
+                accepted=False,
+                stage_iterations=[first_stage],
+            )
+            return first_result, gate
+        for index in trimmed_joint_indices:
+            weights[index] = 0.0
+
+        try:
+            second_result = self._runtime.fit_mano(
+                self._models,
+                side=side,
+                target_xyz_m=target_xyz_m,
+                validity=validity,
+                joint_weights=weights,
+                fixed_beta=fixed_beta,
+                device=self._device,
+                iterations=self._iterations,
+                learning_rate=self._learning_rate,
+                initial_parameters=self._result_initial_parameters(first_result),
+                seed_id=seed_id,
+            )
+            full_rmse_m = self._validate_result(
+                second_result,
+                expected_side=side,
+                expected_valid_indices=valid_indices,
+            )
+        except Exception as error:
+            failed_gate = self._gate_payload(
+                first_pass_rmse_m=first_rmse_m,
+                full_rmse_m=first_rmse_m,
+                residuals=first_residuals,
+                weights=weights,
+                trimmed_joint_indices=trimmed_joint_indices,
+                triggered=True,
+                reason="ROBUST_REFIT_ERROR",
+                accepted=False,
+                stage_iterations=[
+                    first_stage,
+                    {"stage": "WEIGHTED_REFIT", "iterations_run": None},
+                ],
+            )
+            raise _RobustRefitError(failed_gate) from error
+
+        second_residuals = second_result["joint_residuals_m"]
+        inlier_rmse_m = self._weighted_rmse(second_residuals, weights)
+        effective_joint_count = sum(weight > 0.0 for weight in weights)
+        if effective_joint_count < _ROBUST_MIN_EFFECTIVE_JOINTS:
+            reason = "INSUFFICIENT_EFFECTIVE_JOINTS"
+            accepted = False
+        elif full_rmse_m > 2.0 * self._rmse_gate_m:
+            reason = "FULL_RMSE_CEILING_EXCEEDED"
+            accepted = False
+        elif inlier_rmse_m > self._rmse_gate_m:
+            reason = "INLIER_RMSE_GATE_EXCEEDED"
+            accepted = False
+        else:
+            reason = "ROBUST_INLIER_GATE_PASSED"
+            accepted = True
+        gate = self._gate_payload(
+            first_pass_rmse_m=first_rmse_m,
+            full_rmse_m=full_rmse_m,
+            residuals=second_residuals,
+            weights=weights,
+            trimmed_joint_indices=trimmed_joint_indices,
+            triggered=True,
+            reason=reason,
+            accepted=accepted,
+            stage_iterations=[
+                first_stage,
+                {
+                    "stage": "WEIGHTED_REFIT",
+                    "iterations_run": second_result["iterations_run"],
+                },
+            ],
+        )
+        return second_result, gate
 
     @staticmethod
     def _finite_vector(result: dict[str, Any], field: str, length: int) -> tuple[float, ...]:
@@ -254,7 +537,13 @@ class ManoTrackFitter:
         return vector
 
     @classmethod
-    def _validate_result(cls, result: Any, *, expected_side: str) -> float:
+    def _validate_result(
+        cls,
+        result: Any,
+        *,
+        expected_side: str,
+        expected_valid_indices: list[int],
+    ) -> float:
         if not isinstance(result, dict):
             raise WorkerError("MANO fit result must be an object")
         if result.get("side") != expected_side:
@@ -285,9 +574,18 @@ class ManoTrackFitter:
         residuals = result.get("joint_residuals_m")
         if not isinstance(residuals, list) or len(residuals) != 21:
             raise WorkerError("MANO fit result joint_residuals_m must contain 21 values")
-        for residual in residuals:
+        expected_valid = set(expected_valid_indices)
+        for index, residual in enumerate(residuals):
             if residual is None:
+                if index in expected_valid:
+                    raise WorkerError(
+                        "MANO fit result is missing a residual for a valid target landmark"
+                    )
                 continue
+            if index not in expected_valid:
+                raise WorkerError(
+                    "MANO fit result contains a residual for an invalid target landmark"
+                )
             if (
                 isinstance(residual, bool)
                 or not isinstance(residual, (int, float))
@@ -313,4 +611,4 @@ class ManoTrackFitter:
         )
 
 
-__all__ = ["ManoTrackFitter"]
+__all__ = ["ROBUST_GATE_METHOD", "ROBUST_GATE_STATUS", "ManoTrackFitter"]
