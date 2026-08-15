@@ -687,6 +687,33 @@ def run_worker(
                     candidate_decisions = [
                         _candidate_payload(decision) for decision in candidate_batch.decisions
                     ]
+                    detected_candidates = [_detection(detection) for detection in pool_detections]
+                    common = {
+                        "frame_id": frame_id,
+                        "frame_index": global_index,
+                        "timestamp_ns": pair.pair_timestamp_ns,
+                        "view_id": side,
+                        "image_width": rectification.image_size[0],
+                        "image_height": rectification.image_size[1],
+                    }
+                    writer.append(
+                        event_id=f"{event_prefix}:detection:{side}",
+                        stage="DETECTION",
+                        status="SUCCEEDED" if detected_candidates else "WARNING",
+                        event="hand_candidates_detected",
+                        payload={
+                            **common,
+                            "output_status": (
+                                "PRODUCED" if detected_candidates else "NOT_PRODUCED"
+                            ),
+                            "detections": detected_candidates,
+                            "instances": detected_candidates,
+                            "candidate_decisions": candidate_decisions,
+                            "candidate_pool": pool_detections,
+                        },
+                        parent_event_ids=(f"{event_prefix}:sync",),
+                    )
+                    active_stage = "POSE_2D"
                     if virtual_pose_adapter is None:
                         if legacy_pose_instances is None:
                             pose_results = runtime.infer_pose(
@@ -718,7 +745,6 @@ def run_worker(
                             side=side,
                             rectification=rectification,
                         )
-                        detected_candidates = [_detection(instance) for instance in instances]
                     else:
                         crop_batch = virtual_pose_adapter.infer(
                             runtime=runtime,
@@ -734,36 +760,7 @@ def run_worker(
                             side=side,
                             rectification=rectification,
                         )
-                        detected_candidates = [
-                            _detection(result.detection) for result in crop_results
-                        ]
-                    active_stage = "POSE_2D"
                     views[side] = instances
-                    common = {
-                        "frame_id": frame_id,
-                        "frame_index": global_index,
-                        "timestamp_ns": pair.pair_timestamp_ns,
-                        "view_id": side,
-                        "image_width": rectification.image_size[0],
-                        "image_height": rectification.image_size[1],
-                    }
-                    writer.append(
-                        event_id=f"{event_prefix}:detection:{side}",
-                        stage="DETECTION",
-                        status="SUCCEEDED" if detected_candidates else "WARNING",
-                        event="hand_candidates_detected",
-                        payload={
-                            **common,
-                            "output_status": (
-                                "PRODUCED" if detected_candidates else "NOT_PRODUCED"
-                            ),
-                            "detections": detected_candidates,
-                            "instances": detected_candidates,
-                            "candidate_decisions": candidate_decisions,
-                            "candidate_pool": pool_detections,
-                        },
-                        parent_event_ids=(f"{event_prefix}:sync",),
-                    )
                     crop_event_ids: list[str] = []
                     for crop_index, crop_result in enumerate(crop_results):
                         crop_event_id = f"{event_prefix}:crop:{side}:{crop_index}"

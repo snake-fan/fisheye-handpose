@@ -429,6 +429,57 @@ class CandidateAwareRuntime(VirtualPoseRuntime):
         return results
 
 
+class UnrepresentableVirtualCropRuntime(VirtualPoseRuntime):
+    """Expose one unrepresentable detector candidate at the runtime boundary."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.detect_candidate_calls = 0
+
+    def iter_video_frames(self, path: Path):
+        import numpy as np
+
+        side_value = 40 if "_left_" in path.name else 80
+        for index in range(4):
+            yield np.full((480, 640, 3), side_value + index, dtype=np.uint8)
+
+    def detect_candidates(
+        self,
+        models: object,
+        frame: Any,
+        *,
+        policy: CandidatePolicy,
+        category_id: int,
+        view_id: str,
+    ) -> Any:
+        del models
+        self.detect_candidate_calls += 1
+        shift = 0.0 if view_id == "left" else -20.0
+        bboxes = [[260.0 + shift, 180.0, 380.0 + shift, 340.0]]
+        scores = [0.95]
+        if view_id == "left" and int(frame.mean()) == 40:
+            bboxes.insert(0, [0.0, 0.0, 640.0, 480.0])
+            scores.insert(0, 0.99)
+        return policy.classify(
+            bboxes=bboxes,
+            scores=scores,
+            labels=[category_id] * len(bboxes),
+            category_id=category_id,
+            view_id=view_id,
+        )
+
+
+class InvalidVirtualCropFrameRuntime(VirtualPoseRuntime):
+    """Return a frame that violates the calibrated crop contract."""
+
+    def iter_video_frames(self, path: Path):
+        import numpy as np
+
+        side_value = 40 if "_left_" in path.name else 80
+        for _ in range(4):
+            yield np.full((479, 640, 3), side_value, dtype=np.uint8)
+
+
 def _instance(*, side: str, y: float) -> dict[str, Any]:
     shift = 0.0 if side == "left" else -20.0
     return {
@@ -1001,6 +1052,123 @@ class WorkerContractTests(unittest.TestCase):
             [event["payload"]["detection"]["classification"] for event in crop_events],
             ["SEED", "RECOVERY", "SEED", "RECOVERY"],
         )
+
+    def test_unrepresentable_virtual_crop_candidate_does_not_abort_other_candidates_or_frames(
+        self,
+    ) -> None:
+        runtime = UnrepresentableVirtualCropRuntime()
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=2)
+            request = json.loads(fixture["request"].read_text(encoding="utf-8"))
+            request["perception"] = {
+                "pose_input": "virtual_perspective_kb4_v1",
+                "crop_output_size": [192, 160],
+                "crop_bbox_scale": 1.3,
+                "crop_min_valid_fraction": 0.8,
+                "recovery_bbox_score": 0.2,
+                "max_candidates_per_view": 4,
+            }
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+            result_dir = root / "result"
+
+            result = run_worker(fixture["request"], result_dir, runtime=runtime)
+            events = [
+                json.loads(line)
+                for line in (result_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        rejected = next(
+            event for event in events if event["event"] == "virtual_crop_pose_not_produced"
+        )
+        self.assertEqual(result["status"], "COMPLETED")
+        self.assertEqual(result["pair_count"], 2)
+        self.assertEqual(result["export_count"], 2)
+        self.assertFalse(any(event["event"] == "worker_execution_failed" for event in events))
+        self.assertEqual(rejected["status"], "WARNING")
+        self.assertEqual(rejected["payload"]["frame_id"], "part0001/pair000000")
+        self.assertEqual(rejected["payload"]["view_id"], "left")
+        self.assertEqual(rejected["payload"]["candidate_id"], "left-det-0000")
+        self.assertEqual(rejected["payload"]["output_status"], "NOT_PRODUCED")
+        self.assertEqual(
+            rejected["payload"]["reason"],
+            "CROP_NOT_REPRESENTABLE_BY_SINGLE_PERSPECTIVE",
+        )
+        self.assertIsNone(rejected["payload"]["virtual_camera"])
+        self.assertEqual(
+            rejected["payload"]["crop_attempt"],
+            {
+                "crop_policy_id": (
+                    "virtual-perspective-kb4/v1:192x160:bbox-scale=0x1.4cccccccccccdp+0"
+                ),
+                "source_bbox_xyxy": [0.0, 0.0, 640.0, 480.0],
+                "error": {
+                    "type": "UnrepresentablePerspectiveCropError",
+                    "message": "bbox cannot be represented by one perspective crop",
+                },
+            },
+        )
+        produced = [event for event in events if event["event"] == "virtual_crop_pose_inferred"]
+        self.assertTrue(
+            any(
+                event["payload"]["frame_id"] == "part0001/pair000000"
+                and event["payload"]["view_id"] == "left"
+                and event["payload"]["candidate_id"] == "left-det-0001"
+                for event in produced
+            )
+        )
+        self.assertTrue(
+            any(
+                event["payload"]["frame_id"] == "part0001/pair000001"
+                and event["payload"]["view_id"] == "left"
+                for event in produced
+            )
+        )
+        self.assertEqual(runtime.detect_candidate_calls, 4)
+        self.assertEqual(runtime.pose_calls, 4)
+
+    def test_systemic_virtual_crop_error_fails_closed_after_persisting_detection(self) -> None:
+        runtime = InvalidVirtualCropFrameRuntime()
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixture = _write_fixture(root, pair_count=1)
+            request = json.loads(fixture["request"].read_text(encoding="utf-8"))
+            request["perception"] = {
+                "pose_input": "virtual_perspective_kb4_v1",
+                "crop_output_size": [192, 160],
+                "crop_bbox_scale": 1.3,
+                "crop_min_valid_fraction": 0.8,
+            }
+            fixture["request"].write_text(json.dumps(request), encoding="utf-8")
+            result_dir = root / "result"
+
+            with self.assertRaisesRegex(WorkerError, "match the calibrated source image size"):
+                run_worker(fixture["request"], result_dir, runtime=runtime)
+            events = [
+                json.loads(line)
+                for line in (result_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            summary = json.loads((result_dir / "summary.json").read_text(encoding="utf-8"))
+
+        detection = next(event for event in events if event["event"] == "hand_candidates_detected")
+        failure = next(event for event in events if event["event"] == "worker_execution_failed")
+        self.assertEqual(summary["status"], "FAILED")
+        self.assertEqual(summary["output_status"], "NOT_PRODUCED")
+        self.assertEqual(detection["stage"], "DETECTION")
+        self.assertEqual(detection["status"], "SUCCEEDED")
+        self.assertEqual(detection["payload"]["frame_id"], "part0001/pair000000")
+        self.assertEqual(detection["payload"]["view_id"], "left")
+        self.assertEqual(detection["payload"]["output_status"], "PRODUCED")
+        self.assertEqual(detection["payload"]["detections"][0]["candidate_id"], "left-det-0000")
+        self.assertEqual(failure["stage"], "POSE_2D")
+        self.assertEqual(failure["payload"]["failed_stage"], "POSE_2D")
+        self.assertEqual(failure["payload"]["frame_id"], "part0001/pair000000")
+        self.assertEqual(failure["payload"]["error"]["type"], "WorkerError")
+        self.assertIn(
+            "match the calibrated source image size", failure["payload"]["error"]["message"]
+        )
+        self.assertLess(detection["ordinal"], failure["ordinal"])
+        self.assertFalse(any(event["event"] == "view_keypoints_inferred" for event in events))
 
     def test_rectified_projection_preserves_landmark_cardinality_and_nulls_invalid_points(
         self,

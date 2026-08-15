@@ -193,7 +193,13 @@ Trace 允许阶段记录不按 frame 交错排列，前端本来就按 `frame_id
    版本化 `crop_policy_id`，不得静默替换方法身份；
 7. detector 采用 0.30 seed、0.20 recovery，先保留每视角最多 4 个 proposal。recovery
    candidate 只有通过 Phase 2 的 stereo/track gate 才能进入最终最多两只手，不能单纯
-   降低全局阈值。
+   降低全局阈值；
+8. candidate classification 与 detection evidence 必须在尝试 virtual crop/pose 前落盘；
+   后续 crop/pose 出现系统性 contract 错误时，run 仍 fail closed，但失败阶段记为
+   `POSE_2D`，且已知的 side、candidate pool 与 bbox 证据不能随异常丢失；
+9. 只有“一个 bbox 的角域无法由单个透视相机覆盖”这一已分类几何条件按 candidate-local
+   失败处理：抛出专用 `UnrepresentablePerspectiveCropError`，该 candidate 记
+   `NOT_PRODUCED` 后继续其余 candidate 与后续帧；不得自动回退 native/full-image pose。
 
 初始 crop 策略参数必须配置化并写入 run manifest：输出尺寸、bbox 扩边、目标角分辨率或
 FOV、最小 valid fraction、边界处理和 policy version。
@@ -204,6 +210,9 @@ FOV、最小 valid fraction、边界处理和 policy version。
 
 - native source+bbox、virtual crop、valid mask 或其统计；
 - `virtual_camera_id`、intrinsics、`T_rig_from_virtual`、crop policy；
+- 无法构造 virtual camera 时仍保存 `candidate_id`、完整 detection、`crop_policy_id`、
+  `source_bbox_xyxy` 和原始异常 type/message；此时 `virtual_camera=null`，reason 使用
+  `CROP_NOT_REPRESENTABLE_BY_SINGLE_PERSPECTIVE`；
 - RTMPose 原始 crop 点、score/visibility、不确定度方法 ID；
 - 映射回 native 与 rectified inspection space 的 21 点，invalid 保持 `null`；
 - `model_input_space=virtual_pinhole`，防止前端误标全帧 rectification 为模型输入。
@@ -217,6 +226,8 @@ FOV、最小 valid fraction、边界处理和 policy version。
 - 合成 ray round-trip 在有效区域内满足数值容差，越界 pixel 必须落入 invalid mask；
 - resize/letterbox/mirror 往返不改变 landmark index，坐标误差满足测试容差；
 - 0-hand 不得退化为 whole-image pose；
+- 单个不可表示的 perspective crop 不得终止同视角其余 candidate 或后续帧；其他
+  crop/pose contract 错误必须在 detection evidence 已落盘后按 `POSE_2D` fail closed；
 - 当前 120 帧回归中双手最终关联不少于 118/120，ghost/duplicate 为 0；
 - 冻结目标域 2D GT 上报告中心/边缘/遮挡/快速运动分桶，目标 NME ≤ 0.05、
   PCK@0.05 ≥ 95%；
@@ -704,6 +715,53 @@ run 相同。
 filtered list 首次/预热后为 5.212 s/34 ms，detail 首次/预热后为 4.258 s/98 ms。当前前端
 已使用新缓存路径，该运行操作不改变 run 或算法；首次 cold latency 仍需在 UI 中明确反馈。
 
+### 8.10 `817fc57` 全量批处理 canary 的不可表示 crop 偏差
+
+2026-08-15 的 immutable canary run `final-817fc57-full-20260815` 在数据项
+`Orbbec_Ego_AZEL764000H_19700102_224701` 上以 `FAILED / NOT_PRODUCED` 结束。audit 为
+PASS，canonical Trace 共 388 records；worker 在 `part0001/pair000024`（frame index 24）
+终止，外层错误为
+`WorkerError: cannot construct virtual crop: bbox cannot be represented by one perspective crop`。
+提交 `817fc57` 中原始异常是普通 `ValueError`；本次修正才为该已知几何条件引入专用
+`UnrepresentablePerspectiveCropError`，不得把新类型写回解释成旧 run 已经保存的异常类。
+
+失败帧的证据边界如下：
+
+- left detection 已完整落盘：46 个 detector decision 全部低于 0.20 recovery threshold，
+  `candidate_pool=[]`、`instances=[]`，所以本帧无法形成任何 stereo hand；
+- right source 与 rectified blob 已保存，SHA-256 分别为
+  `7e5d5a9404812f106f6f6079d2eae8f742a552b989cb8411dc408a18d4da99b1` 和
+  `5c6f3db8535bc3c9dd77c698f51e692cfda64f4df8899c657ed4e133a236b32a`；
+- 旧 runner 只有在一个 side 的全部 crop 完成后才写 detection event；异常发生在 right
+  adapter 返回前，因此 right detection/crop record 为零。具体 `candidate_id`、
+  `source_index`、bbox、score，以及 right 同视图是否已有其他可用 candidate，均无法从
+  已持久化的 worker events/blobs 或 batch stderr 恢复，禁止用相邻帧轨迹猜测；
+- 在 fatal 之前已有 81 个 candidate crop outcome：76 个 `PRODUCED`，另 5 个以
+  `CROP_VALID_FRACTION_BELOW_THRESHOLD` 记为 candidate-local `NOT_PRODUCED` 后继续运行。
+  这证明“局部拒绝、继续剩余候选/帧”已有主链语义；本次偏差是不可表示角域仍被普通
+  `ValueError` 扩大成整条 worker 失败。
+
+据此冻结以下修正语义：
+
+1. cropper 只把“bbox 至少一个角点落在该 virtual camera 的非前向半球，无法由单个
+   perspective crop 表示”分类为 `UnrepresentablePerspectiveCropError`；adapter 捕获后
+   为该 candidate 生成 `NOT_PRODUCED` / `CROP_NOT_REPRESENTABLE_BY_SINGLE_PERSPECTIVE`，
+   不调用该 candidate 的 RTMPose，不回退 native/full-image pose，并继续其余 candidate
+   与后续帧；
+2. warning Trace 保留 detection，并增加 `crop_attempt.crop_policy_id`、
+   `source_bbox_xyxy` 和原始 `error.type/message`；`virtual_camera` 保持 `null`，不得伪造
+   crop intrinsics、mask 或图像；
+3. runner 在进入 adapter 前先持久化 detection event，再把 active stage 切到 `POSE_2D`。
+   除上述专用 candidate-local 条件外，frame/calibration/runtime 等系统性 contract 错误仍
+   fail closed，并在已保存 detection evidence 后产生 `POSE_2D` terminal failure；不得用
+   广泛捕获全部 `ValueError` 的方式掩盖系统错误。
+
+本地修正不能替代真实验证。验收必须先覆盖“同帧 bad candidate 后仍处理 good candidate”
+和“下一帧仍处理”的 contract test，再用新 immutable run 重跑同一数据项，确认 pair 24
+产生含 exact right candidate/bbox/exception 的 warning、存在 pair 24 之后的记录、无
+`worker_execution_failed`、无 native fallback，且完整 `trace-validate` 通过。该 H20 修正
+复跑当前为 **PENDING**；本节不宣称 canary 已恢复，也不覆盖上述 FAILED run。
+
 ## 9. 总体验收矩阵
 
 | 层级 | 验收 |
@@ -761,8 +819,12 @@ MANO phase 完成。
 
 ## 10. 失败与回退策略
 
-- crop 无效：candidate 记录 `NOT_PRODUCED`，不得静默回退全图 pose；只有显式 ablation
-  profile 才能运行 native baseline；
+- crop 无效：valid fraction 不足或单透视角域不可表示时，candidate 记录带明确 reason 的
+  `NOT_PRODUCED`，继续其他 candidate/帧，不调用该 candidate 的 RTMPose，也不得静默
+  回退全图 pose；只有显式 ablation profile 才能运行 native baseline；
+- crop/pose 系统性 contract 错误：先保留 detection evidence，再以 `POSE_2D` fail closed；
+  只允许专用 `UnrepresentablePerspectiveCropError` 使用上述 candidate-local 回退，不得
+  吞掉其他 `ValueError`；
 - robust fusion 不足：Raw 点 invalid，保留左右 2D evidence；
 - MANO 未收敛：Frame-wise MANO `NOT_PRODUCED`，Temporal MANO 不得冒用该结果；
 - Temporal MANO 未通过：保留 Raw 与 Frame-wise MANO，不用 XYZ EMA 冒充目标方法；
@@ -793,6 +855,7 @@ MANO phase 完成。
 | 2026-08-14 | V7.1 / local implementation | 固定写死 20/40 mm，并用 inlier RMSE 同时做 gate 与跨 hypothesis 排序 | trigger/residual threshold 从现有 `max_fit_rmse_m` 派生，full ceiling 固定为其 2 倍；gate 仍用 inlier，但 handedness/seed 统一按 final full RMSE 排序 | 独立审查发现硬编码会与合法非 20 mm 配置分叉，且不同 mask 的 inlier RMSE 不可横向比较；14 点低 RMSE、左右不同 gate、weighted reject/error accepted-state 防污染均有回归 | 默认 profile 的数值仍是 20/40 mm；配置兼容性和 handedness 选择语义更明确；Trace 新增 first/full/inlier、21 点 weights/mask、支持数与阶段迭代，FHP21 v1 不变 | 属于实现阶段必要修正，已同步正文；H20 前本地 contract PASS，真实策略效果仍待 smoke/full run |
 | 2026-08-14 | V7.1 / `v71-1579ebc-h20-smoke1` | 零权重 joint 在前端统一显示为 trimmed | 根据 `trimmed_joint_indices` 区分显式 residual trim；其余 mask=false/weight=0 显示 `NO RAW SUPPORT` | 首帧 track-0000 wrist 的 Raw validity 无效、weight=0、trimmed list 为空；将其显示为裁剪会错误解释算法行为 | 只改变前端诊断标签与样式；Trace、算法和旧 run 不变；新增 produced/rejected/legacy UI tests | 现场语义修正；smoke 系统/契约 PASS，二阶段效果仍需 full run |
 | 2026-08-14 | V7.1 / `v71-bda6fa1-h20-120` | 以 production≥95%、inlier≤20 mm 和 full≤40 mm 验证二阶段策略，同时保留原 ordinary full-P95≤20 mm 总体验收口径 | 保留 `RESIDUAL_TRIM_10PCT_V1` 参数与 20/40 mm 门槛，不因 4 个残余失败继续放宽；将 production/inlier PASS 与 ordinary full-P95 FAIL 分开记录 | Raw 240 records 精确不变；MANO 213→234、21 个新增成功且零回退；inlier P95 17.897 mm、full max 33.140 mm，但 full P95 25.327 mm；frame 50–53 仍按门禁拒绝 | V7.1 继续作为可追溯局部鲁棒门禁；Trace/UI/FHP21 契约保持，后续优先修上游 association/anatomy 与做 GT 评测，不把 full outlier 隐藏为整体质量 PASS | production 与 V7.1 gate PASS，MANO 总体 phase 仍 PARTIAL；不修改历史 run |
+| 2026-08-15 | V2 / `final-817fc57-full-20260815` canary | 任一 virtual-crop `ValueError` 终止 worker，且该 side 的 detection 在 adapter 完成后才落盘 | 将单 perspective 无法覆盖 bbox 的几何条件类型化为 candidate-local `UnrepresentablePerspectiveCropError`：记录 `NOT_PRODUCED` 后继续；detection 改为 crop/pose 前落盘，其余系统 contract 错误仍在 `POSE_2D` fail closed | item `...224701` 的 pair 24：left pool 为空；right exact candidate/bbox 因旧写入顺序不可恢复；fatal 前 76 个 crop produced、5 个 valid-fraction local skip，证明局部继续语义可行 | 新 warning 增加 detection 与 `crop_attempt`，不产生虚假 crop、不做 native fallback；旧 FAILED run 保持 immutable；相同数据项及后续全批次必须用新 run ID 重跑 | 现场偏差驱动修正已冻结；本地 contract 与 H20 同项复跑均须验收，H20 状态 `PENDING` |
 
 复制模板：
 
@@ -823,3 +886,4 @@ MANO phase 完成。
 | 2026-08-14 | 完成本地 V7.1 TDD 切片：weighted runtime、accepted-state robust gate、runner Trace 与 v3 provenance 接通；修正为配置派生 gate/2×ceiling、跨 hypothesis 按 full RMSE 排序，严格 `fhp21/v1` 顶层不变。deploy 187 项通过，真实 Torch weighted objective 通过；H20 smoke/full 仍待执行。 |
 | 2026-08-14 | `v71-1579ebc-h20-smoke1` 在 H20 完成 1-pair smoke：2/2 MANO、39 records/27 blobs、strict Trace 与 1 帧 H.264 overlay 全通过；本帧未触发 weighted refit。前端据此把无 Raw 支持的零权重点与 residual-trim 点分开显示。 |
 | 2026-08-14 | `v71-bda6fa1-h20-120` 完成 V7.1 全量验收：Raw 240 records 精确不变；MANO production 从 213/238 提升到 234/238，30 个 selected hand-frame 进入鲁棒门禁，26 个通过、4 个保留拒绝；实际 weighted-refit attempts 为 26 accepted/8 rejected/0 error。inlier P95 与 40 mm ceiling 通过，但 ordinary full P95 25.327 mm 仍未通过原 20 mm 总体门槛。Trace、238 行 FHP21、1,943 blobs 与 120 帧 H.264 overlay 全部验证通过。 |
+| 2026-08-15 | 记录 `final-817fc57-full-20260815` 在 item `...224701` pair 24 的真实 canary 偏差：left pool 为空，right exact candidate/bbox 因旧 side-level 延迟写入不可恢复；fatal 前 76 个 crop produced、5 个 valid-fraction candidate-local skip。冻结专用 `UnrepresentablePerspectiveCropError` → `NOT_PRODUCED`、无 native fallback、继续候选/帧，以及 detection 先落盘、其余系统错误在 `POSE_2D` fail closed 的语义；修正 H20 同项复跑仍为 `PENDING`。 |

@@ -17,6 +17,10 @@ import numpy as np
 from .calibration import RectifiedStereo
 
 
+class UnrepresentablePerspectiveCropError(ValueError):
+    """A detector candidate cannot be covered by one perspective crop."""
+
+
 def _uv_array(points: Any, *, label: str) -> tuple[np.ndarray, tuple[int, ...]]:
     values = np.asarray(points, dtype=np.float64)
     if values.ndim == 0 or values.shape[-1] != 2:
@@ -243,7 +247,9 @@ class VirtualPerspectiveCropper:
         corner_rays_source = _kb4_unproject(corners, source_k, source_d)
         corner_rays_virtual = corner_rays_source @ rotation
         if np.any(corner_rays_virtual[:, 2] <= 1e-8):
-            raise ValueError("bbox cannot be represented by one perspective crop")
+            raise UnrepresentablePerspectiveCropError(
+                "bbox cannot be represented by one perspective crop"
+            )
         normalized = corner_rays_virtual[:, :2] / corner_rays_virtual[:, 2:3]
         extent_x = float(np.max(np.abs(normalized[:, 0]))) * self.bbox_scale
         extent_y = float(np.max(np.abs(normalized[:, 1]))) * self.bbox_scale
@@ -312,4 +318,8 @@ class VirtualPerspectiveCropper:
         )
 
 
-__all__ = ["PerspectiveCrop", "VirtualPerspectiveCropper"]
+__all__ = [
+    "PerspectiveCrop",
+    "UnrepresentablePerspectiveCropError",
+    "VirtualPerspectiveCropper",
+]

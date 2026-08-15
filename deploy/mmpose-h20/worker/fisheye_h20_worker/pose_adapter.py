@@ -10,7 +10,11 @@ import numpy as np
 
 from .calibration import RectifiedStereo
 from .contracts import WorkerError
-from .crop import PerspectiveCrop, VirtualPerspectiveCropper
+from .crop import (
+    PerspectiveCrop,
+    UnrepresentablePerspectiveCropError,
+    VirtualPerspectiveCropper,
+)
 from .scores import (
     MODEL_SCORE_SEMANTICS,
     QUALITY_WEIGHT_METHOD,
@@ -80,6 +84,7 @@ class CropPoseResult:
     reason: str | None
     crop: PerspectiveCrop | None
     instance: dict[str, Any] | None
+    crop_attempt: dict[str, Any] | None = None
 
     def trace_payload(self) -> dict[str, Any]:
         crop_payload: dict[str, Any] | None = None
@@ -106,6 +111,8 @@ class CropPoseResult:
             "model_input_space": "virtual_pinhole",
             "virtual_camera": crop_payload,
         }
+        if self.crop_attempt is not None:
+            payload["crop_attempt"] = self.crop_attempt
         if self.instance is not None:
             payload.update(
                 {
@@ -182,6 +189,26 @@ class VirtualCropPoseAdapter:
                     detection["bbox_xyxy"],
                     rectification,
                 )
+            except UnrepresentablePerspectiveCropError as exc:
+                outcomes.append(
+                    CropPoseResult(
+                        candidate_id=detection["candidate_id"],
+                        detection=detection,
+                        status="NOT_PRODUCED",
+                        reason="CROP_NOT_REPRESENTABLE_BY_SINGLE_PERSPECTIVE",
+                        crop=None,
+                        instance=None,
+                        crop_attempt={
+                            "crop_policy_id": self.cropper.policy_id,
+                            "source_bbox_xyxy": detection["bbox_xyxy"],
+                            "error": {
+                                "type": type(exc).__name__,
+                                "message": str(exc),
+                            },
+                        },
+                    )
+                )
+                continue
             except ValueError as exc:
                 raise WorkerError(f"cannot construct virtual crop: {exc}") from exc
             if crop.valid_fraction < self.min_valid_fraction:
