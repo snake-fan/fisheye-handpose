@@ -758,9 +758,24 @@ PASS，canonical Trace 共 388 records；worker 在 `part0001/pair000024`（fram
 
 本地修正不能替代真实验证。验收必须先覆盖“同帧 bad candidate 后仍处理 good candidate”
 和“下一帧仍处理”的 contract test，再用新 immutable run 重跑同一数据项，确认 pair 24
-产生含 exact right candidate/bbox/exception 的 warning、存在 pair 24 之后的记录、无
-`worker_execution_failed`、无 native fallback，且完整 `trace-validate` 通过。该 H20 修正
-复跑当前为 **PENDING**；本节不宣称 canary 已恢复，也不覆盖上述 FAILED run。
+产生含 exact right candidate/bbox/exception 的 warning、无 `worker_execution_failed`、无
+native fallback，且完整 `trace-validate` 通过。由于 pair 24 正好是该 session 的最后一帧，
+“后续帧仍继续”只能由两帧 public contract test 验证，真实 canary 不得伪造不存在的 pair 25。
+
+修正提交 `398f355` 的新 immutable run `final-398f355-full-20260815` 已完成 H20 验收：audit
+PASS，worker return 0，25/25 pairs，core `COMPLETED`，398 records/324 blobs，完整
+`trace-validate` 为 0 error/0 warning；overlay 为 H.264、1600×1300、`yuv420p`，ffprobe
+解码 25/25 帧。pair 24 的 `right-det-0001`（RECOVERY，score 0.2726469，bbox
+`[406.2222, 8.2581, 1594.7906, 1296.5486]`）精确产生一条
+`CROP_NOT_REPRESENTABLE_BY_SINGLE_PERSPECTIVE` warning，包含 policy、bbox 和 typed error；
+同视图 `right-det-0000` 的 crop/pose 正常产出，worker failure 数为 0。
+
+该短 session 的 left pool 在 pair 24 为空，整段 25 pairs 都没有形成 cross-view match，故
+最终 `output_status=NOT_PRODUCED`、export=0。这是完整执行后的诚实“无双目骨骼输出”，
+不是系统失败，也不证明 hand recall 达标。批处理语义据此区分
+`COMPLETED/PRODUCED` 与 `COMPLETED/NOT_PRODUCED`：两者都可作为该数据项的最终可追溯
+版本，但必须分别统计，不能把后者包装为有骨骼结果。旧 `817fc57` FAILED run 仍保持
+immutable，不被本次成功 canary 覆盖改写。
 
 ## 9. 总体验收矩阵
 
@@ -855,7 +870,7 @@ MANO phase 完成。
 | 2026-08-14 | V7.1 / local implementation | 固定写死 20/40 mm，并用 inlier RMSE 同时做 gate 与跨 hypothesis 排序 | trigger/residual threshold 从现有 `max_fit_rmse_m` 派生，full ceiling 固定为其 2 倍；gate 仍用 inlier，但 handedness/seed 统一按 final full RMSE 排序 | 独立审查发现硬编码会与合法非 20 mm 配置分叉，且不同 mask 的 inlier RMSE 不可横向比较；14 点低 RMSE、左右不同 gate、weighted reject/error accepted-state 防污染均有回归 | 默认 profile 的数值仍是 20/40 mm；配置兼容性和 handedness 选择语义更明确；Trace 新增 first/full/inlier、21 点 weights/mask、支持数与阶段迭代，FHP21 v1 不变 | 属于实现阶段必要修正，已同步正文；H20 前本地 contract PASS，真实策略效果仍待 smoke/full run |
 | 2026-08-14 | V7.1 / `v71-1579ebc-h20-smoke1` | 零权重 joint 在前端统一显示为 trimmed | 根据 `trimmed_joint_indices` 区分显式 residual trim；其余 mask=false/weight=0 显示 `NO RAW SUPPORT` | 首帧 track-0000 wrist 的 Raw validity 无效、weight=0、trimmed list 为空；将其显示为裁剪会错误解释算法行为 | 只改变前端诊断标签与样式；Trace、算法和旧 run 不变；新增 produced/rejected/legacy UI tests | 现场语义修正；smoke 系统/契约 PASS，二阶段效果仍需 full run |
 | 2026-08-14 | V7.1 / `v71-bda6fa1-h20-120` | 以 production≥95%、inlier≤20 mm 和 full≤40 mm 验证二阶段策略，同时保留原 ordinary full-P95≤20 mm 总体验收口径 | 保留 `RESIDUAL_TRIM_10PCT_V1` 参数与 20/40 mm 门槛，不因 4 个残余失败继续放宽；将 production/inlier PASS 与 ordinary full-P95 FAIL 分开记录 | Raw 240 records 精确不变；MANO 213→234、21 个新增成功且零回退；inlier P95 17.897 mm、full max 33.140 mm，但 full P95 25.327 mm；frame 50–53 仍按门禁拒绝 | V7.1 继续作为可追溯局部鲁棒门禁；Trace/UI/FHP21 契约保持，后续优先修上游 association/anatomy 与做 GT 评测，不把 full outlier 隐藏为整体质量 PASS | production 与 V7.1 gate PASS，MANO 总体 phase 仍 PARTIAL；不修改历史 run |
-| 2026-08-15 | V2 / `final-817fc57-full-20260815` canary | 任一 virtual-crop `ValueError` 终止 worker，且该 side 的 detection 在 adapter 完成后才落盘 | 将单 perspective 无法覆盖 bbox 的几何条件类型化为 candidate-local `UnrepresentablePerspectiveCropError`：记录 `NOT_PRODUCED` 后继续；detection 改为 crop/pose 前落盘，其余系统 contract 错误仍在 `POSE_2D` fail closed | item `...224701` 的 pair 24：left pool 为空；right exact candidate/bbox 因旧写入顺序不可恢复；fatal 前 76 个 crop produced、5 个 valid-fraction local skip，证明局部继续语义可行 | 新 warning 增加 detection 与 `crop_attempt`，不产生虚假 crop、不做 native fallback；旧 FAILED run 保持 immutable；相同数据项及后续全批次必须用新 run ID 重跑 | 现场偏差驱动修正已冻结；本地 contract 与 H20 同项复跑均须验收，H20 状态 `PENDING` |
+| 2026-08-15 | V2 / `817fc57`→`398f355` canary | 任一 virtual-crop `ValueError` 终止 worker，且该 side 的 detection 在 adapter 完成后才落盘 | 将单 perspective 无法覆盖 bbox 的几何条件类型化为 candidate-local `UnrepresentablePerspectiveCropError`：记录 `NOT_PRODUCED` 后继续；detection 改为 crop/pose 前落盘，其余系统 contract 错误仍在 `POSE_2D` fail closed | 旧 run 在 item `...224701` pair 24 fatal；新 run 精确记录 `right-det-0001` warning，同侧 `right-det-0000` 正常 pose，worker 0 failure，25-frame Trace/overlay 完整 | 新 warning 增加 detection 与 `crop_attempt`，不产生虚假 crop、不做 native fallback；新 run 因整段无 cross-view match 而诚实保留 `COMPLETED/NOT_PRODUCED`，旧 FAILED run 不改写 | 本地 contract 与 H20 同项修正 PASS；hand recall/output quality 仍须单独评估 |
 
 复制模板：
 
@@ -886,4 +901,5 @@ MANO phase 完成。
 | 2026-08-14 | 完成本地 V7.1 TDD 切片：weighted runtime、accepted-state robust gate、runner Trace 与 v3 provenance 接通；修正为配置派生 gate/2×ceiling、跨 hypothesis 按 full RMSE 排序，严格 `fhp21/v1` 顶层不变。deploy 187 项通过，真实 Torch weighted objective 通过；H20 smoke/full 仍待执行。 |
 | 2026-08-14 | `v71-1579ebc-h20-smoke1` 在 H20 完成 1-pair smoke：2/2 MANO、39 records/27 blobs、strict Trace 与 1 帧 H.264 overlay 全通过；本帧未触发 weighted refit。前端据此把无 Raw 支持的零权重点与 residual-trim 点分开显示。 |
 | 2026-08-14 | `v71-bda6fa1-h20-120` 完成 V7.1 全量验收：Raw 240 records 精确不变；MANO production 从 213/238 提升到 234/238，30 个 selected hand-frame 进入鲁棒门禁，26 个通过、4 个保留拒绝；实际 weighted-refit attempts 为 26 accepted/8 rejected/0 error。inlier P95 与 40 mm ceiling 通过，但 ordinary full P95 25.327 mm 仍未通过原 20 mm 总体门槛。Trace、238 行 FHP21、1,943 blobs 与 120 帧 H.264 overlay 全部验证通过。 |
-| 2026-08-15 | 记录 `final-817fc57-full-20260815` 在 item `...224701` pair 24 的真实 canary 偏差：left pool 为空，right exact candidate/bbox 因旧 side-level 延迟写入不可恢复；fatal 前 76 个 crop produced、5 个 valid-fraction candidate-local skip。冻结专用 `UnrepresentablePerspectiveCropError` → `NOT_PRODUCED`、无 native fallback、继续候选/帧，以及 detection 先落盘、其余系统错误在 `POSE_2D` fail closed 的语义；修正 H20 同项复跑仍为 `PENDING`。 |
+| 2026-08-15 | 记录 `final-817fc57-full-20260815` 在 item `...224701` pair 24 的真实 canary 偏差：left pool 为空，right exact candidate/bbox 因旧 side-level 延迟写入不可恢复；fatal 前 76 个 crop produced、5 个 valid-fraction candidate-local skip。冻结专用 `UnrepresentablePerspectiveCropError` → `NOT_PRODUCED`、无 native fallback、继续候选/帧，以及 detection 先落盘、其余系统错误在 `POSE_2D` fail closed 的语义；该记录生成时 H20 同项复跑状态为 `PENDING`。 |
+| 2026-08-15 | `final-398f355-full-20260815` 完成 25-pair H20 修正 canary：typed warning 精确保留 `right-det-0001` policy/bbox/error，同侧另一 candidate 正常 pose，worker 无 failure；398 records/324 blobs 与 25 帧 H.264 overlay 全部校验通过。该短片无 cross-view match，故最终明确为 `COMPLETED/NOT_PRODUCED`；批处理验收开始分别统计有骨骼输出和完整执行但无骨骼输出。 |
