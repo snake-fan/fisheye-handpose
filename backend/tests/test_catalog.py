@@ -227,6 +227,84 @@ def test_catalog_run_detail_keeps_source_documents_and_filter_vocabularies(
     }
 
 
+def test_run_detail_only_offers_frame_stages_in_pipeline_order(tmp_path: Path) -> None:
+    run = _write_run(tmp_path)
+    records = [
+        {
+            "record_id": "kinematic:7",
+            "ordinal": 0,
+            "stage": "KINEMATIC_REFINEMENT",
+            "status": "SUCCEEDED",
+            "event": "kinematic",
+            "payload": {"frame_id": "frame/000007", "frame_index": 7},
+            "blobs": [],
+        },
+        {
+            "record_id": "system",
+            "ordinal": 1,
+            "stage": "SYSTEM",
+            "status": "SUCCEEDED",
+            "event": "configured",
+            "payload": {"mode": "test"},
+            "blobs": [],
+        },
+        {
+            "record_id": "raw:7",
+            "ordinal": 2,
+            "stage": "RAW_FUSION",
+            "status": "SUCCEEDED",
+            "event": "raw",
+            "payload": {"frame_id": "frame/000007", "frame_index": 7},
+            "blobs": [],
+        },
+        {
+            "record_id": "calibration",
+            "ordinal": 3,
+            "stage": "CALIBRATION",
+            "status": "SUCCEEDED",
+            "event": "loaded",
+            "payload": {"calibration_id": "test"},
+            "blobs": [],
+        },
+        {
+            "record_id": "pose:7",
+            "ordinal": 4,
+            "stage": "POSE_2D",
+            "status": "SUCCEEDED",
+            "event": "pose",
+            "payload": {"frame_id": "frame/000007", "frame_index": 7},
+            "blobs": [],
+        },
+        {
+            "record_id": "detection:7",
+            "ordinal": 5,
+            "stage": "DETECTION",
+            "status": "SUCCEEDED",
+            "event": "detection",
+            "payload": {"frame_id": "frame/000007", "frame_index": 7},
+            "blobs": [],
+        },
+    ]
+    (run / "trace.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    catalog = TraceCatalog(tmp_path)
+    detail = catalog.get_run(_key(catalog, "capture-001"))
+
+    assert detail["stages"] == [
+        "DETECTION",
+        "POSE_2D",
+        "RAW_FUSION",
+        "KINEMATIC_REFINEMENT",
+    ]
+    assert [record["record_id"] for record in detail["global_records"]] == [
+        "system",
+        "calibration",
+    ]
+
+
 def test_frame_page_filters_records_before_aggregating_frames(tmp_path: Path) -> None:
     _write_run(tmp_path)
 

@@ -14,13 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from fisheye_handpose.trace import RunArtifactReader, TraceValidationError
+from fisheye_handpose.trace import RunArtifactReader, TraceStage, TraceValidationError
 
 _MANIFEST_NAMES = ("run_manifest.json", "trace_manifest.json", "manifest.json")
 _TRACE_NAMES = ("trace.jsonl", "records.jsonl")
 _SUMMARY_NAMES = ("run_summary.json", "summary.json")
 DEFAULT_DISCOVERY_CACHE_TTL_SECONDS = 30.0
 DEFAULT_VALIDATION_CACHE_TTL_SECONDS = 300.0
+_TRACE_STAGE_RANK = {stage.value: index for index, stage in enumerate(TraceStage)}
 
 
 class ArtifactNotFoundError(LookupError):
@@ -220,7 +221,7 @@ class TraceCatalog:
             "summary": summary,
             "validation": self._validate_run(run, index, verify_blobs=True),
             "provenance": _run_provenance(manifest, records),
-            "stages": sorted({str(record["stage"]) for record in records if record.get("stage")}),
+            "stages": _frame_filter_stages(records),
             "track_ids": sorted(
                 {str(payload["track_id"]) for payload in payloads if payload.get("track_id")}
             ),
@@ -854,6 +855,21 @@ def _frame_timestamp_ns(payload: dict[str, Any]) -> int | None:
 
 def _frame_key(frame_id: str) -> str:
     return hashlib.sha256(frame_id.encode("utf-8")).hexdigest()
+
+
+def _frame_filter_stages(records: tuple[dict[str, Any], ...]) -> list[str]:
+    """Return stages that can match the frame timeline, in pipeline order."""
+    stages: set[str] = set()
+    for record in records:
+        payload = _metadata(record)
+        frame_id = payload.get("frame_id")
+        stage = record.get("stage")
+        if isinstance(frame_id, str) and frame_id and isinstance(stage, str) and stage:
+            stages.add(stage)
+    return sorted(
+        stages,
+        key=lambda stage: (_TRACE_STAGE_RANK.get(stage, len(_TRACE_STAGE_RANK)), stage),
+    )
 
 
 def _append_text(items: list[str], value: Any) -> None:
