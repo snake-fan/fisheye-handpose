@@ -1,13 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { TraceApiError, traceApi } from "./api/client";
 import type { FrameDetail, FrameSummary, RunDetail, RunSummary } from "./api/types";
 import { FrameInspector } from "./components/FrameInspector";
 import { FrameTimeline } from "./components/FrameTimeline";
 import { OverlayVideoPlayer } from "./components/OverlayVideoPlayer";
+import { ImagePreviewProvider } from "./components/PreviewableImage";
 import { RunCatalog } from "./components/RunCatalog";
 import { RunHeader } from "./components/RunHeader";
 import { TraceFilters } from "./components/TraceFilters";
+import { frameFilterStages } from "./domain/stages";
 import { useUrlState } from "./hooks/useUrlState";
 
 const FRAME_PAGE_SIZE = 40;
@@ -20,7 +22,7 @@ function pageOffset(value: string): number {
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
 }
 
-export function App() {
+function AppContent() {
   const [urlState, setUrlState] = useUrlState();
   const [runs, setRuns] = useState<RunSummary[]>([]);
   const [runTotal, setRunTotal] = useState(0);
@@ -43,6 +45,7 @@ export function App() {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>("checking");
   const [retryNonce, setRetryNonce] = useState(0);
   const connectionStatusRef = useRef<ConnectionStatus>("checking");
+  const stageOptions = useMemo(() => detail ? frameFilterStages(detail) : [], [detail]);
 
   const recordRequestSuccess = () => {
     connectionStatusRef.current = "connected";
@@ -61,6 +64,11 @@ export function App() {
     setConnectionStatus("checking");
     setRetryNonce((value) => value + 1);
   };
+
+  useEffect(() => {
+    if (!detail || !urlState.stage || stageOptions.includes(urlState.stage)) return;
+    setUrlState({ stage: "", frame: "", offset: "" });
+  }, [detail, setUrlState, stageOptions, urlState.stage]);
 
   useEffect(() => {
     if (connectionStatus !== "disconnected") return;
@@ -260,7 +268,7 @@ export function App() {
             <RunHeader detail={detail} />
             <OverlayVideoPlayer runKey={detail.run.run_key} detail={detail} />
             <TraceFilters
-              stages={detail.stages}
+              stages={stageOptions}
               tracks={detail.track_ids}
               stage={urlState.stage}
               track={urlState.track}
@@ -296,5 +304,13 @@ export function App() {
         </div>
       )}
     </div>
+  );
+}
+
+export function App() {
+  return (
+    <ImagePreviewProvider>
+      <AppContent />
+    </ImagePreviewProvider>
   );
 }

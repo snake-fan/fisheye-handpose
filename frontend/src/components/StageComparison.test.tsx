@@ -319,7 +319,8 @@ test("virtual-crop RTMPose diagnostics lazily load only the selected candidate e
   expect(screen.queryByRole("img", { name: /valid mask/ })).not.toBeInTheDocument();
 });
 
-test("raw 3D projection on a rectified background never falls back to native keypoints", () => {
+test("raw 3D projection on a rectified background never falls back to native keypoints", async () => {
+  const user = userEvent.setup();
   const projected = Array.from({ length: 21 }, (_, index) => [30 + index, 40 + index]);
   const native = Array.from({ length: 21 }, (_, index) => [900 + index, 800 + index]);
   const records: TraceRecord[] = [
@@ -366,9 +367,16 @@ test("raw 3D projection on a rectified background never falls back to native key
   expect(container.querySelector('circle[cx="30"]')).toBeInTheDocument();
   expect(container.querySelector('circle[cx="900"]')).not.toBeInTheDocument();
   expect(screen.getByText("RECTIFIED PIXEL SPACE")).toBeVisible();
+
+  await user.click(screen.getByRole("button", {
+    name: "放大预览：左目 ASSOCIATION rectified background",
+  }));
+  const preview = screen.getByRole("dialog", { name: "左目 ASSOCIATION rectified background" });
+  expect(within(preview).getByText("NOT_PRODUCED")).toBeVisible();
 });
 
-test("hand detection compares the source image with every detected bounding box", () => {
+test("hand detection compares the source image with every detected bounding box", async () => {
+  const user = userEvent.setup();
   const records: TraceRecord[] = [
     {
       record_id: "sync",
@@ -413,6 +421,12 @@ test("hand detection compares the source image with every detected bounding box"
   expect(within(left).getByLabelText("left-1 detection")).toBeInTheDocument();
   expect(within(left).getByText("2 HAND CANDIDATES")).toBeVisible();
   expect(screen.queryByText("RAW DETECTOR PROPOSALS → BOUNDED ASSOCIATION POOL")).not.toBeInTheDocument();
+
+  await user.click(within(left).getByRole("button", {
+    name: "放大预览：左目 detection output background",
+  }));
+  const preview = screen.getByRole("dialog", { name: "左目 detection output background" });
+  expect(within(preview).getByRole("img", { name: "左目 all detection boxes" })).toBeVisible();
 });
 
 test("candidate-aware detection audits every raw proposal before the bounded association pool", () => {

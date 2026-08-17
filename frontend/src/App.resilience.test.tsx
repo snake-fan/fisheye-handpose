@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { expect, test, vi } from "vitest";
 
@@ -31,7 +31,7 @@ function runSummary(overrides: Partial<RunSummary> = {}): RunSummary {
 }
 
 test("audit-only runs explain every model stage that was not produced", async () => {
-  window.history.replaceState({}, "", "/?run=audit-key");
+  window.history.replaceState({}, "", "/?run=audit-key&stage=DETECTION");
   const run = runSummary();
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
     const url = new URL(String(input), window.location.origin);
@@ -44,7 +44,7 @@ test("audit-only runs explain every model stage that was not produced", async ()
         manifest: { run_id: run.run_id, metadata: { item_id: run.item_id } },
         summary: { status: "COMPLETED" },
         validation: { ok: true, errors: [], warnings: [] },
-        stages: ["DISCOVERY", "DETECTION", "POSE_2D"],
+        stages: [],
         track_ids: [],
         view_ids: [],
         global_records: [
@@ -82,6 +82,14 @@ test("audit-only runs explain every model stage that was not produced", async ()
   render(<App />);
 
   expect(await screen.findByRole("heading", { name: "运行级阶段记录" })).toBeVisible();
+  expect(
+    within(screen.getByRole("combobox", { name: "阶段" }))
+      .getAllByRole("option")
+      .map((option) => option.textContent),
+  ).toEqual(["全部阶段"]);
+  await waitFor(() => {
+    expect(new URL(window.location.href).searchParams.has("stage")).toBe(false);
+  });
   const panel = screen.getByRole("tabpanel", { name: "阶段" });
   expect(within(panel).getAllByText("SKIPPED")).toHaveLength(2);
   expect(within(panel).getAllByText("NOT_PRODUCED")).toHaveLength(2);

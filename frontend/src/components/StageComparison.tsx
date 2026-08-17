@@ -1,10 +1,11 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { ImageIcon } from "lucide-react";
 
 import { traceApi } from "../api/client";
 import type { ArtifactRef, TraceRecord } from "../api/types";
 import { artifactsOf, FHP21_EDGES, FHP21_NAMES, payloadOf } from "../domain/trace";
 import type { PipelineNodeId } from "./PipelineNodeRail";
+import { PreviewableImage } from "./PreviewableImage";
 
 interface StageComparisonProps {
   runKey: string;
@@ -111,10 +112,12 @@ function EvidenceImage({
   runKey,
   artifact,
   label,
+  previewOverlay,
 }: {
   runKey: string;
   artifact: ArtifactRef | undefined;
   label: string;
+  previewOverlay?: ReactNode;
 }) {
   if (!artifact) {
     return (
@@ -124,7 +127,13 @@ function EvidenceImage({
       </div>
     );
   }
-  return <img src={traceApi.artifactUrl(runKey, artifactPath(artifact))} alt={label} />;
+  return (
+    <PreviewableImage
+      src={traceApi.artifactUrl(runKey, artifactPath(artifact))}
+      alt={label}
+      previewOverlay={previewOverlay}
+    />
+  );
 }
 
 function StereoImageComparison({
@@ -463,9 +472,9 @@ function OverlayPanel({
   graphicLabel: string;
   layerLabel?: string;
 }) {
-  return (
-    <div className="comparison-overlay-stage">
-      <EvidenceImage runKey={runKey} artifact={background} label={backgroundLabel} />
+  const hasVisibleLayer = layers.some(hasVisiblePoint);
+  const overlay = (
+    <>
       <SkeletonGraphic
         layers={layers}
         selectedTrack={selectedTrack}
@@ -474,7 +483,19 @@ function OverlayPanel({
         label={graphicLabel}
         layerLabel={layerLabel}
       />
-      {!layers.some(hasVisiblePoint) && <div className="overlay-empty-label">NOT_PRODUCED</div>}
+      {!hasVisibleLayer && <span className="overlay-empty-label">NOT_PRODUCED</span>}
+    </>
+  );
+
+  return (
+    <div className="comparison-overlay-stage">
+      <EvidenceImage
+        runKey={runKey}
+        artifact={background}
+        label={backgroundLabel}
+        previewOverlay={overlay}
+      />
+      {overlay}
     </div>
   );
 }
@@ -580,7 +601,20 @@ function DetectionComparison({ runKey, records }: { runKey: string; records: Tra
                 <div className="stage-comparison-pair">
                   <figure>
                     <div className="comparison-overlay-stage">
-                      <EvidenceImage runKey={runKey} artifact={source} label={`${label} raw proposal background`} />
+                      <EvidenceImage
+                        runKey={runKey}
+                        artifact={source}
+                        label={`${label} raw proposal background`}
+                        previewOverlay={(
+                          <DetectionGraphic
+                            detections={audit.decisions}
+                            width={width}
+                            height={height}
+                            label={`${label} raw detector proposals`}
+                            variant="raw"
+                          />
+                        )}
+                      />
                       <DetectionGraphic
                         detections={audit.decisions}
                         width={width}
@@ -593,7 +627,20 @@ function DetectionComparison({ runKey, records }: { runKey: string; records: Tra
                   </figure>
                   <figure>
                     <div className="comparison-overlay-stage">
-                      <EvidenceImage runKey={runKey} artifact={source} label={`${label} bounded pool background`} />
+                      <EvidenceImage
+                        runKey={runKey}
+                        artifact={source}
+                        label={`${label} bounded pool background`}
+                        previewOverlay={(
+                          <DetectionGraphic
+                            detections={audit.pool}
+                            width={width}
+                            height={height}
+                            label={`${label} bounded association pool`}
+                            variant="pool"
+                          />
+                        )}
+                      />
                       <DetectionGraphic
                         detections={audit.pool}
                         width={width}
@@ -619,7 +666,19 @@ function DetectionComparison({ runKey, records }: { runKey: string; records: Tra
                 </figure>
                 <figure>
                   <div className="comparison-overlay-stage">
-                    <EvidenceImage runKey={runKey} artifact={source} label={`${label} detection output background`} />
+                    <EvidenceImage
+                      runKey={runKey}
+                      artifact={source}
+                      label={`${label} detection output background`}
+                      previewOverlay={(
+                        <DetectionGraphic
+                          detections={detections}
+                          width={width}
+                          height={height}
+                          label={`${label} all detection boxes`}
+                        />
+                      )}
+                    />
                     <DetectionGraphic detections={detections} width={width} height={height} label={`${label} all detection boxes`} />
                   </div>
                   <figcaption>AFTER · ALL DETECTIONS</figcaption>
@@ -866,7 +925,19 @@ function PoseComparison({
                 <div className="stage-comparison-pair">
                   <figure>
                     <div className="comparison-overlay-stage">
-                      <EvidenceImage runKey={runKey} artifact={source} label={`${label} detection background`} />
+                      <EvidenceImage
+                        runKey={runKey}
+                        artifact={source}
+                        label={`${label} detection background`}
+                        previewOverlay={(
+                          <DetectionGraphic
+                            detections={detections}
+                            width={width}
+                            height={height}
+                            label={`${label} detection input boxes`}
+                          />
+                        )}
+                      />
                       <DetectionGraphic detections={detections} width={width} height={height} label={`${label} detection input boxes`} />
                     </div>
                     <figcaption>BEFORE · DETECTION</figcaption>
