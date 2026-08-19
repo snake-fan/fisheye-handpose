@@ -15,11 +15,14 @@ import sys
 import tempfile
 import urllib.request
 from pathlib import Path, PurePosixPath
+from runpy import run_path
 from typing import Any
 from urllib.parse import urlsplit
 
-SCHEMA_VERSION = "fisheye-handpose/model-assets/v1"
-DEFAULT_MANIFEST = Path(__file__).with_name("model-assets.json")
+DEPLOY_ROOT = Path(__file__).resolve().parent
+_PROJECT_CONTRACT = run_path(str(DEPLOY_ROOT / "_generated_project_contract.py"))
+SCHEMA_VERSION = str(_PROJECT_CONTRACT["MODEL_ASSETS_SCHEMA"])
+DEFAULT_MANIFEST = DEPLOY_ROOT / "model-assets.json"
 ALLOWED_DOWNLOAD_HOST = "download.openmmlab.com"
 LICENSE_STATUSES = frozenset({"ALLOWED", "REVIEW_REQUIRED"})
 

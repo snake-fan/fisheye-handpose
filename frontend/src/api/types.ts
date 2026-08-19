@@ -1,3 +1,5 @@
+import type { SCHEMA_IDS } from "../domain/projectContract.generated";
+
 export type RunStatus = "ACTIVE" | "COMPLETED" | "FAILED" | string;
 
 export interface RunSummary {
@@ -78,6 +80,28 @@ export interface ArtifactRef {
   relative_path?: string;
   path?: string;
   [key: string]: unknown;
+}
+
+export interface RationalValue {
+  numerator: number;
+  denominator: number;
+}
+
+export interface OverlayVideoTimelineFrame {
+  video_frame_index: number;
+  video_pts: number;
+  duration_pts: number;
+  frame_id: string;
+  frame_index: number;
+  timestamp_ns: number;
+  track_ids: string[];
+}
+
+export interface OverlayVideoTimeline {
+  schema_version: (typeof SCHEMA_IDS)["OVERLAY_VIDEO_TIMELINE"];
+  frame_rate: RationalValue;
+  time_base: RationalValue;
+  frames: OverlayVideoTimelineFrame[];
 }
 
 export interface TraceRecord {

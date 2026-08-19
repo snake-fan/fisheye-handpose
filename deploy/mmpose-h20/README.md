@@ -461,21 +461,28 @@ duplicated as a mutable `runs/<item>/<run>/fhp21.jsonl` file.
 
 ## Tests
 
-The deployment contract tests use only the Python standard library, so manifest and CLI
-validation can run before installing the Linux-only CUDA environment:
+The manifest doctor and its focused tests use only the Python standard library, so the pinned
+environment contract can be validated before installing the Linux-only CUDA environment:
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 doctor.py --mode manifest
+python3 -m unittest tests/test_doctor.py -v
 ```
 
-The worker tests use a fake model/video runtime but real KB4 rectification and stereo
-geometry, so they do not initialize CUDA or deserialize checkpoints. The video encoder
-unit test replaces the FFmpeg process with an in-memory fake while asserting the exact
-libx264/yuv420p/faststart command and timeline contract; it does not require system FFmpeg:
+The complete lightweight worker suite also requires `pytest`, NumPy, and OpenCV. Run it from
+the repository's locked Python 3.11 root dev environment; do **not** synchronize this
+Linux/CUDA subproject merely to run unit tests:
 
 ```bash
-python3 -m unittest tests/test_worker.py -v
+cd /path/to/fisheye-handpose
+uv sync --locked --extra dev --no-editable
+uv run --locked --extra dev --no-editable pytest -q deploy/mmpose-h20/tests
 ```
+
+These tests use a fake model/video runtime but real KB4 rectification and stereo geometry, so
+they do not initialize CUDA or deserialize checkpoints. Torch-only MANO optimizer tests skip
+when Torch is absent. The video encoder test replaces FFmpeg with an in-memory fake while
+asserting the exact libx264/yuv420p/faststart command and timeline contract.
 
 Do not run `uv sync` for this subproject on macOS: the pinned MMCV wheel intentionally
 supports only CPython 3.10 on Linux x86_64.

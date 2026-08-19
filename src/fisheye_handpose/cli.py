@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from ._generated_project_contract import AUDIT_SCHEMA
 from .audit import AuditConfig, AuditConfigurationError, audit_session
 from .calibration import load_orbbec_stereo
 from .errors import FisheyeHandposeError
@@ -234,7 +235,7 @@ def _demo_svg(frame_index: int, view_id: str, points: list[list[float]]) -> byte
         f'x2="{points[child][0]:.1f}" y2="{points[child][1]:.1f}" />'
         for parent, child in FHP21.edges
     )
-    joints = "".join(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="5" />' for x, y in points)
+    joints = "".join(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="3" />' for x, y in points)
     return (
         '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" '
         'viewBox="0 0 640 480">'
@@ -242,7 +243,7 @@ def _demo_svg(frame_index: int, view_id: str, points: list[list[float]]) -> byte
         '<path d="M0 360 Q160 300 320 350 T640 330 V480 H0Z" fill="#182638"/>'
         f'<text x="24" y="38" fill="#e8f1ff" font-family="sans-serif" font-size="20">'
         f"FHP trace demo · {view_id} · frame {frame_index:06d}</text>"
-        f'<g stroke="{color}" stroke-width="4" stroke-linecap="round" '
+        f'<g stroke="{color}" stroke-width="2" stroke-linecap="round" '
         f'fill="{color}">{edges}{joints}</g>'
         '<rect x="140" y="90" width="340" height="330" fill="none" '
         'stroke="#ff5c8a" stroke-width="2" stroke-dasharray="8 5"/>'
@@ -668,7 +669,7 @@ def _command_audit_session(args: argparse.Namespace) -> None:
         config = _audit_config(args)
     except FisheyeHandposeError as exc:
         report = {
-            "schema_version": "fisheye-handpose/audit/v1",
+            "schema_version": AUDIT_SCHEMA,
             "status": "FAIL",
             "input_session": str(Path(args.session).expanduser().resolve()),
             "errors": [

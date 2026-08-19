@@ -208,3 +208,36 @@ def test_result_writer_validates_pose_estimate_before_first_append(tmp_path: Pat
         writer.append_fhp21(record)
 
     assert not (tmp_path / "result" / "fhp21.jsonl").exists()
+
+
+def test_result_writer_rejects_a_noncanonical_event_stage(tmp_path: Path) -> None:
+    writer = ResultWriter(tmp_path / "result", {"test": True})
+
+    with pytest.raises(WorkerError, match="stage"):
+        writer.append(
+            event_id="unknown-stage",
+            stage="NOT_A_STAGE",
+            status="FAILED",
+            event="invalid_contract_event",
+            payload={},
+        )
+
+
+def test_result_writer_rejects_a_noncanonical_event_status(tmp_path: Path) -> None:
+    writer = ResultWriter(tmp_path / "result", {"test": True})
+
+    with pytest.raises(WorkerError, match="status"):
+        writer.append(
+            event_id="unknown-status",
+            stage="SYSTEM",
+            status="NOT_A_STATUS",
+            event="invalid_contract_event",
+            payload={},
+        )
+
+
+def test_result_writer_rejects_a_nonterminal_run_status(tmp_path: Path) -> None:
+    writer = ResultWriter(tmp_path / "result", {"test": True})
+
+    with pytest.raises(WorkerError, match="final status"):
+        writer.finalize(status="ACTIVE", summary={})

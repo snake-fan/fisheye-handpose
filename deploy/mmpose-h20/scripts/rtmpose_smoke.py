@@ -13,12 +13,17 @@ from collections.abc import Sequence
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
+from runpy import run_path
 from typing import Any
 
-SCHEMA_VERSION = "fisheye-handpose/rtmpose-smoke/v1"
+DEPLOY_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_CONTRACT = run_path(
+    str(Path(__file__).resolve().with_name("_generated_project_contract.py"))
+)
+SCHEMA_VERSION = str(_PROJECT_CONTRACT["RTMPOSE_SMOKE_SCHEMA"])
+MODEL_ASSETS_SCHEMA = str(_PROJECT_CONTRACT["MODEL_ASSETS_SCHEMA"])
 H20_COMPUTE_CAPABILITY = (9, 0)
 MMPOSE_COMMIT = "5408bc76f5b848cf925a0d1857899011d8c5b497"
-DEPLOY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ASSET_MANIFEST = DEPLOY_ROOT / "model-assets.json"
 EXPECTED_ARTIFACTS = {
     "rtmdet-nano-hand": Path("demo/mmdetection_cfg/rtmdet_nano_320-8xb32_hand.py"),
@@ -108,7 +113,7 @@ def _load_verified_assets(manifest_path: Path, model_dir: Path) -> dict[str, Any
         raise SmokeError(f"cannot parse model asset manifest {manifest_path}: {error}") from error
     if not isinstance(manifest, dict):
         raise SmokeError("model asset manifest must be a JSON object")
-    if manifest.get("schema_version") != "fisheye-handpose/model-assets/v1":
+    if manifest.get("schema_version") != MODEL_ASSETS_SCHEMA:
         raise SmokeError("unexpected model asset manifest schema_version")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list):

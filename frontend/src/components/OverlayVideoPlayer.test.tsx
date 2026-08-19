@@ -1,7 +1,8 @@
-import { render, screen } from "@testing-library/react";
-import { expect, test } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { expect, test, vi } from "vitest";
 
-import type { RunDetail } from "../api/types";
+import { traceApi } from "../api/client";
+import type { OverlayVideoTimeline, RunDetail } from "../api/types";
 import { OverlayVideoPlayer } from "./OverlayVideoPlayer";
 
 function detailWith(records: RunDetail["global_records"]): RunDetail {
@@ -30,8 +31,8 @@ function detailWith(records: RunDetail["global_records"]): RunDetail {
   };
 }
 
-test("operator plays the stereo overlay with timeline and truthful RAW to EMA provenance", () => {
-  const detail = detailWith([{
+function overlayDetail(withTimeline = true): RunDetail {
+  return detailWith([{
     record_id: "overlay-video",
     stage: "EXPORT",
     status: "SUCCEEDED",
@@ -49,15 +50,37 @@ test("operator plays the stereo overlay with timeline and truthful RAW to EMA pr
         relative_path: "blobs/sha256/aa/overlay.mp4",
         media_type: "video/mp4",
       },
-      {
+      ...(withTimeline ? [{
         role: "overlay_video_timeline",
         relative_path: "blobs/sha256/bb/timeline.json",
         media_type: "application/json",
-      },
+      }] : []),
     ],
   }]);
+}
 
-  render(<OverlayVideoPlayer runKey="video-run" detail={detail} />);
+function timelineDocument(frameCount = 120): OverlayVideoTimeline {
+  const durationPoints = 3003;
+  return {
+    schema_version: "fisheye-handpose/overlay-video-timeline/v1",
+    frame_rate: { numerator: 30_000, denominator: 1001 },
+    time_base: { numerator: 1, denominator: 90_000 },
+    frames: Array.from({ length: frameCount }, (_, index) => ({
+      video_frame_index: index,
+      video_pts: index * durationPoints,
+      duration_pts: durationPoints,
+      frame_id: `frame/${String(index).padStart(6, "0")}`,
+      frame_index: index + 40,
+      timestamp_ns: 1_000_000_000 + index * 33_366_667,
+      track_ids: ["track-0000"],
+    })),
+  };
+}
+
+test("operator plays the stereo overlay with timeline and truthful RAW to EMA provenance", async () => {
+  vi.spyOn(traceApi, "getArtifactJson").mockResolvedValue(timelineDocument());
+
+  render(<OverlayVideoPlayer runKey="video-run" detail={overlayDetail()} />);
 
   const video = screen.getByLabelText("Raw 与 Stable 双目骨架抖动对比视频");
   expect(video).toHaveAttribute("controls");
@@ -70,6 +93,98 @@ test("operator plays the stereo overlay with timeline and truthful RAW to EMA pr
     expect.stringContaining("/timeline.json"),
   );
   expect(screen.getByText("120 frames · RECTIFIED")).toBeVisible();
+  const slider = await screen.findByRole("slider", { name: "帧时间轴" });
+  expect(slider).toHaveAttribute("min", "0");
+  expect(slider).toHaveAttribute("max", "119");
+  expect(slider).toHaveAttribute("step", "1");
+  expect(slider).toBeDisabled();
+});
+
+test("operator drags and steps through exact video presentation frames", async () => {
+  const timeline = timelineDocument();
+  vi.spyOn(traceApi, "getArtifactJson").mockResolvedValue(timeline);
+  const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+  render(<OverlayVideoPlayer runKey="video-run" detail={overlayDetail()} />);
+
+  const video = screen.getByLabelText("Raw 与 Stable 双目骨架抖动对比视频") as HTMLVideoElement;
+  const slider = await screen.findByRole("slider", { name: "帧时间轴" });
+  fireEvent.loadedMetadata(video);
+  expect(slider).toBeEnabled();
+
+  fireEvent.change(slider, { target: { value: "7" } });
+  const expectedFrameSevenTime = (timeline.frames[7].video_pts
+    + timeline.frames[7].duration_pts / 2)
+    * timeline.time_base.numerator / timeline.time_base.denominator;
+  expect(pause).toHaveBeenCalledTimes(1);
+  expect(video.currentTime).toBeCloseTo(expectedFrameSevenTime, 8);
+  expect(slider).toHaveValue("7");
+  expect(screen.getByText(/8 \/ 120/)).toBeVisible();
+  expect(screen.getByText(/源帧 000047/)).toBeVisible();
+
+  fireEvent.click(screen.getByRole("button", { name: "下一帧" }));
+  expect(slider).toHaveValue("8");
+  fireEvent.click(screen.getByRole("button", { name: "上一帧" }));
+  expect(slider).toHaveValue("7");
+});
+
+test("the frame timeline follows normal video playback", async () => {
+  const timeline = timelineDocument();
+  vi.spyOn(traceApi, "getArtifactJson").mockResolvedValue(timeline);
+  render(<OverlayVideoPlayer runKey="video-run" detail={overlayDetail()} />);
+
+  const video = screen.getByLabelText("Raw 与 Stable 双目骨架抖动对比视频") as HTMLVideoElement;
+  const slider = await screen.findByRole("slider", { name: "帧时间轴" });
+  fireEvent.loadedMetadata(video);
+  video.currentTime = timeline.frames[60].video_pts
+    * timeline.time_base.numerator / timeline.time_base.denominator;
+  fireEvent.timeUpdate(video);
+
+  await waitFor(() => expect(slider).toHaveValue("60"));
+  expect(screen.getByText(/61 \/ 120/)).toBeVisible();
+});
+
+test("a late timeline load adopts the paused native video position", async () => {
+  const timeline = timelineDocument();
+  let resolveTimeline: (value: OverlayVideoTimeline) => void = () => {};
+  const delayedTimeline = new Promise<OverlayVideoTimeline>((resolve) => {
+    resolveTimeline = resolve;
+  });
+  vi.spyOn(traceApi, "getArtifactJson").mockReturnValue(delayedTimeline);
+  render(<OverlayVideoPlayer runKey="video-run" detail={overlayDetail()} />);
+
+  const video = screen.getByLabelText("Raw 与 Stable 双目骨架抖动对比视频") as HTMLVideoElement;
+  video.currentTime = timeline.frames[60].video_pts
+    * timeline.time_base.numerator / timeline.time_base.denominator;
+  fireEvent.loadedMetadata(video);
+  resolveTimeline(timeline);
+
+  const slider = await screen.findByRole("slider", { name: "帧时间轴" });
+  await waitFor(() => expect(slider).toHaveValue("60"));
+});
+
+test("a legacy CFR video gets frame stepping from duration when no timeline artifact exists", async () => {
+  const pause = vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+  render(<OverlayVideoPlayer runKey="video-run" detail={overlayDetail(false)} />);
+
+  const video = screen.getByLabelText("Raw 与 Stable 双目骨架抖动对比视频") as HTMLVideoElement;
+  Object.defineProperty(video, "duration", { configurable: true, value: 4 });
+  fireEvent.loadedMetadata(video);
+  const slider = await screen.findByRole("slider", { name: "帧时间轴" });
+  expect(screen.getByText(/CFR 估算/)).toBeVisible();
+
+  fireEvent.change(slider, { target: { value: "30" } });
+  expect(pause).toHaveBeenCalledTimes(1);
+  expect(video.currentTime).toBeCloseTo((30.5 * 4) / 120, 8);
+  expect(slider).toHaveValue("30");
+});
+
+test("a malformed timeline never breaks native video playback", async () => {
+  vi.spyOn(traceApi, "getArtifactJson").mockResolvedValue({ schema_version: "wrong" });
+  render(<OverlayVideoPlayer runKey="video-run" detail={overlayDetail()} />);
+
+  expect(await screen.findByText("帧时间轴不可用，仍可使用视频进度条")).toBeVisible();
+  expect(screen.getByLabelText("Raw 与 Stable 双目骨架抖动对比视频")).toHaveAttribute("controls");
+  expect(screen.queryByRole("slider", { name: "帧时间轴" })).not.toBeInTheDocument();
 });
 
 test("an old run without video remains inspectable and explains the fallback", () => {
@@ -123,4 +238,42 @@ test("video provenance does not claim MANO when a legacy artifact has no input m
 
   expect(screen.getByText("输入来源未记录")).toBeVisible();
   expect(screen.queryByText("MANO → Temporal")).not.toBeInTheDocument();
+});
+
+
+test("latest successful produced EXPORT owns the video and optional timeline as one record", () => {
+  const getArtifact = vi.spyOn(traceApi, "getArtifactJson");
+  const qualified = (recordId: string, video: string, timeline?: string) => ({
+    record_id: recordId,
+    stage: "EXPORT",
+    status: "SUCCEEDED",
+    payload: { output_status: "PRODUCED", frame_count: 12 },
+    blobs: [
+      {
+        role: "overlay_video_raw_vs_stable_stereo_rectified",
+        relative_path: video,
+        media_type: "video/mp4",
+      },
+      ...(timeline ? [{
+        role: "overlay_video_timeline",
+        relative_path: timeline,
+        media_type: "application/json",
+      }] : []),
+    ],
+  });
+  const detail = detailWith([
+    qualified("old-pair", "old.mp4", "old-timeline.json"),
+    qualified("latest-video", "latest.mp4"),
+    {
+      ...qualified("newer-failed", "failed.mp4", "failed-timeline.json"),
+      status: "FAILED",
+    },
+  ]);
+
+  render(<OverlayVideoPlayer runKey="paired-run" detail={detail} />);
+
+  expect(screen.getByLabelText("Raw 与 Stable 双目骨架抖动对比视频"))
+    .toHaveAttribute("src", expect.stringContaining("/latest.mp4"));
+  expect(screen.queryByRole("link", { name: "下载帧时间映射" })).not.toBeInTheDocument();
+  expect(getArtifact).not.toHaveBeenCalled();
 });

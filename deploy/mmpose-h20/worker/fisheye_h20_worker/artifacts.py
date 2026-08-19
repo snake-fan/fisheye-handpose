@@ -10,12 +10,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ._generated_project_contract import (
+    FHP21_OUTPUT_SCHEMA,
+    H20_WORKER_EVENT_SCHEMA,
+    H20_WORKER_MANIFEST_SCHEMA,
+    H20_WORKER_SUMMARY_SCHEMA,
+    RUN_STATUS_VALUES,
+    TRACE_STAGE_VALUES,
+    TRACE_STATUS_VALUES,
+)
 from .contracts import WorkerError
 
-EVENT_SCHEMA = "fisheye-handpose/h20-worker-event/v1"
-MANIFEST_SCHEMA = "fisheye-handpose/h20-worker-manifest/v1"
-SUMMARY_SCHEMA = "fisheye-handpose/h20-worker-summary/v1"
-FHP21_OUTPUT_SCHEMA = "fisheye-handpose/fhp21-output/v1"
+EVENT_SCHEMA = H20_WORKER_EVENT_SCHEMA
+MANIFEST_SCHEMA = H20_WORKER_MANIFEST_SCHEMA
+SUMMARY_SCHEMA = H20_WORKER_SUMMARY_SCHEMA
+_TRACE_STAGES = frozenset(TRACE_STAGE_VALUES)
+_TRACE_STATUSES = frozenset(TRACE_STATUS_VALUES)
+_FINAL_RUN_STATUSES = frozenset(RUN_STATUS_VALUES[1:])
 
 
 def _now() -> str:
@@ -75,7 +86,7 @@ class ResultWriter:
             self.root / "manifest.json",
             {
                 "schema_version": MANIFEST_SCHEMA,
-                "status": "ACTIVE",
+                "status": RUN_STATUS_VALUES[0],
                 "created_at_utc": _now(),
                 **manifest,
             },
@@ -182,6 +193,10 @@ class ResultWriter:
             raise WorkerError("cannot append to finalized result")
         if not isinstance(event_id, str) or not event_id or event_id in self._event_ids:
             raise WorkerError(f"event_id must be new and non-empty: {event_id!r}")
+        if not isinstance(stage, str) or stage not in _TRACE_STAGES:
+            raise WorkerError(f"stage must be canonical: {stage!r}")
+        if not isinstance(status, str) or status not in _TRACE_STATUSES:
+            raise WorkerError(f"status must be canonical: {status!r}")
         if not isinstance(event, str) or not event:
             raise WorkerError("event must be non-empty")
         if len(set(parent_event_ids)) != len(parent_event_ids):
@@ -228,6 +243,8 @@ class ResultWriter:
     def finalize(self, *, status: str, summary: dict[str, Any]) -> dict[str, Any]:
         if self._finalized:
             raise WorkerError("result is already finalized")
+        if not isinstance(status, str) or status not in _FINAL_RUN_STATUSES:
+            raise WorkerError(f"final status must be canonical and terminal: {status!r}")
         value = {
             "schema_version": SUMMARY_SCHEMA,
             "status": status,

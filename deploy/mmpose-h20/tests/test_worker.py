@@ -640,6 +640,46 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(visualization.track_color_rgb("track-0000"), (117, 246, 196))
         self.assertEqual(visualization.track_color_rgb("track-0001"), (255, 180, 84))
 
+    def test_overlay_scaled_one_pixel_skeleton_remains_visible(self) -> None:
+        import numpy as np
+
+        renderer = object.__new__(visualization.RawVsStableOverlayVideo)
+        renderer._source_size = (640, 480)
+        renderer._panel_size = (320, 240)
+        renderer._track_colors = {}
+        points: list[list[float] | None] = [None] * 21
+        points[0] = [100.0, 200.0]
+        points[1] = [100.0, 360.0]
+        points[2] = [260.0, 360.0]
+        points[4] = [400.0, 240.0]
+        projection = {"left": points, "right": points}
+
+        panel = renderer._panel(
+            np.zeros((480, 640, 3), dtype=np.uint8),
+            tracks=[{"track_id": "track-0000", "raw": projection}],
+            stage_key="raw",
+            stage_label="RAW_FUSION",
+            side="left",
+            frame_id="part0001/pair000000",
+            timestamp_ns=1_000_000_000,
+        )
+
+        occupied = np.any(panel != 0, axis=2)
+        self.assertTrue(occupied[140, 50], "scaled vertical edge disappeared")
+        self.assertTrue(occupied[180, 90], "scaled horizontal edge disappeared")
+        for x, y in ((50, 100), (50, 180), (130, 180)):
+            self.assertTrue(occupied[y, x], f"scaled joint disappeared at {(x, y)}")
+        self.assertGreaterEqual(
+            int(np.count_nonzero(occupied[119:122, 199:202])),
+            3,
+            "scaled isolated joint disappeared",
+        )
+        self.assertGreater(
+            int(np.count_nonzero(occupied[90:191, 40:141])),
+            100,
+            "scaled one-pixel skeleton has insufficient visible pixel coverage",
+        )
+
     def test_overlay_renderer_uses_seekable_h264_contract_and_exact_cfr_timeline(self) -> None:
         import numpy as np
 

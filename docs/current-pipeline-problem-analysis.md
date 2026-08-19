@@ -1,5 +1,12 @@
 # 当前双目鱼眼手部骨骼抽取 Pipeline 问题分析报告
 
+> **历史基线报告（已被后续 v2 工作取代）**
+>
+> 本文只描述提交 `5eacb7a` 和 run `h20-stage-video-5eacb7a` 的当时状态，保留用于问题
+> 证据和决策追溯。它不是当前 worker 能力清单；virtual-perspective crop、候选恢复、鲁棒融合、
+> tracking 和 MANO 改进的当前结果见
+> [`pipeline-v2-iteration-plan.md`](pipeline-v2-iteration-plan.md)。
+
 ## 1. 报告范围
 
 本报告分析当前 `fisheye-handpose` 在真实 H20 环境中的端到端运行结果，目标是回答：

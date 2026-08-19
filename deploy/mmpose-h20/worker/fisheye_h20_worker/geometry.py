@@ -7,6 +7,7 @@ import statistics
 from itertools import combinations
 from typing import Any
 
+from ._generated_project_contract import FHP21_SCHEMA_ID
 from .calibration import RectifiedStereo
 from .contracts import ThresholdRequest, WorkerError
 from .fusion import (
@@ -268,7 +269,7 @@ def triangulate_match(
         "fusion_method": FUSION_METHOD_ID,
         "coordinate_frame": "rectified_left_camera",
         "length_unit": "m",
-        "landmark_schema": "fhp21/v1",
+        "landmark_schema": FHP21_SCHEMA_ID,
         "landmarks_xyz_m": landmarks,
         "validity": validity,
         "covariance_m2": covariance_m2,

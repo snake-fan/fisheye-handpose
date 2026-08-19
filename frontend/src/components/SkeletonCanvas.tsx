@@ -2,6 +2,7 @@ import { RotateCcw } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { TraceRecord } from "../api/types";
+import { createFrameEvidence, type FrameEvidence } from "../domain/frameEvidence";
 import {
   best3dRecord,
   FHP21_EDGES,
@@ -12,6 +13,7 @@ import {
 } from "../domain/trace";
 
 interface SkeletonCanvasProps {
+  evidence?: FrameEvidence;
   records: TraceRecord[];
   trackId: string;
 }
@@ -22,11 +24,18 @@ interface ProjectedPoint {
   z: number;
 }
 
-export function SkeletonCanvas({ records, trackId }: SkeletonCanvasProps) {
+export function SkeletonCanvas({ evidence, records, trackId }: SkeletonCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dragRef = useRef<{ x: number; y: number } | null>(null);
   const [rotation, setRotation] = useState({ yaw: -0.68, pitch: 0.42 });
-  const record = useMemo(() => best3dRecord(records, trackId), [records, trackId]);
+  const evidenceRecords = useMemo(
+    () => (evidence ?? createFrameEvidence(records)).records,
+    [evidence, records],
+  );
+  const record = useMemo(
+    () => best3dRecord(evidenceRecords, trackId),
+    [evidenceRecords, trackId],
+  );
   const payload = record ? payloadOf(record) : {};
   const landmarks = useMemo(() => points3(payload.landmarks_xyz_m), [payload.landmarks_xyz_m]);
   const validity = useMemo(
@@ -129,7 +138,7 @@ export function SkeletonCanvas({ records, trackId }: SkeletonCanvasProps) {
       context.moveTo(start.x, start.y);
       context.lineTo(end.x, end.y);
       context.lineCap = "round";
-      context.lineWidth = 3.2;
+      context.lineWidth = 1.8;
       context.strokeStyle = FINGER_COLORS[Math.floor(edgeIndex / 4)];
       context.globalAlpha = 0.88;
       context.stroke();
@@ -141,12 +150,12 @@ export function SkeletonCanvas({ records, trackId }: SkeletonCanvasProps) {
       .forEach(({ point, index }) => {
         if (!point) return;
         context.beginPath();
-        context.arc(point.x, point.y, index === 0 ? 5.6 : 4.2, 0, Math.PI * 2);
+        context.arc(point.x, point.y, index === 0 ? 3.6 : 2.6, 0, Math.PI * 2);
         context.fillStyle = index === 0 ? "#ffffff" : FINGER_COLORS[Math.max(0, Math.ceil(index / 4) - 1)];
         context.globalAlpha = 1;
         context.fill();
         context.strokeStyle = "rgba(5, 10, 12, 0.9)";
-        context.lineWidth = 1.5;
+        context.lineWidth = 0.8;
         context.stroke();
       });
     context.globalAlpha = 1;
@@ -155,7 +164,14 @@ export function SkeletonCanvas({ records, trackId }: SkeletonCanvasProps) {
   useEffect(() => {
     draw();
     window.addEventListener("resize", draw);
-    return () => window.removeEventListener("resize", draw);
+    const observer = typeof ResizeObserver === "undefined"
+      ? undefined
+      : new ResizeObserver(() => draw());
+    if (canvasRef.current) observer?.observe(canvasRef.current);
+    return () => {
+      window.removeEventListener("resize", draw);
+      observer?.disconnect();
+    };
   }, [draw]);
 
   return (

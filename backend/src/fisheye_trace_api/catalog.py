@@ -14,7 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from fisheye_handpose.trace import RunArtifactReader, TraceStage, TraceValidationError
+from fisheye_handpose.trace import (
+    RUN_MANIFEST_SCHEMA,
+    RunArtifactReader,
+    TraceStage,
+    TraceValidationError,
+)
 
 _MANIFEST_NAMES = ("run_manifest.json", "trace_manifest.json", "manifest.json")
 _TRACE_NAMES = ("trace.jsonl", "records.jsonl")
@@ -473,7 +478,7 @@ class TraceCatalog:
         manifest = index.manifest
         summary = index.summary
         records = index.records
-        if manifest.get("schema_version") == "fisheye-handpose/run-manifest/v1":
+        if manifest.get("schema_version") == RUN_MANIFEST_SCHEMA:
             report = self._validate_run(run, index, verify_blobs=False)
             if not report["ok"]:
                 raise TraceValidationError("; ".join(report["errors"]))
@@ -630,7 +635,7 @@ class TraceCatalog:
         *,
         verify_blobs: bool,
     ) -> dict[str, Any]:
-        if index.manifest.get("schema_version") != "fisheye-handpose/run-manifest/v1":
+        if index.manifest.get("schema_version") != RUN_MANIFEST_SCHEMA:
             return _legacy_validation()
         if not index.finalized:
             return _validate_canonical(run, verify_blobs=verify_blobs)
@@ -911,7 +916,7 @@ def _run_provenance(
     manifest: dict[str, Any],
     records: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    if manifest.get("schema_version") != "fisheye-handpose/run-manifest/v1":
+    if manifest.get("schema_version") != RUN_MANIFEST_SCHEMA:
         return {}
     provenance: dict[str, Any] = {}
     if "config" in manifest and "metadata" in manifest:
@@ -958,7 +963,7 @@ def _validate_run(
     run: Path,
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
-    if manifest.get("schema_version") != "fisheye-handpose/run-manifest/v1":
+    if manifest.get("schema_version") != RUN_MANIFEST_SCHEMA:
         return _legacy_validation()
     return _validate_canonical(run, verify_blobs=True)
 

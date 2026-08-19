@@ -1,21 +1,7 @@
 import type { ArtifactRef, TraceRecord } from "../api/types";
+import { artifactPathFor, artifactRefsFor, payloadFor } from "./frameEvidence";
 
-export const FHP21_EDGES: ReadonlyArray<readonly [number, number]> = [
-  [0, 1], [1, 2], [2, 3], [3, 4],
-  [0, 5], [5, 6], [6, 7], [7, 8],
-  [0, 9], [9, 10], [10, 11], [11, 12],
-  [0, 13], [13, 14], [14, 15], [15, 16],
-  [0, 17], [17, 18], [18, 19], [19, 20],
-];
-
-export const FHP21_NAMES: readonly string[] = [
-  "wrist_center",
-  "thumb_cmc", "thumb_mcp", "thumb_ip", "thumb_tip",
-  "index_mcp", "index_pip", "index_dip", "index_tip",
-  "middle_mcp", "middle_pip", "middle_dip", "middle_tip",
-  "ring_mcp", "ring_pip", "ring_dip", "ring_tip",
-  "little_mcp", "little_pip", "little_dip", "little_tip",
-];
+export { FHP21_EDGES, FHP21_NAMES } from "./projectContract.generated";
 
 export const FINGER_COLORS = ["#75f6c4", "#63d7e5", "#7ba6ff", "#f2c66d", "#ef86b8"];
 
@@ -23,7 +9,7 @@ export type Point2 = [number, number];
 export type Point3 = [number, number, number];
 
 export function payloadOf(record: TraceRecord): Record<string, unknown> {
-  return record.payload && typeof record.payload === "object" ? record.payload : {};
+  return payloadFor(record);
 }
 
 function objectInstances(payload: Record<string, unknown>): Record<string, unknown>[] {
@@ -82,9 +68,7 @@ export function validityValues(value: unknown, count: number): boolean[] {
 }
 
 export function artifactsOf(record: TraceRecord): ArtifactRef[] {
-  return [...(record.blobs ?? []), ...(record.artifacts ?? [])].filter((artifact) => {
-    return typeof artifact.relative_path === "string" || typeof artifact.path === "string";
-  });
+  return artifactRefsFor(record);
 }
 
 function artifactView(artifact: ArtifactRef): string {
@@ -111,7 +95,7 @@ export function viewArtifacts(records: TraceRecord[], viewId: string): ArtifactR
     for (const artifact of artifactsOf(record)) {
       const inferredView = artifactView(artifact);
       if (recordView !== viewId && inferredView !== viewId) continue;
-      const path = String(artifact.relative_path ?? artifact.path ?? "");
+      const path = artifactPathFor(artifact);
       const key = `${path}:${String(artifact.role ?? "artifact")}`;
       if (seen.has(key)) continue;
       seen.add(key);

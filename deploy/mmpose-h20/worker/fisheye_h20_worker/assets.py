@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ._generated_project_contract import MODEL_ASSETS_SCHEMA
 from .contracts import ModelRequest, WorkerError
 
 MMPOSE_COMMIT = "5408bc76f5b848cf925a0d1857899011d8c5b497"
@@ -36,9 +37,7 @@ def verify_assets(config: ModelRequest) -> dict[str, Any]:
         document = json.loads(config.manifest.read_text(encoding="utf-8"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise WorkerError(f"cannot parse model manifest: {exc}") from exc
-    if not isinstance(document, dict) or document.get("schema_version") != (
-        "fisheye-handpose/model-assets/v1"
-    ):
+    if not isinstance(document, dict) or document.get("schema_version") != MODEL_ASSETS_SCHEMA:
         raise WorkerError("unexpected model asset manifest schema")
     entries = document.get("artifacts")
     if not isinstance(entries, list):

@@ -6,6 +6,7 @@ import { FrameInspector } from "./components/FrameInspector";
 import { FrameTimeline } from "./components/FrameTimeline";
 import { OverlayVideoPlayer } from "./components/OverlayVideoPlayer";
 import { ImagePreviewProvider } from "./components/PreviewableImage";
+import { ResizableSidebarLayout } from "./components/ResizableSidebarLayout";
 import { RunCatalog } from "./components/RunCatalog";
 import { RunHeader } from "./components/RunHeader";
 import { TraceFilters } from "./components/TraceFilters";
@@ -216,39 +217,43 @@ function AppContent() {
   }, [retryNonce, urlState.frame, urlState.run]);
 
   return (
-    <div className="app-shell">
-      <RunCatalog
-        runs={runs}
-        total={runTotal}
-        offset={loadedRunOffset}
-        limit={runLimit}
-        selectedRunKey={urlState.run}
-        query={urlState.q}
-        loading={loading}
-        error={error}
-        connectionStatus={connectionStatus}
-        onSelect={(run) => setUrlState({
-          run,
-          frame: "",
-          offset: "",
-          stage: "",
-          track: "",
-          status: "",
-        })}
-        onSearch={(q) => setUrlState({
-          q,
-          run_offset: "",
-          run: "",
-          frame: "",
-          offset: "",
-          stage: "",
-          track: "",
-          status: "",
-        })}
-        onPage={(offset) => setUrlState({
-          run_offset: offset > 0 ? String(offset) : "",
-        })}
-      />
+    <ResizableSidebarLayout
+      sidebarId="run-catalog-pane"
+      sidebar={(
+        <RunCatalog
+          runs={runs}
+          total={runTotal}
+          offset={loadedRunOffset}
+          limit={runLimit}
+          selectedRunKey={urlState.run}
+          query={urlState.q}
+          loading={loading}
+          error={error}
+          connectionStatus={connectionStatus}
+          onSelect={(run) => setUrlState({
+            run,
+            frame: "",
+            offset: "",
+            stage: "",
+            track: "",
+            status: "",
+          })}
+          onSearch={(q) => setUrlState({
+            q,
+            run_offset: "",
+            run: "",
+            frame: "",
+            offset: "",
+            stage: "",
+            track: "",
+            status: "",
+          })}
+          onPage={(offset) => setUrlState({
+            run_offset: offset > 0 ? String(offset) : "",
+          })}
+        />
+      )}
+    >
       <main className="studio-main">
         {!urlState.run && (
           <div className="empty-studio">
@@ -303,7 +308,7 @@ function AppContent() {
           <button type="button" className="retry-button" onClick={retryConnection}>重试连接</button>
         </div>
       )}
-    </div>
+    </ResizableSidebarLayout>
   );
 }
 

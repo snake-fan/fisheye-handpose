@@ -3,11 +3,19 @@ import { ImageIcon } from "lucide-react";
 
 import { traceApi } from "../api/client";
 import type { ArtifactRef, TraceRecord } from "../api/types";
+import {
+  artifactPathFor,
+  createFrameEvidence,
+  failureReasonFor,
+  type FrameEvidence,
+  outputAvailableFor,
+} from "../domain/frameEvidence";
 import { artifactsOf, FHP21_EDGES, FHP21_NAMES, payloadOf } from "../domain/trace";
 import type { PipelineNodeId } from "./PipelineNodeRail";
 import { PreviewableImage } from "./PreviewableImage";
 
 interface StageComparisonProps {
+  evidence?: FrameEvidence;
   runKey: string;
   records: TraceRecord[];
   selectedNodeId: PipelineNodeId;
@@ -67,10 +75,6 @@ function hasVisiblePoint(layer: PoseLayer): boolean {
   return layer.points.some((point) => point !== null);
 }
 
-function artifactPath(artifact: ArtifactRef): string {
-  return String(artifact.relative_path ?? artifact.path ?? "");
-}
-
 function artifactByRole(records: TraceRecord[], role: string): ArtifactRef | undefined {
   return records.flatMap(artifactsOf).find((artifact) => artifact.role === role);
 }
@@ -80,24 +84,11 @@ function sideLabel(side: Side): string {
 }
 
 function outputProduced(record: TraceRecord): boolean {
-  const status = payloadOf(record).output_status;
-  if (status === "NOT_PRODUCED") return false;
-  if (status === "PRODUCED") return true;
-  return record.status !== "SKIPPED" && record.status !== "FAILED";
+  return outputAvailableFor(record);
 }
 
 function failureReason(record: TraceRecord): string {
-  const payload = payloadOf(record);
-  if (typeof payload.reason === "string" && payload.reason) return payload.reason;
-  if (typeof payload.hand_reason === "string" && payload.hand_reason) return payload.hand_reason;
-  if (payload.selection && typeof payload.selection === "object") {
-    const selection = payload.selection as Record<string, unknown>;
-    const gate = recordObject(selection.gate);
-    if (typeof gate?.reason === "string" && gate.reason) return gate.reason;
-    const decision = selection.decision;
-    if (typeof decision === "string" && decision) return decision;
-  }
-  return record.status === "FAILED" ? "STAGE_FAILED" : "OUTPUT_NOT_PRODUCED";
+  return failureReasonFor(record) || "OUTPUT_NOT_PRODUCED";
 }
 
 function trackColor(identity: string): string {
@@ -129,7 +120,7 @@ function EvidenceImage({
   }
   return (
     <PreviewableImage
-      src={traceApi.artifactUrl(runKey, artifactPath(artifact))}
+      src={traceApi.artifactUrl(runKey, artifactPathFor(artifact))}
       alt={label}
       previewOverlay={previewOverlay}
     />
@@ -428,7 +419,7 @@ function SkeletonGraphic({
                 data-joint-index={index}
                 cx={point[0]}
                 cy={point[1]}
-                r="3.5"
+                r="2.3"
               />
             ))}
           </g>
@@ -1456,46 +1447,48 @@ function ExportComparison({ runKey, records, selectedTrack }: Omit<StageComparis
 }
 
 export function StageComparison({
+  evidence,
   runKey,
   records,
   selectedNodeId,
   selectedTrack,
 }: StageComparisonProps) {
+  const evidenceRecords = (evidence ?? createFrameEvidence(records)).records;
   let content;
   switch (selectedNodeId) {
     case "SOURCE_RGB":
-      content = <SourceComparison runKey={runKey} records={records} />;
+      content = <SourceComparison runKey={runKey} records={evidenceRecords} />;
       break;
     case "FISHEYE_UNDISTORTION":
       content = (
-        <StereoImageComparison runKey={runKey} records={records} beforePrefix="source" afterPrefix="undistorted" />
+        <StereoImageComparison runKey={runKey} records={evidenceRecords} beforePrefix="source" afterPrefix="undistorted" />
       );
       break;
     case "STEREO_RECTIFICATION":
       content = (
-        <StereoImageComparison runKey={runKey} records={records} beforePrefix="undistorted" afterPrefix="rectified" />
+        <StereoImageComparison runKey={runKey} records={evidenceRecords} beforePrefix="undistorted" afterPrefix="rectified" />
       );
       break;
     case "HAND_DETECTION":
-      content = <DetectionComparison runKey={runKey} records={records} />;
+      content = <DetectionComparison runKey={runKey} records={evidenceRecords} />;
       break;
     case "HAND_POSE_2D":
-      content = <PoseComparison runKey={runKey} records={records} selectedTrack={selectedTrack} />;
+      content = <PoseComparison runKey={runKey} records={evidenceRecords} selectedTrack={selectedTrack} />;
       break;
     case "CROSS_VIEW_ASSOCIATION":
-      content = <AssociationComparison runKey={runKey} records={records} selectedTrack={selectedTrack} />;
+      content = <AssociationComparison runKey={runKey} records={evidenceRecords} selectedTrack={selectedTrack} />;
       break;
     case "STEREO_TRIANGULATION_RAW_3D":
-      content = <RawComparison runKey={runKey} records={records} selectedTrack={selectedTrack} />;
+      content = <RawComparison runKey={runKey} records={evidenceRecords} selectedTrack={selectedTrack} />;
       break;
     case "MANO_FRAMEWISE":
-      content = <ManoComparison runKey={runKey} records={records} selectedTrack={selectedTrack} />;
+      content = <ManoComparison runKey={runKey} records={evidenceRecords} selectedTrack={selectedTrack} />;
       break;
     case "TEMPORAL_REFINEMENT":
-      content = <TemporalComparison runKey={runKey} records={records} selectedTrack={selectedTrack} />;
+      content = <TemporalComparison runKey={runKey} records={evidenceRecords} selectedTrack={selectedTrack} />;
       break;
     case "STABLE_FHP21_EXPORT":
-      content = <ExportComparison runKey={runKey} records={records} selectedTrack={selectedTrack} />;
+      content = <ExportComparison runKey={runKey} records={evidenceRecords} selectedTrack={selectedTrack} />;
       break;
   }
   return <section className="stage-comparison" aria-label="阶段前后对比">{content}</section>;

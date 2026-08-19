@@ -17,6 +17,7 @@ models/
 checkpoints/
 outputs/
 runs/
+results/
 data/
 *.mp4
 *.mov

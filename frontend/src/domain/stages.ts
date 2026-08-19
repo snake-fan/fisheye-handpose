@@ -1,24 +1,9 @@
 import type { TraceRecord } from "../api/types";
 
-const TRACE_STAGE_ORDER = [
-  "SYSTEM",
-  "DISCOVERY",
-  "CALIBRATION",
-  "DECODE",
-  "SYNCHRONIZATION",
-  "RECTIFICATION",
-  "DETECTION",
-  "POSE_2D",
-  "CROSS_VIEW_ASSOCIATION",
-  "RAW_FUSION",
-  "KINEMATIC_REFINEMENT",
-  "TEMPORAL_REFINEMENT",
-  "QA",
-  "EXPORT",
-] as const;
+import { TRACE_STAGES } from "./projectContract.generated";
 
 const TRACE_STAGE_RANK = new Map<string, number>(
-  TRACE_STAGE_ORDER.map((stage, index) => [stage, index]),
+  TRACE_STAGES.map((stage, index) => [stage, index]),
 );
 
 interface StageVocabularySource {
@@ -41,7 +26,7 @@ export function frameFilterStages(detail: StageVocabularySource): string[] {
   });
 
   return [...new Set(stages)].sort((left, right) => {
-    const fallback = TRACE_STAGE_ORDER.length;
+    const fallback = TRACE_STAGES.length;
     return (TRACE_STAGE_RANK.get(left) ?? fallback) - (TRACE_STAGE_RANK.get(right) ?? fallback)
       || left.localeCompare(right);
   });

@@ -203,7 +203,13 @@ def test_h20_executor_builds_runtime_request_and_imports_verified_worker_bundle(
         / "fisheye_h20_worker"
     )
     (package / "__init__.py").write_text("", encoding="utf-8")
-    for name in ("artifacts.py", "bridge.py", "contracts.py", "output_contract.py"):
+    for name in (
+        "_generated_project_contract.py",
+        "artifacts.py",
+        "bridge.py",
+        "contracts.py",
+        "output_contract.py",
+    ):
         (package / name).write_bytes((source_package / name).read_bytes())
 
     config = H20ExecutorConfig.from_dict(
@@ -391,7 +397,13 @@ def test_invalid_worker_package_is_retained_as_a_failed_trace_record(tmp_path: P
         / "fisheye_h20_worker"
     )
     (package / "__init__.py").write_text("", encoding="utf-8")
-    for name in ("artifacts.py", "bridge.py", "contracts.py", "output_contract.py"):
+    for name in (
+        "_generated_project_contract.py",
+        "artifacts.py",
+        "bridge.py",
+        "contracts.py",
+        "output_contract.py",
+    ):
         (package / name).write_bytes((source_package / name).read_bytes())
     config = H20ExecutorConfig.from_dict(
         {

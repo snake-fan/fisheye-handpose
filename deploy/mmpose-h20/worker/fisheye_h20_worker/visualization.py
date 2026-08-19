@@ -10,33 +10,15 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from ._generated_project_contract import (
+    FHP21_EDGES,
+    OVERLAY_VIDEO_SCHEMA,
+    OVERLAY_VIDEO_TIMELINE_SCHEMA,
+)
 from .contracts import WorkerError
 
-TIMELINE_SCHEMA = "fisheye-handpose/overlay-video-timeline/v1"
-VIDEO_SCHEMA = "fisheye-handpose/overlay-video/v1"
-
-_FHP21_EDGES = (
-    (0, 1),
-    (1, 2),
-    (2, 3),
-    (3, 4),
-    (0, 5),
-    (5, 6),
-    (6, 7),
-    (7, 8),
-    (0, 9),
-    (9, 10),
-    (10, 11),
-    (11, 12),
-    (0, 13),
-    (13, 14),
-    (14, 15),
-    (15, 16),
-    (0, 17),
-    (17, 18),
-    (18, 19),
-    (19, 20),
-)
+TIMELINE_SCHEMA = OVERLAY_VIDEO_TIMELINE_SCHEMA
+VIDEO_SCHEMA = OVERLAY_VIDEO_SCHEMA
 
 # RGB metadata values. OpenCV receives the reversed BGR tuple while rendering.
 _TRACK_PALETTE = (
@@ -274,7 +256,7 @@ class RawVsStableOverlayVideo:
             visible_tracks += 1
             rgb = self._color(track_id)
             bgr = (rgb[2], rgb[1], rgb[0])
-            for start_index, end_index in _FHP21_EDGES:
+            for start_index, end_index in FHP21_EDGES:
                 start = points[start_index]
                 end = points[end_index]
                 if start is None or end is None:
@@ -284,7 +266,7 @@ class RawVsStableOverlayVideo:
                     (round(start[0] * scale_x), round(start[1] * scale_y)),
                     (round(end[0] * scale_x), round(end[1] * scale_y)),
                     bgr,
-                    2,
+                    1,
                     cv2.LINE_AA,
                 )
             for point in points:
@@ -293,7 +275,7 @@ class RawVsStableOverlayVideo:
                 cv2.circle(
                     panel,
                     (round(point[0] * scale_x), round(point[1] * scale_y)),
-                    3,
+                    1,
                     bgr,
                     -1,
                     cv2.LINE_AA,

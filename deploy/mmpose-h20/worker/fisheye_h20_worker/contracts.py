@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-REQUEST_SCHEMA = "fisheye-handpose/h20-worker-request/v1"
+from ._generated_project_contract import H20_WORKER_REQUEST_SCHEMA
+
+REQUEST_SCHEMA = H20_WORKER_REQUEST_SCHEMA
 
 
 class WorkerError(RuntimeError):

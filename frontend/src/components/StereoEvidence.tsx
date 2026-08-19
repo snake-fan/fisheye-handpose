@@ -4,6 +4,12 @@ import { useEffect, useMemo, useState } from "react";
 import { traceApi } from "../api/client";
 import type { ArtifactRef, TraceRecord } from "../api/types";
 import {
+  artifactPathFor,
+  createFrameEvidence,
+  type FrameEvidence,
+  outputAvailableFor,
+} from "../domain/frameEvidence";
+import {
   artifactsOf,
   FHP21_EDGES,
   FINGER_COLORS,
@@ -14,6 +20,7 @@ import {
 import { PreviewableImage } from "./PreviewableImage";
 
 interface StereoEvidenceProps {
+  evidence?: FrameEvidence;
   runKey: string;
   records: TraceRecord[];
   trackId: string;
@@ -71,13 +78,9 @@ function keypointScoreThreshold(payload: Record<string, unknown>): number {
     : DEFAULT_KEYPOINT_SCORE_THRESHOLD;
 }
 
-function artifactPath(artifact: ArtifactRef): string {
-  return String(artifact.relative_path ?? artifact.path ?? "");
-}
-
 function isAllowedBackground(artifact: ArtifactRef): boolean {
   const mediaType = String(artifact.media_type ?? "").toLowerCase();
-  const path = artifactPath(artifact);
+  const path = artifactPathFor(artifact);
   return !mediaType.startsWith("video/")
     && mediaType !== "application/json"
     && !/\.(mp4|webm|mov|json)$/i.test(path);
@@ -190,10 +193,7 @@ function posePoints2(value: unknown): NullablePoint2[] {
 }
 
 function outputProduced(record: TraceRecord): boolean {
-  const outputStatus = payloadOf(record).output_status;
-  if (outputStatus === "NOT_PRODUCED") return false;
-  if (outputStatus === "PRODUCED") return true;
-  return record.status !== "FAILED" && record.status !== "SKIPPED";
+  return outputAvailableFor(record);
 }
 
 function objectInstances(payload: Record<string, unknown>): Record<string, unknown>[] {
@@ -509,7 +509,7 @@ function PoseOverlayGraphic({
                 data-joint-index={index}
                 cx={x}
                 cy={y}
-                r="3.8"
+                r="2.4"
                 className={isVisible ? "" : "hidden-keypoint"}
                 vectorEffect="non-scaling-stroke"
               />
@@ -575,7 +575,7 @@ function ViewPanel({ side, runKey, records, trackId, overlay }: ViewPanelProps) 
       <div className="image-stage">
         {selectedArtifact ? (
           <PreviewableImage
-            src={traceApi.artifactUrl(runKey, artifactPath(selectedArtifact))}
+            src={traceApi.artifactUrl(runKey, artifactPathFor(selectedArtifact))}
             alt={`${sideLabel} ${selected.artifactRole}`}
             previewOverlay={renderPoseOverlay()}
           />
@@ -613,8 +613,12 @@ function ViewPanel({ side, runKey, records, trackId, overlay }: ViewPanelProps) 
   );
 }
 
-export function StereoEvidence({ runKey, records, trackId }: StereoEvidenceProps) {
+export function StereoEvidence({ evidence, runKey, records, trackId }: StereoEvidenceProps) {
   const [overlay, setOverlay] = useState(true);
+  const evidenceRecords = useMemo(
+    () => (evidence ?? createFrameEvidence(records)).records,
+    [evidence, records],
+  );
   return (
     <section className="evidence-card stereo-card">
       <header className="card-header">
@@ -632,8 +636,8 @@ export function StereoEvidence({ runKey, records, trackId }: StereoEvidenceProps
         </button>
       </header>
       <div className="stereo-grid">
-        <ViewPanel side="left" runKey={runKey} records={records} trackId={trackId} overlay={overlay} />
-        <ViewPanel side="right" runKey={runKey} records={records} trackId={trackId} overlay={overlay} />
+        <ViewPanel side="left" runKey={runKey} records={evidenceRecords} trackId={trackId} overlay={overlay} />
+        <ViewPanel side="right" runKey={runKey} records={evidenceRecords} trackId={trackId} overlay={overlay} />
       </div>
     </section>
   );

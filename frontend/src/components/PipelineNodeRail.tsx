@@ -1,5 +1,9 @@
 import type { TraceRecord } from "../api/types";
-import { artifactsOf, payloadOf } from "../domain/trace";
+import {
+  createFrameEvidence,
+  type FrameEvidence,
+  type FrameEvidenceRecord,
+} from "../domain/frameEvidence";
 
 export type PipelineNodeId =
   | "SOURCE_RGB"
@@ -35,6 +39,7 @@ export const PIPELINE_NODES: readonly PipelineNodeDefinition[] = [
 ] as const;
 
 interface PipelineNodeRailProps {
+  evidence?: FrameEvidence;
   records: TraceRecord[];
   selectedNodeId: PipelineNodeId;
   onSelect: (nodeId: PipelineNodeId) => void;
@@ -42,54 +47,35 @@ interface PipelineNodeRailProps {
 
 type PipelineNodeStatus = "PRODUCED" | "PARTIAL" | "NOT_PRODUCED";
 
-function outputState(record: TraceRecord): Exclude<PipelineNodeStatus, "PARTIAL"> | null {
-  const payload = payloadOf(record);
-  if (payload.output_status === "NOT_PRODUCED") return "NOT_PRODUCED";
-  if (payload.output_status === "PRODUCED") return "PRODUCED";
-  if (record.status === "SUCCEEDED") return "PRODUCED";
-  if (record.status === "FAILED" || record.status === "SKIPPED" || record.event?.includes("not_produced")) {
-    return "NOT_PRODUCED";
-  }
-  return null;
+function outputState(record: FrameEvidenceRecord): Exclude<PipelineNodeStatus, "PARTIAL"> | null {
+  return record.outputStatus === "UNKNOWN" ? null : record.outputStatus;
 }
 
-function recordReason(record: TraceRecord): string {
-  const payload = payloadOf(record);
-  if (typeof payload.reason === "string" && payload.reason) return payload.reason;
-  if (typeof payload.hand_reason === "string" && payload.hand_reason) return payload.hand_reason;
-  const selection = payload.selection;
-  if (selection && typeof selection === "object") {
-    const decision = (selection as Record<string, unknown>).decision;
-    if (typeof decision === "string" && decision) return decision;
-  }
-  return "";
-}
-
-function nodeState(definition: PipelineNodeDefinition, records: TraceRecord[]) {
+function nodeState(definition: PipelineNodeDefinition, evidence: FrameEvidence) {
   if (definition.roles) {
-    const roles = new Set(records.flatMap(artifactsOf).map((artifact) => String(artifact.role ?? "")));
-    const produced = definition.roles.every((role) => roles.has(role));
+    const produced = definition.roles.every((role) => evidence.hasArtifactRole(role));
     return {
       status: (produced ? "PRODUCED" : "NOT_PRODUCED") as PipelineNodeStatus,
       reason: produced ? "" : definition.missing,
     };
   }
-  const matching = records.filter((record) => record.stage === definition.stage);
+  const matching = evidence.recordsForStage(definition.stage ?? "");
   const produced = matching.filter((record) => outputState(record) === "PRODUCED");
   const notProduced = matching.filter((record) => outputState(record) === "NOT_PRODUCED");
   const status: PipelineNodeStatus = produced.length
     ? notProduced.length ? "PARTIAL" : "PRODUCED"
     : "NOT_PRODUCED";
-  const reason = notProduced.map(recordReason).find(Boolean)
+  const reason = notProduced.map((record) => record.failureReason).find(Boolean)
     ?? (status === "PARTIAL" ? "部分手未产出" : definition.missing);
   return { status, reason: status === "PRODUCED" ? "" : reason };
 }
 
-export function PipelineNodeRail({ records, selectedNodeId, onSelect }: PipelineNodeRailProps) {
+export function PipelineNodeRail({ evidence, records, selectedNodeId, onSelect }: PipelineNodeRailProps) {
+  const frameEvidence = evidence ?? createFrameEvidence(records);
   return (
     <nav className="pipeline-node-rail" aria-label="Pipeline 节点">
       {PIPELINE_NODES.map((definition, index) => {
-        const state = nodeState(definition, records);
+        const state = nodeState(definition, frameEvidence);
         const statusClass = state.status.toLowerCase().replace("_", "-");
         return (
           <button

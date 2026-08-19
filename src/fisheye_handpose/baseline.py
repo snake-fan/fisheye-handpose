@@ -10,11 +10,12 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from ._generated_project_contract import BASELINE_METRICS_SCHEMA
 from .errors import FisheyeHandposeError
 from .joints import FHP21
 from .trace import RunArtifactReader, TraceRecord
 
-BASELINE_SCHEMA = "fisheye-handpose/baseline-metrics/v1"
+BASELINE_SCHEMA = BASELINE_METRICS_SCHEMA
 
 
 class BaselineExtractionError(FisheyeHandposeError):

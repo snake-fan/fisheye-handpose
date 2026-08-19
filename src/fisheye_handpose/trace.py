@@ -22,41 +22,33 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
-RUN_MANIFEST_SCHEMA = "fisheye-handpose/run-manifest/v1"
-TRACE_RECORD_SCHEMA = "fisheye-handpose/trace-record/v1"
-RUN_SUMMARY_SCHEMA = "fisheye-handpose/run-summary/v1"
+from ._generated_project_contract import (
+    RUN_MANIFEST_SCHEMA,
+    RUN_STATUS_VALUES,
+    RUN_SUMMARY_SCHEMA,
+    TRACE_RECORD_SCHEMA,
+    TRACE_STAGE_VALUES,
+    TRACE_STATUS_VALUES,
+)
+
 HASH_ALGORITHM = "sha256"
 
 
-class TraceStage(StrEnum):
-    SYSTEM = "SYSTEM"
-    DISCOVERY = "DISCOVERY"
-    CALIBRATION = "CALIBRATION"
-    DECODE = "DECODE"
-    SYNCHRONIZATION = "SYNCHRONIZATION"
-    RECTIFICATION = "RECTIFICATION"
-    DETECTION = "DETECTION"
-    POSE_2D = "POSE_2D"
-    CROSS_VIEW_ASSOCIATION = "CROSS_VIEW_ASSOCIATION"
-    RAW_FUSION = "RAW_FUSION"
-    KINEMATIC_REFINEMENT = "KINEMATIC_REFINEMENT"
-    TEMPORAL_REFINEMENT = "TEMPORAL_REFINEMENT"
-    QA = "QA"
-    EXPORT = "EXPORT"
-
-
-class TraceStatus(StrEnum):
-    STARTED = "STARTED"
-    SUCCEEDED = "SUCCEEDED"
-    FAILED = "FAILED"
-    WARNING = "WARNING"
-    SKIPPED = "SKIPPED"
-
-
-class RunStatus(StrEnum):
-    ACTIVE = "ACTIVE"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
+TraceStage = StrEnum(
+    "TraceStage",
+    {value: value for value in TRACE_STAGE_VALUES},
+    module=__name__,
+)
+TraceStatus = StrEnum(
+    "TraceStatus",
+    {value: value for value in TRACE_STATUS_VALUES},
+    module=__name__,
+)
+RunStatus = StrEnum(
+    "RunStatus",
+    {value: value for value in RUN_STATUS_VALUES},
+    module=__name__,
+)
 
 
 class TraceValidationError(ValueError):

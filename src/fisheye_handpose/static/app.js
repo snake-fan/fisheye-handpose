@@ -414,7 +414,7 @@ function drawTwoDimensionalOverlay(wrapper, image, payload) {
     if (Number.isFinite(scores[index]) && scores[index] <= 0) return;
     context.beginPath();
     context.fillStyle = fingerColors[Math.min(4, Math.max(0, Math.ceil(index / 4) - 1))];
-    context.arc(point[0], point[1], 3.2 * unit, 0, Math.PI * 2);
+    context.arc(point[0], point[1], 2.2 * unit, 0, Math.PI * 2);
     context.fill();
   });
 }
@@ -476,7 +476,7 @@ function drawSkeleton(payload) {
     context.beginPath();
     context.moveTo(screen[a][0], screen[a][1]);
     context.lineTo(screen[b][0], screen[b][1]);
-    context.lineWidth = 5;
+    context.lineWidth = 2.5;
     context.lineCap = "round";
     context.strokeStyle = fingerColors[Math.floor(edgeIndex / 4)];
     context.stroke();
@@ -486,7 +486,7 @@ function drawSkeleton(payload) {
     .sort((a, b) => screen[a][2] - screen[b][2])
     .forEach((index) => {
       context.beginPath();
-      context.arc(screen[index][0], screen[index][1], index === 0 ? 7 : 5, 0, Math.PI * 2);
+      context.arc(screen[index][0], screen[index][1], index === 0 ? 4 : 3, 0, Math.PI * 2);
       context.fillStyle = index === 0 ? "#ffffff" : fingerColors[Math.min(4, Math.max(0, Math.ceil(index / 4) - 1))];
       context.fill();
     });

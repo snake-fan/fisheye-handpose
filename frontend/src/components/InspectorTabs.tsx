@@ -13,6 +13,7 @@ import { useState } from "react";
 
 import { traceApi } from "../api/client";
 import type { RunDetail, TraceRecord } from "../api/types";
+import { artifactPathFor } from "../domain/frameEvidence";
 import { bytesDisplay, provenanceFacts, runArtifacts } from "../domain/provenance";
 import { asDisplay, payloadOf, recordLabel } from "../domain/trace";
 
@@ -128,7 +129,7 @@ function ProvenancePanel({ detail, records }: InspectorTabsProps) {
           </div>
           <div className="artifact-downloads">
             {artifacts.map((artifact) => {
-              const path = String(artifact.relative_path ?? artifact.path ?? "");
+              const path = artifactPathFor(artifact);
               const role = String(artifact.role ?? "artifact");
               const finalOutput = role === "worker_fhp21_output";
               return (

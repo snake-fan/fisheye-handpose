@@ -90,3 +90,9 @@ and show an explicit unavailable state.
 
 All artifact requests are scoped by the backend's opaque `run_key`; the browser cannot
 read arbitrary server paths.
+
+`FrameInspector` converts each API frame response once through the domain-level
+`FrameEvidence` adapter. Pipeline state, stage comparison, stereo evidence, and the 3D canvas
+share that normalized view instead of independently interpreting raw trace aliases. Shared
+stage/status/schema/FHP21 constants come from the generated project contract; edit the
+canonical JSON at the repository root rather than the generated TypeScript file.

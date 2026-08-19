@@ -11,11 +11,13 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from runpy import run_path
 from typing import Any
 
-SCHEMA_VERSION = "fisheye-handpose/doctor/v1"
-MANIFEST_SCHEMA = "fisheye-handpose/h20-environment/v1"
 DEPLOY_ROOT = Path(__file__).resolve().parent
+_PROJECT_CONTRACT = run_path(str(DEPLOY_ROOT / "_generated_project_contract.py"))
+SCHEMA_VERSION = str(_PROJECT_CONTRACT["DOCTOR_SCHEMA"])
+MANIFEST_SCHEMA = str(_PROJECT_CONTRACT["H20_ENVIRONMENT_SCHEMA"])
 DEFAULT_MANIFEST = DEPLOY_ROOT / "environment.json"
 EXPECTED_TARGET = {
     "platform": "linux-x86_64",

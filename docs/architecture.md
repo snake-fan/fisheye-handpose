@@ -28,8 +28,9 @@ per-view pose evidence is returned in physical crop pixels after undoing interna
 letterbox, or mirroring.
 
 Core code must not import a detector, parameterized hand model, model repository, or
-weights package. Model adapters live under `backends/`. `BackendManifest` declares API and
-model versions, input spaces/joint sets, capabilities, source revision, code and weight
+weights package. Backend-specific runtime code lives outside the core package; the current
+H20 implementation is process-isolated under `deploy/mmpose-h20`. `BackendManifest` declares
+API and model versions, input spaces/joint sets, capabilities, source revision, code and weight
 terms, artifact hash, and an explicit commercial-use classification. `UNKNOWN` commercial
 status is not deployment approval. A parameterized hand model is an optional kinematic
 backend, never the definition of `fhp21/v1`.
@@ -168,18 +169,23 @@ Implemented now:
 - true `cv2.fisheye.stereoRectify` geometry and remap construction for QA/debugging;
 - empirical rectified epipolar, disparity-sign, and positive-depth QA;
 - versioned `fhp21/v1` definitions and model-neutral contracts;
+- one language-neutral project contract with checked-in generated constants for the core,
+  standalone H20 tooling, worker, and TypeScript inspector;
 - atomic JSON/CSV CLI artifacts with calibration hashes and provenance;
 - one immutable `runs/<item>/<run>/` trace shared by audit and worker stages;
 - a process-isolated H20 baseline with RTMDet/RTMPose, calibrated point rectification,
   cross-view association, metric triangulation, track-local MANO, real-time-delta EMA,
-  and FHP21 JSONL export;
-- a multi-run read-only API and independent React inspector.
+  and FHP21 JSONL export, with run lifecycle separated from typed frame execution;
+- two explicit RTMPose input profiles: backward-compatible `baseline_native_v1` and opt-in
+  `virtual_perspective_kb4_v1`, whose hand-centred KB4 crop is mapped back to named native and
+  rectified spaces;
+- a multi-run read-only API and independent React inspector whose frame views share one
+  normalized `FrameEvidence` index.
 
 Not yet implemented:
 
-- explicit hand-centred virtual-perspective crop generation (the compatibility worker
-  currently detects on the raw fisheye frame and uses the top-down model crop);
-- learned ray/feature fusion, calibrated 2D covariance, and a learned temporal prior;
+- target-domain ground-truth accuracy validation and calibrated 2D score/covariance models;
+- learned ray/feature fusion and a learned temporal prior;
 - a production-safe replacement for the legacy OpenMMLab/PyTorch environment.
 
 ## Non-negotiable invariants

@@ -9,6 +9,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
+from ._generated_project_contract import AUDIT_SCHEMA
 from .calibration import load_orbbec_stereo
 from .errors import FisheyeHandposeError
 from .geometry import RectificationConfig, StereoRectifier
@@ -121,7 +122,7 @@ def _package_version(name: str) -> str | None:
 
 def _new_report(session_path: Path, config: AuditConfig) -> dict[str, Any]:
     return {
-        "schema_version": "fisheye-handpose/audit/v1",
+        "schema_version": AUDIT_SCHEMA,
         "status": "FAIL",
         "input_session": str(session_path),
         "config": config.to_dict(),

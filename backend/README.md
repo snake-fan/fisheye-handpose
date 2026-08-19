@@ -9,7 +9,7 @@ or GPU backends is not required.
 
 ```bash
 cd backend
-uv sync --locked --group dev
+uv sync --locked --group dev --no-editable
 uv run --locked --no-editable fisheye-trace-api \
   --catalog-root ../runs \
   --host 127.0.0.1 \
@@ -121,7 +121,7 @@ not use the cheap status shortcut because corruption is only knowable after read
 ## Verify
 
 ```bash
-uv run --locked pytest -q
-uv run --locked ruff check .
-uv run --locked ruff format --check .
+uv run --locked --no-editable pytest -q
+uv run --locked --no-editable ruff check .
+uv run --locked --no-editable ruff format --check .
 ```

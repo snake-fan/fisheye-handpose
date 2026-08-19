@@ -1,105 +1,158 @@
 # fisheye-handpose
 
-An independent, calibration-first project for extracting metric 21-landmark hand poses
-from synchronized stereo fisheye video. It does **not** import or execute the existing
-VLA pipeline.
+Calibration-first reconstruction of metric `fhp21/v1` hand landmarks from synchronized
+stereo fisheye video, with an isolated NVIDIA H20 worker and evidence-first inspection.
 
-The project is intentionally split into three independently deployable layers:
+## Status
 
-1. A strict geometry foundation: session discovery, timestamp pairing, Orbbec KB4
-   calibration normalization, full video decode audit, true stereo rectification/QA,
-   timestamp-indexed stereo reading, and a versioned 21-landmark contract.
-2. An isolated H20 worker: RTMDet + RTMPose evidence, calibrated stereo fusion,
-   tracking, optional MANO fitting, temporal refinement, and FHP21 export.
-3. A read-only FastAPI run catalog and an independent React/TypeScript inspector.
+This is a controlled research pipeline, not a production hand-tracking service. The core
+geometry, trace, H20 process bridge, read-only API, and React inspector are implemented and
+covered by synthetic/contract tests. Real H20 runs support two explicit RTMPose input profiles:
 
-The worker keeps RTMDet on full native fisheye frames and supports two versioned RTMPose
-profiles: the compatible native path and an opt-in hand-centred virtual-perspective crop
-path. The active v2 accuracy work and its H20 gates are tracked in
-[docs/pipeline-v2-iteration-plan.md](docs/pipeline-v2-iteration-plan.md). No weights, MANO
-files, or private manifests are embedded here.
+- `baseline_native_v1` — backward-compatible default; RTMDet and top-down RTMPose operate from
+  native distorted fisheye frames/proposals;
+- `virtual_perspective_kb4_v1` — opt-in hand-centred perspective crop generated with calibrated
+  KB4 ray mapping.
 
-## Coordinate and unit conventions
+The virtual profile has passed the recorded H20 pipeline gates, but neither profile is a claim
+of target-domain ground-truth accuracy or production readiness. The legacy PyTorch/OpenMMLab
+stack also has known security and support debt. Current results are summarized in the
+[`v2 iteration report`](docs/pipeline-v2-iteration-plan.md).
 
-- 3D axes use the OpenCV camera convention: `+x right`, `+y down`, `+z forward`.
-- Internal timestamps are integer nanoseconds.
-- Internal lengths are metres.
-- A transform named `T_B_from_A` means `X_B = R @ X_A + t`.
-- The canonical hand landmark set is `fhp21/v1`; see
-  [docs/output-schema.md](docs/output-schema.md).
+This repository is independent of the existing VLA pipeline and does not import or execute it.
 
-The supplied Orbbec YAML does not declare translation units or the direction of its
-extrinsics. Commands therefore require both values explicitly; they are never guessed.
+## Architecture
 
-## Install
+The deployable system has four layers with deliberate process and write boundaries:
+
+| Layer | Location | Responsibility |
+| --- | --- | --- |
+| Core geometry and orchestration | `src/fisheye_handpose/` | Session discovery, calibration, timestamp pairing, video audit, rectification QA, typed contracts, canonical trace writing, and worker orchestration. Python 3.11+. |
+| H20 perception worker | `deploy/mmpose-h20/` | Python 3.10/CUDA 12.1 RTMDet + RTMPose, stereo association/fusion, tracking, optional MANO, temporal baseline, and staged FHP21 export. |
+| Read-only Trace API | `backend/` | Validated multi-item run catalog and integrity-checked artifact delivery. It never writes a run. |
+| React inspector | `frontend/` | Multi-run, frame/stage/track evidence inspection through the API. It never reads the server filesystem directly. |
+
+```text
+stereo video + hardware timestamps + explicit calibration semantics
+  -> core audit and canonical ACTIVE trace
+  -> versioned JSON request to isolated H20 Python 3.10 process
+  -> validated worker staging package
+  -> single core writer imports records and content-addressed blobs
+  -> immutable COMPLETED/FAILED canonical run
+  -> read-only FastAPI catalog -> React inspector
+```
+
+The embedded `trace-serve` viewer remains a small single-run utility for local demos. The
+FastAPI/React pair is the normal operator interface. See the accepted decisions in
+[`docs/adr/`](docs/adr/) and the shared terms in [`CONTEXT.md`](CONTEXT.md).
+
+## Repository layout
+
+```text
+src/fisheye_handpose/          Python 3.11 core package and CLI
+tests/                        core geometry, trace, CLI, and bridge tests
+deploy/mmpose-h20/            isolated Python 3.10 H20 project and worker
+backend/                      independent FastAPI Trace API project
+frontend/                     independent React/TypeScript/Vite inspector
+contracts/                    canonical cross-runtime and Trace API contracts
+docs/                         contracts, architecture, ADRs, and dated reports
+scripts/                      operational helpers
+runs/                         generated canonical runs; ignored by Git
+```
+
+Generated `results/`, runs, captures, weights, MANO files, and private manifests are local
+artifacts and are not source code.
+
+## Quick start: deterministic local demo
+
+Requirements: `uv`, Python 3.11, and a host that permits binding a loopback port.
 
 ```bash
 uv python install 3.11
-uv sync --locked --extra dev
-uv run --locked fisheye-handpose schema
+uv sync --locked --extra dev --no-editable
+uv run --locked --no-editable fisheye-handpose schema
+uv run --locked --no-editable fisheye-handpose trace-demo runs/demo
+uv run --locked --no-editable fisheye-handpose trace-validate runs/demo
+uv run --locked --no-editable fisheye-handpose trace-serve runs/demo \
+  --host 127.0.0.1 --port 8000
 ```
 
-`uv.lock` is the source of truth for the cross-platform geometry environment. Use
-`uv lock --check` in CI and `uv sync --locked` in development; do not replace these with
-an unconstrained `pip install`. CI/release verification additionally uses
-`uv sync --locked --no-editable` so source-tree imports cannot hide packaging mistakes.
+Open `http://127.0.0.1:8000/`. The three-frame trace is synthetic inspection data, not a
+model-accuracy result. Run directories are intentionally non-overwriting; choose another demo
+path for a second run.
 
-## Geometry CLI
+`uv.lock` is the source of truth for the core environment. Use locked, non-editable installs
+for verification so imports from the source tree cannot hide packaging failures.
 
-Discover complete sessions:
+## Core capture workflow
 
-```bash
-uv run --locked --no-editable fisheye-handpose discover /path/to/fisheye_data
-```
-
-Inspect and normalize an Orbbec calibration:
+Every command emits machine-readable output. Diagnostics go to stderr; output files are
+written atomically.
 
 ```bash
-uv run --locked --no-editable fisheye-handpose inspect-calibration calibration_camera.yaml \
+# Discover complete multi-part sessions.
+uv run --locked --no-editable fisheye-handpose discover /path/to/fisheye-data
+
+# Inspect calibration with semantics the source YAML does not declare.
+uv run --locked --no-editable fisheye-handpose inspect-calibration \
+  /path/to/calibration_camera.yaml \
   --left-id cam_0 --right-id cam_1 \
   --translation-unit mm \
   --extrinsics-convention reference_to_camera
-```
 
-Pair two hardware timestamp streams monotonically and one-to-one:
-
-```bash
-uv run --locked --no-editable fisheye-handpose pair-pts left_pts.csv right_pts.csv \
-  --max-skew-us 1000 --output pairs.csv
-```
-
-Fully audit a capture session and build true stereo rectification geometry:
-
-```bash
+# Fully decode, synchronize, calibrate, rectify, and gate one session.
 uv run --locked --no-editable fisheye-handpose audit-session /path/to/session \
   --left-id cam_0 --right-id cam_1 \
   --translation-unit mm \
   --extrinsics-convention reference_to_camera \
-  --max-skew-us 1000 --output report.json
+  --max-skew-us 1000 \
+  --output /path/to/audit-report.json
 ```
 
-`audit-session` fully decodes both videos, requires decoded frame counts to equal their
-hardware-timestamp counts, checks synchronization/geometry gates, and by default runs
-empirical epipolar/disparity/positive-depth QA. Its JSON report is written atomically;
-invalid or inconclusive physical geometry exits non-zero. Other commands write
-machine-readable JSON to stdout unless `--output` is supplied; diagnostics go to stderr.
+Frames are paired monotonically and one-to-one by hardware timestamp, never by frame index.
+Full video decode must agree with timestamp counts. Calibration translation units and extrinsic
+direction are required because the Orbbec YAML does not identify them.
 
-## One immutable folder per data item
+Coordinate conventions are stable:
 
-`run-item` creates one non-overwriting attempt under
-`runs/<item_id>/<run_id>/`. The folder contains `run_manifest.json`, `trace.jsonl`,
-`run_summary.json`, and content-addressed `blobs/sha256/...`. Audit, perception, MANO,
-temporal, export, warning, and failure records share one hash chain; an absent stage is
-recorded as `SKIPPED / NOT_PRODUCED`.
+- OpenCV 3D axes: `+x` right, `+y` down, `+z` forward;
+- internal time: integer nanoseconds;
+- internal length: metres;
+- `T_B_from_A`: `X_B = R @ X_A + t`;
+- canonical landmarks: [`fhp21/v1`](docs/output-schema.md).
 
-On the configured H20, run one real data item with the checked-in executor profile:
+Use `fisheye-handpose --help` and the [architecture](docs/architecture.md) for the remaining
+pairing, trace, baseline, and run options.
+
+## Canonical runs and the H20 worker
+
+`run-item` creates one non-overwriting attempt under `runs/<item_id>/<run_id>/`. Its manifest,
+JSONL records, final summary, and `blobs/sha256/...` share one canonical integrity boundary.
+Audit, inference, refinement, export, warnings, skipped stages, and failures remain explicit.
+Only the core writer mutates this directory; worker output is temporary staging data until the
+bridge validates and imports it.
+
+The H20 environment is intentionally separate:
+
+| Requirement | H20 compatibility target |
+| --- | --- |
+| Host | Linux x86_64, NVIDIA H20 / SM90 |
+| Python | exactly 3.10 |
+| CUDA stack | CUDA 12.1, PyTorch 2.1.0, TorchVision 0.16.0 |
+| OpenMMLab | MMCV 2.1.0, MMDetection 3.2.0, MMPose 1.3.2 |
+| uv | `>=0.12.3,<0.13` for the isolated subproject |
+
+Follow [`deploy/mmpose-h20/README.md`](deploy/mmpose-h20/README.md) for environment creation,
+the fail-closed runtime doctor, checkpoint verification, MANO terms/manifests, and the special
+procedure for the configured H20 with its locally compiled SM90 MMCV wheel. Do not synchronize
+that Linux/CUDA project on macOS, and do not casually replace the configured H20 environment.
+
+After the core audit and H20 prerequisites are ready:
 
 ```bash
-cd /mnt/workspace/zyf/fisheye/fisheye-handpose
-.venv/bin/fisheye-handpose run-item \
-  /mnt/workspace/zyf/fisheye/data/Orbbec_Ego_AZEL764000H_19700102_204253 \
-  --runs-root /mnt/workspace/zyf/fisheye/fisheye-handpose/runs \
-  --run-id h20-e2e-20260813 \
+.venv/bin/fisheye-handpose run-item /path/to/session \
+  --runs-root /path/to/repository/runs \
+  --run-id h20-e2e-YYYYMMDD \
   --left-id cam_0 --right-id cam_1 \
   --translation-unit mm \
   --extrinsics-convention reference_to_camera \
@@ -107,148 +160,124 @@ cd /mnt/workspace/zyf/fisheye/fisheye-handpose
   --h20-executor-config deploy/mmpose-h20/h20-executor.example.json
 ```
 
-The checked-in debugging template processes at most 120 synchronized pairs, saves source,
-undistorted, and stereo-rectified evidence for every processed pair, and exports a 2x2
-H.264 raw-versus-stable skeleton video plus its hardware-timestamp timeline. Once a run has
-been visually accepted, increase `artifacts.sample_every` to reduce still-image storage or
-disable `artifacts.overlay_video`. The orchestrator replaces its session/calibration fields
-with audited values.
-The final `fhp21.jsonl` is imported as a verified content-addressed blob with role
-`worker_fhp21_output`, not copied to a mutable top-level run file. Download it through the
-React/API artifact link or locate it from the EXPORT provenance.
+The executor template is site-specific and records model/source/MANO settings. The orchestrator
+replaces its session and audited calibration fields. Final `fhp21.jsonl` is retained as the
+verified blob role `worker_fhp21_output`, not as a mutable top-level run file.
 
-Freeze reproducible stage/quality metrics for any completed canonical run:
+## Inspect runs
 
-```bash
-uv run --locked --no-editable fisheye-handpose trace-baseline \
-  runs/ITEM_ID/RUN_ID --output runs/ITEM_ID/RUN_ID.baseline.json
-```
-
-The baseline extractor validates the trace first and records the applied configuration,
-model/calibration provenance, detections, associations, Raw validity/bone statistics,
-tracks, MANO attempts/RMSE, and the temporal stage's actual input source.
-
-## Stage traces and inspection UIs
-
-Every pipeline stage can write append-only records to a run artifact directory. Records
-carry explicit parent IDs and form a SHA-256 chain; source images, overlays, arrays, and
-reports are content-addressed blobs with explicit semantic roles. Finalization writes a separate immutable summary,
-so raw evidence is never overwritten by MANO or temporal output and interrupted runs can
-be reopened while they remain active.
-
-The on-disk v1 protocol, payload conventions, lifecycle, and integrity guarantees are
-defined in [docs/trace-format.md](docs/trace-format.md).
-
-Generate a deterministic three-frame stereo example, validate it, then inspect it in the
-legacy single-run read-only UI:
-
-```bash
-uv run --locked --no-editable fisheye-handpose trace-demo runs/demo
-uv run --locked --no-editable fisheye-handpose trace-validate runs/demo
-uv run --locked --no-editable fisheye-handpose trace-serve runs/demo \
-  --host 127.0.0.1 --port 8000
-```
-
-Open `http://127.0.0.1:8000/`. The example contains three frames and the complete planned
-stage vocabulary, including stereo source SVGs, detections, virtual crops, per-view 2D
-evidence, association, raw 3D fusion, kinematic/temporal refinement, QA, and export links.
-It is synthetic inspection data and must not be interpreted as a model accuracy result.
-
-For the normal multi-item workflow, start the independent API and React application:
+For normal multi-item inspection, start the independent API and frontend in two terminals:
 
 ```bash
 cd backend
-uv sync --locked --group dev
-uv run --locked --no-editable fisheye-trace-api --catalog-root ../runs \
-  --host 127.0.0.1 --port 8000
+uv sync --locked --group dev --no-editable
+uv run --locked --no-editable fisheye-trace-api \
+  --catalog-root ../runs --host 127.0.0.1 --port 8000
+```
 
-# another terminal
+```bash
 cd frontend
 npm ci
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. Remote H20 inspection uses an SSH tunnel; see
-[backend/README.md](backend/README.md) and [frontend/README.md](frontend/README.md).
+Open `http://127.0.0.1:5173`. The API has no authentication layer: keep it on loopback or
+behind a trusted tunnel/reverse proxy. The backend verifies paths, byte counts, and hashes
+before serving artifacts.
 
-For each selected frame, the React inspector exposes the ten logical nodes from source RGB
-through stable FHP21 export. Every node has a before/after view; missing evidence remains
-visible as `NOT_PRODUCED` with its recorded reason. When no track filter is selected, all
-hands are drawn together with deterministic colors. The run-level player uses the global
-`overlay_video_raw_vs_stable_stereo_rectified` artifact to compare raw triangulation (top)
-with the actual temporal output (bottom) in both cameras. Its label is provenance-driven:
-if MANO was rejected, it says `RAW_FUSION -> causal_time_ema_v1` rather than claiming a
-temporal MANO result.
-
-For the configured remote workflow, the Mac helper keeps both the SSH tunnel and local
-React development server alive, verifies the API health contract before declaring success,
-and reconnects automatically after a network drop:
+For the configured remote H20 workflow, run this from the repository root on the Mac:
 
 ```bash
 uv run --locked --no-editable python scripts/remote_trace_viewer.py
 ```
 
-It defaults to SSH alias `h20`, remote API port `18080`, local API port `18081`, and
-frontend port `15174`. Press Ctrl-C once to terminate only the tunnel and Vite process that
-the helper created. Run `python scripts/remote_trace_viewer.py --help` to override ports,
-the SSH alias, or frontend directory; no remote path, password, or private key is embedded.
+The helper maintains the SSH tunnel, checks API health, runs/reuses the local Vite server, and
+reconnects after a drop. See the [backend](backend/README.md) and
+[frontend](frontend/README.md) guides for ports, CORS, and the manual equivalent.
 
-To persist the stages already executed by `audit-session`, add a trace directory:
-
-```bash
-uv run --locked --no-editable fisheye-handpose audit-session /path/to/session \
-  --left-id cam_0 --right-id cam_1 \
-  --translation-unit mm \
-  --extrinsics-convention reference_to_camera \
-  --max-skew-us 1000 \
-  --output runs/session-audit.json \
-  --trace-output runs/session-audit-trace
-```
-
-The audit trace records discovery, calibration, rectification, both timestamp streams,
-pairing, full video decode reports, epipolar QA, warnings, and failures. The complete audit
-JSON is attached as a verified blob. It deliberately does not create detector, pose,
-fusion, MANO, or temporal records, because those stages have not run. It also omits image
-previews instead of decoding the videos a second time; perception stages attach source
-frames and overlays as they execute.
-
-For a producer that will append records later, `trace-init RUN_DIR` creates an empty ACTIVE
-run. `RunArtifactWriter.open(RUN_DIR)` resumes that run under a single-writer lock. Treat a
-run directory as immutable after finalization; `trace-validate` checks both its record
-chain and referenced blob hashes and exits non-zero on corruption.
-
-Full-frame stereo rectification is a geometry/QA utility, not the mandatory model image.
-The current compatibility worker detects in native fisheye pixels and uses RTMPose's
-top-down crop. A future backend should add explicit hand-centred virtual-perspective crops.
-
-## Tests
+To publish named copies of verified H20 overlay videos for downstream review, run from the
+repository root:
 
 ```bash
-uv run --locked --extra dev --no-editable pytest
-uv run --locked --extra dev --no-editable ruff check .
+uv run --locked --no-editable python scripts/export_h20_result_videos.py \
+  /path/to/runs /path/to/new-mp4-export
 ```
 
-The tests include synthetic projection/rectification geometry, timestamp drops and
-offset tails, full video decode and frame selection, CLI failure reports, calibration
-direction/unit checks, deterministic discovery, and the `fhp21/v1` contract.
-The H20 worker, process bridge, multi-run API, and React project have separate tests too.
+The output directory must not already exist and must be outside the source runs root. The helper
+requires `ffprobe` (by default `/usr/bin/ffprobe`; override it with `--ffprobe`), completes full
+canonical manifest/trace/summary/blob validation before publishing anything, and materializes
+independent file copies rather than hard links. Editing an exported MP4 must never mutate its
+source run; do not replace this operation with `ln` or otherwise modify finalized runs in place.
 
-See [docs/architecture.md](docs/architecture.md) for the planned model-facing APIs and
-the next implementation milestone. The attached engineering proposal has been evaluated
-in [docs/design-review.md](docs/design-review.md); that review is the implementation
-decision record for which parts are retained, revised, or rejected. The evidence-backed
-stage-by-stage diagnosis of the current H20 baseline is in
-[docs/current-pipeline-problem-analysis.md](docs/current-pipeline-problem-analysis.md).
+## Validation matrix
 
-## H20 perception environment
+The `Makefile` is the shared local/CI entry point. None of these targets synchronizes the
+Linux/CUDA H20 subproject.
 
-The legacy RTMDet + RTMPose Hand5 compatibility stack is intentionally isolated in
-[`deploy/mmpose-h20`](deploy/mmpose-h20/README.md). It uses its own Python 3.10 uv lock,
-CUDA 12.1 binary sources, fail-closed runtime doctor, explicit detector/pose artifacts,
-and separate RTMPose/MANO smoke commands. Do not add CUDA/OpenMMLab dependencies to this
-core environment. That subproject was locked with uv 0.12.3 and accepts only
-`uv>=0.12.3,<0.13`; follow its README rather than using the root environment commands.
+| Scope | Command | What it verifies |
+| --- | --- | --- |
+| Core | `make check-core` | root lock, non-editable install, pytest, Ruff lint/format, installed CLI schema smoke |
+| Trace API | `make check-backend` | backend lock/install, pytest, Ruff lint/format |
+| React inspector | `make check-frontend` | `npm ci`, Vitest, strict TypeScript, production Vite build |
+| H20 static | `make check-h20-static` | standard-library manifest doctor plus fake-runtime/contract tests and Ruff, using the root dev environment |
+| All local-safe checks | `make check` | all four rows above |
 
-The H20 profile is for controlled research reproduction. Model checkpoint rights,
-MANO/SMPL-X terms, and the known security debt of the pinned legacy PyTorch stack require
-separate approval before any production or commercial use.
+The exact commands are also visible with `make help`. Real CUDA, MMCV native-op, model,
+RTMPose, MANO, and full-data gates require the configured H20 and are documented separately;
+GitHub-hosted CI intentionally does not pretend to validate them.
+
+Shared contract values are changed only in `contracts/project-contract-v1.json`. Regenerate the
+checked-in core, H20 tooling/worker, and frontend views with
+`uv run --locked --no-editable python scripts/generate_contracts.py`, or append `--check` to
+verify that they and the bound H20 JSON manifests are current.
+
+The GitHub Actions workflow mirrors these four scopes. The H20-static job only validates
+manifests and lightweight worker behavior; it never runs `uv sync` inside
+`deploy/mmpose-h20`.
+
+## Data, model, and license boundaries
+
+- Do not commit captures, `runs/`, `results/`, generated videos, model weights, TensorRT/ONNX
+  artifacts, MANO pickle files, or private asset manifests.
+- The repository does not download MANO. Its files require separate acceptance of the MANO
+  terms and must match a private byte-count/SHA-256 manifest before deserialization.
+- RTMDet/RTMPose checkpoints are fetched only after an explicit license-risk acknowledgement
+  and are checked against the committed identity manifest.
+- The pinned PyTorch/OpenMMLab environment is a reproducibility enclave, not a security or
+  production approval.
+- Dataset, checkpoint, MANO/SMPL-X, and repository-code rights are separate. No project
+  `LICENSE` is currently declared; choose one before treating the GitHub repository as an
+  open-source distribution.
+
+## Documentation
+
+Start with [`docs/index.md`](docs/index.md), which distinguishes normative contracts, accepted
+ADRs, current implementation notes, and historical reports. The most important references are:
+
+- [`CONTEXT.md`](CONTEXT.md) — stable vocabulary and invariants;
+- [`docs/output-schema.md`](docs/output-schema.md) — normative `fhp21/v1` output;
+- [`docs/trace-format.md`](docs/trace-format.md) — normative trace lifecycle and integrity;
+- [`docs/architecture.md`](docs/architecture.md) — current boundaries and known gaps;
+- [`docs/pipeline-v2-iteration-plan.md`](docs/pipeline-v2-iteration-plan.md) — current v2 H20
+  iteration result;
+- [`docs/current-pipeline-problem-analysis.md`](docs/current-pipeline-problem-analysis.md) —
+  historical `5eacb7a` baseline diagnosis, retained for evidence rather than current status.
+
+## Troubleshooting
+
+- **A test cannot bind `127.0.0.1`:** legacy-viewer integration tests require a loopback socket.
+  Run them in a normal local/CI environment that permits ephemeral loopback ports.
+- **A run already exists:** runs are non-overwriting by design. Select a new `run_id` or output
+  directory; do not repair a finalized run in place.
+- **The React app cannot reach the API:** use the default Vite `/api` proxy, or build with a
+  browser-visible `VITE_API_BASE_URL`; custom frontend ports also require matching API CORS
+  origins.
+- **H20 sync fails on macOS:** expected. Run only `doctor.py --mode manifest` and the root-env
+  lightweight tests locally; create/synchronize the CUDA project only on its Linux x86_64 host.
+- **The configured H20 has a working compiled MMCV wheel:** follow its protected update procedure
+  instead of running subproject `uv sync`.
+- **Calibration looks plausible but geometry fails:** verify camera IDs, translation unit,
+  extrinsic convention, timestamp column/unit, and the full decode/timestamp-count gate; none is
+  guessed.
+- **Generated result files are absent from Git status:** `runs/` and `results/` are ignored on
+  purpose. Publish only reviewed, explicitly packaged artifacts outside the source tree.

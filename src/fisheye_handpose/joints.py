@@ -6,6 +6,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from ._generated_project_contract import (
+    FHP21_IDENTITY_MAPPING_ID,
+    FHP21_NAMES,
+    FHP21_PARENTS,
+    FHP21_SCHEMA_ID,
+    FHP21_TIP_INDICES,
+)
+
 
 class LandmarkKind(StrEnum):
     """Geometric meaning of a canonical landmark."""
@@ -204,7 +212,7 @@ def _joint(name: str) -> LandmarkDefinition:
         name,
         LandmarkKind.ARTICULATION_CENTER,
         _JOINT_CENTER,
-        f"fhp21/v1:{name}",
+        f"{FHP21_SCHEMA_ID}:{name}",
     )
 
 
@@ -213,50 +221,35 @@ def _tip(name: str) -> LandmarkDefinition:
         name,
         LandmarkKind.SURFACE_POINT,
         _TIP_SURFACE,
-        f"fhp21/v1:{name}",
+        f"{FHP21_SCHEMA_ID}:{name}",
     )
 
 
 FHP21 = LandmarkSchema(
-    version="fhp21/v1",
-    definitions=(
+    version=FHP21_SCHEMA_ID,
+    definitions=tuple(
         LandmarkDefinition(
-            "wrist_center",
+            name,
             LandmarkKind.REFERENCE_POINT,
             "The fhp21/v1 canonical kinematic wrist reference at the proximal hand/wrist "
             "base. Its operational realization (for example a native keypoint, annotation "
             "rule, mesh regressor, or derived point) is declared by the mapping record; it "
             "does not claim a unique, directly observable radiocarpal centre.",
-            "fhp21/v1:wrist_center",
-        ),
-        _joint("thumb_cmc"),
-        _joint("thumb_mcp"),
-        _joint("thumb_ip"),
-        _tip("thumb_tip"),
-        _joint("index_mcp"),
-        _joint("index_pip"),
-        _joint("index_dip"),
-        _tip("index_tip"),
-        _joint("middle_mcp"),
-        _joint("middle_pip"),
-        _joint("middle_dip"),
-        _tip("middle_tip"),
-        _joint("ring_mcp"),
-        _joint("ring_pip"),
-        _joint("ring_dip"),
-        _tip("ring_tip"),
-        _joint("little_mcp"),
-        _joint("little_pip"),
-        _joint("little_dip"),
-        _tip("little_tip"),
+            f"{FHP21_SCHEMA_ID}:{name}",
+        )
+        if index == 0
+        else _tip(name)
+        if index in FHP21_TIP_INDICES
+        else _joint(name)
+        for index, name in enumerate(FHP21_NAMES)
     ),
-    parents=(-1, 0, 1, 2, 3, 0, 5, 6, 7, 0, 9, 10, 11, 0, 13, 14, 15, 0, 17, 18, 19),
-    tip_indices=(4, 8, 12, 16, 20),
+    parents=FHP21_PARENTS,
+    tip_indices=FHP21_TIP_INDICES,
 )
 
 
 FHP21_IDENTITY_MAPPING = LandmarkMappingRecord(
-    mapping_id="fhp21/v1:identity",
+    mapping_id=FHP21_IDENTITY_MAPPING_ID,
     source_joint_set_id=FHP21.version,
     target_schema_version=FHP21.version,
     source_landmark_names=FHP21.names,

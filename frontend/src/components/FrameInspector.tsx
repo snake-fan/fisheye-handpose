@@ -1,7 +1,8 @@
 import { Clock3, LoaderCircle } from "lucide-react";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 import type { FrameDetail, RunDetail } from "../api/types";
+import { createFrameEvidence } from "../domain/frameEvidence";
 import { InspectorTabs } from "./InspectorTabs";
 import { PipelineNodeRail, type PipelineNodeId } from "./PipelineNodeRail";
 import { SkeletonCanvas } from "./SkeletonCanvas";
@@ -26,6 +27,10 @@ export function FrameInspector({
   error,
 }: FrameInspectorProps) {
   const [selectedNodeId, setSelectedNodeId] = useState<PipelineNodeId>("SOURCE_RGB");
+  const evidence = useMemo(
+    () => createFrameEvidence(frameDetail?.records ?? []),
+    [frameDetail?.records],
+  );
   if (loading && !frameDetail) {
     return <section className="inspection-state"><LoaderCircle className="spin" /><span>正在组装帧证据</span></section>;
   }
@@ -54,7 +59,8 @@ export function FrameInspector({
     );
   }
 
-  const { frame, records } = frameDetail;
+  const { frame } = frameDetail;
+  const { records } = evidence;
   return (
     <div className="frame-inspector">
       <div className="frame-context">
@@ -77,11 +83,13 @@ export function FrameInspector({
           </div>
         </header>
         <PipelineNodeRail
+          evidence={evidence}
           records={records}
           selectedNodeId={selectedNodeId}
           onSelect={setSelectedNodeId}
         />
         <StageComparison
+          evidence={evidence}
           runKey={runKey}
           records={records}
           selectedNodeId={selectedNodeId}
@@ -89,8 +97,8 @@ export function FrameInspector({
         />
       </section>
       <div className="evidence-grid">
-        <StereoEvidence runKey={runKey} records={records} trackId={selectedTrack} />
-        <SkeletonCanvas records={records} trackId={selectedTrack} />
+        <StereoEvidence evidence={evidence} runKey={runKey} records={records} trackId={selectedTrack} />
+        <SkeletonCanvas evidence={evidence} records={records} trackId={selectedTrack} />
       </div>
       <InspectorTabs detail={runDetail} records={records} />
     </div>

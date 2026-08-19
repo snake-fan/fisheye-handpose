@@ -9,10 +9,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from ._generated_project_contract import FHP21_SCHEMA_ID, RTMPOSE_FHP21_MAPPING_ID
 from .artifacts import FHP21_OUTPUT_SCHEMA
 from .contracts import WorkerError
 
-RTMPOSE_FHP21_MAPPING_ID = "rtmpose-hand5-native21-to-fhp21/v1"
 OUTPUT_AXIS_CONVENTION = "OPENCV_X_RIGHT_Y_DOWN_Z_FORWARD"
 
 
@@ -113,7 +113,7 @@ def build_pose_estimate(
         # Compatibility aliases consumed by the current trace inspector.
         "coordinate_frame": "rectified_left_camera",
         "length_unit": "m",
-        "landmark_schema": "fhp21/v1",
+        "landmark_schema": FHP21_SCHEMA_ID,
         "handedness_probabilities": handedness,
         "stage": "TEMPORAL_REFINEMENT",
         "selected_output_stage": "TEMPORAL_REFINEMENT",
@@ -265,7 +265,7 @@ def _validate_raw_observation(raw: Any, label: str) -> None:
     if (
         raw["coordinate_frame"] != "rectified_left_camera"
         or raw["length_unit"] != "m"
-        or raw["landmark_schema"] != "fhp21/v1"
+        or raw["landmark_schema"] != FHP21_SCHEMA_ID
     ):
         raise WorkerError(f"{label} raw source observation frame/schema is invalid")
     points = _array21(raw["landmarks_xyz_m"], f"{label}.raw.landmarks_xyz_m")
@@ -566,7 +566,7 @@ def validate_pose_estimate(value: Any, *, line_number: int) -> dict[str, Any]:
         raise WorkerError(f"{label}.output_frame semantics are invalid")
     _text(frame["frame_id"], f"{label}.output_frame.frame_id")
     _text(frame["axis_convention"], f"{label}.output_frame.axis_convention")
-    if value["landmark_schema"] != "fhp21/v1":
+    if value["landmark_schema"] != FHP21_SCHEMA_ID:
         raise WorkerError(f"{label}.landmark_schema is invalid")
 
     handedness = value["handedness_probabilities"]

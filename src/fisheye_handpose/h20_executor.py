@@ -18,12 +18,13 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+from ._generated_project_contract import H20_EXECUTOR_SCHEMA, H20_WORKER_REQUEST_SCHEMA
 from .errors import FisheyeHandposeError
 from .pipeline import PipelineExecutionContext, PipelineExecutionSummary
 from .trace import BlobRef, RunArtifactWriter, TraceStage, TraceStatus
 
-EXECUTOR_SCHEMA = "fisheye-handpose/h20-executor/v1"
-WORKER_REQUEST_SCHEMA = "fisheye-handpose/h20-worker-request/v1"
+EXECUTOR_SCHEMA = H20_EXECUTOR_SCHEMA
+WORKER_REQUEST_SCHEMA = H20_WORKER_REQUEST_SCHEMA
 
 
 class H20ExecutorConfigurationError(FisheyeHandposeError):

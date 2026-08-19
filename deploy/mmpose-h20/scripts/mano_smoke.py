@@ -12,9 +12,14 @@ from collections.abc import Sequence
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
+from runpy import run_path
 from typing import Any
 
-SCHEMA_VERSION = "fisheye-handpose/mano-smoke/v1"
+_PROJECT_CONTRACT = run_path(
+    str(Path(__file__).resolve().with_name("_generated_project_contract.py"))
+)
+SCHEMA_VERSION = str(_PROJECT_CONTRACT["MANO_SMOKE_SCHEMA"])
+MANO_ASSETS_SCHEMA = str(_PROJECT_CONTRACT["MANO_ASSETS_SCHEMA"])
 H20_COMPUTE_CAPABILITY = (9, 0)
 MANO_FILES = {
     "left": Path("mano") / "MANO_LEFT.pkl",
@@ -86,7 +91,7 @@ def _load_verified_mano_assets(model_dir: Path, manifest_path: Path) -> dict[str
         raise SmokeError(f"cannot parse MANO manifest {resolved_manifest}: {error}") from error
     if not isinstance(manifest, dict):
         raise SmokeError("MANO manifest must be a JSON object")
-    if manifest.get("schema_version") != "fisheye-handpose/mano-assets/v1":
+    if manifest.get("schema_version") != MANO_ASSETS_SCHEMA:
         raise SmokeError("unexpected MANO manifest schema_version")
 
     license_record = manifest.get("license")

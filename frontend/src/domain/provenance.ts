@@ -1,4 +1,5 @@
 import type { ArtifactRef, RunDetail, TraceRecord } from "../api/types";
+import { artifactPathFor } from "./frameEvidence";
 import { artifactsOf, payloadOf } from "./trace";
 
 export interface ProvenanceFacts {
@@ -92,10 +93,6 @@ export function provenanceFacts(detail: RunDetail, records: TraceRecord[]): Prov
   };
 }
 
-function artifactPath(artifact: ArtifactRef): string {
-  return String(artifact.relative_path ?? artifact.path ?? "");
-}
-
 function artifactRank(artifact: ArtifactRef): number {
   const role = String(artifact.role ?? "");
   if (role === "worker_fhp21_output") return 0;
@@ -108,7 +105,7 @@ export function runArtifacts(detail: RunDetail, records: TraceRecord[]): Artifac
   const result: ArtifactRef[] = [];
   for (const record of [...(detail.global_records ?? []), ...records]) {
     for (const artifact of artifactsOf(record)) {
-      const path = artifactPath(artifact);
+      const path = artifactPathFor(artifact);
       const sha256 = artifact.sha256;
       if (!path || typeof sha256 !== "string" || !sha256) continue;
       const key = `${path}:${sha256}:${String(artifact.role ?? "artifact")}`;

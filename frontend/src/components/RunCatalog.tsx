@@ -63,7 +63,7 @@ export function RunCatalog({
   const hasNext = runs.length > 0 && pageEnd < total;
 
   return (
-    <aside className="run-catalog" aria-label="运行目录">
+    <aside id="run-catalog-pane" className="run-catalog" aria-label="运行目录">
       <div className="brand-lockup">
         <div className="brand-mark" aria-hidden="true">
           <span />

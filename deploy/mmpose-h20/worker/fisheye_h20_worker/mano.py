@@ -8,10 +8,10 @@ import re
 from pathlib import Path
 from typing import Any
 
+from ._generated_project_contract import MANO_ASSETS_SCHEMA, MANO_FHP21_MAPPING_ID
 from .contracts import WorkerError
 
-MANO_ASSET_SCHEMA = "fisheye-handpose/mano-assets/v1"
-MANO_FHP21_MAPPING_ID = "mano-v1.2-j16-tips-to-fhp21/v1"
+MANO_ASSET_SCHEMA = MANO_ASSETS_SCHEMA
 MANO_FILES = {
     "left": Path("mano") / "MANO_LEFT.pkl",
     "right": Path("mano") / "MANO_RIGHT.pkl",

@@ -34,11 +34,15 @@ function withQuery<T extends object>(path: string, query: T): string {
   return `${apiBaseUrl}${path}${suffix ? `?${suffix}` : ""}`;
 }
 
-async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
+async function getJson<T>(
+  url: string,
+  signal?: AbortSignal,
+  cache: RequestCache = "no-store",
+): Promise<T> {
   let response: Response;
   try {
     response = await fetch(url, {
-      cache: "no-store",
+      cache,
       headers: { Accept: "application/json" },
       signal,
     });
@@ -66,6 +70,20 @@ async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
 
 function segment(value: string | number): string {
   return encodeURIComponent(String(value));
+}
+
+function artifactUrl(runKey: string, relativePath: string): string {
+  if (relativePath.includes("\\") || relativePath.includes("\0")) {
+    throw new TypeError("artifact path contains a forbidden character");
+  }
+  const segments = relativePath.split("/");
+  if (
+    segments.length === 0
+    || segments.some((value) => value === "" || value === "." || value === "..")
+  ) {
+    throw new TypeError("artifact path contains an unsafe segment");
+  }
+  return `${apiBaseUrl}/api/v1/runs/${segment(runKey)}/artifacts/${segments.map(segment).join("/")}`;
 }
 
 export const traceApi = {
@@ -96,7 +114,10 @@ export const traceApi = {
   },
 
   artifactUrl(runKey: string, relativePath: string): string {
-    const normalized = relativePath.split("/").filter(Boolean).map(segment).join("/");
-    return `${apiBaseUrl}/api/v1/runs/${segment(runKey)}/artifacts/${normalized}`;
+    return artifactUrl(runKey, relativePath);
+  },
+
+  getArtifactJson<T>(runKey: string, relativePath: string, signal?: AbortSignal): Promise<T> {
+    return getJson<T>(artifactUrl(runKey, relativePath), signal, "force-cache");
   },
 };
